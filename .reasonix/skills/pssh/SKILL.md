@@ -114,7 +114,7 @@ python3 pssh.py exec root@10.0.0.5 --jump @bastion --cmd 'hostname'   # 跳板�
 
 ## 文档导航（按需读取，节省上下文）
 
-> **维护约定**：每次更新/修改/修复 pssh，必须在 **CHANGELOG.md** **末尾追加**一条记录（**最新在最后**，文件只增不减、历史条目禁止覆盖或删除——末尾追加是对 AI 最安全的更新方式，避免"往开头插入"误伤标题/约定；版本号与 `pssh.py` 的 `VERSION` 常量一致），并同步技能目录（`/skills/pssh/`） `pssh.py` / `CHANGELOG.md`。**回归测试**（技能自带，纯单元无网络）：改代码后跑 `python3 <pssh_dir>/tests/verify_r3.py`（54 例，含凭据正则 L4 矩阵）与 `PSSH_PY=<pssh_dir>/pssh.py python3 <pssh_dir>/tests/v3_sig_unit.py`（极早期信号/进程内复用 3 例）；涉及 ⚠️ 危险区（见 pssh.py 顶部代码地图 D1-D4）需另跑 stest_tmp 服务器套件。
+> **维护约定**：每次更新/修改/修复 pssh，必须在 **CHANGELOG.md** **末尾追加**一条记录（**最新在最后**，文件只增不减、历史条目禁止覆盖或删除——末尾追加是对 AI 最安全的更新方式，避免"往开头插入"误伤标题/约定；版本号与 `pssh.py` 的 `VERSION` 常量一致），并同步技能目录（`/skills/pssh/`） `pssh.py` / `CHANGELOG.md`。
 
 | 场景 | 读哪个文档 |
 |---|---|

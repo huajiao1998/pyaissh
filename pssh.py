@@ -152,23 +152,6 @@ VERSION = "1.5.2"
 #                   _port / _max_time / _exec_timeout
 #   常量/正则        _CONSTANTS（本文件顶部）                 调参只改此处
 # =========================================================================
-# ⚠️ 危险区（改前必读；改后必须跑对应测试——这些区域回归极难发现）：
-#   D1 极早期信号：_sigterm_handler 与 signal.signal 注册必须在 import paramiko
-#      之前（本文件 78-118 行）。动了顺序 = 信号窗口回归（rc=143、无 JSON）。
-#      → 测试：tests/v3_sig_unit.py（CASE1 必须 130）
-#   D2 进程内复用：main() 的全局重置（_SIGTERM_RECEIVED / _ACTIVE_TRANSPORTS /
-#      _PUT_RESIDUE_WARNINGS）+ _RESPONDER_STARTED 单例。漏重置/重复启动 =
-#      同进程复用误判中断（0.00s 即 130）或线程泄漏。
-#      → 测试：tests/v3_sig_unit.py（CASE2/3 必须 0）+ stest_tmp/s2_stale.py、
-#        stest_tmp/s2_inproc.py（进程内复用 40 连，需测试服务器）
-#   D3 凭据启发式正则：_SENSITIVE_CMD_RE（_P_SENS_* 片段）——改片段必须保持
-#      alternation 顺序与分组边界，否则凭据误报/漏报。
-#      → 测试：tests/verify_r3.py（L4 矩阵 40 例正反例）
-#   D4 SFTP 看门狗/原子写：_sftp_watchdog 强断 socket 的时机、_sftp_put_atomic
-#      的 .part 清理与双丢防护、_atomic_local_write 的 os.replace。改错 =
-#      传输挂死、半截文件残留或双丢。
-#      → 测试：stest_tmp 信号中断套件（v4_audit.py part3，需测试服务器）
-# =========================================================================
 
 # --text 模式分隔标记的随机 nonce：远程输出无法预测它，伪造不出有效标记
 # （标记形如 ---STDOUT.1a2b3c---，每个标记携带本次运行的 nonce 后缀）
