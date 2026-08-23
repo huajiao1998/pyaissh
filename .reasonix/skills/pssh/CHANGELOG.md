@@ -62,6 +62,7 @@
 
 ### 修改
 - **`cmd` 字段回显截断（防撑爆调用方上下文）**：结果 JSON 的 `cmd` 超过 `CMD_ECHO_LIMIT`（8KB 常量）时保留头尾 + 中间省略标记，新增恒有键 **`cmd_truncated`**（false=完整），warnings 提示"cmd 字段已截断（完整命令在 --cmd-file 本地文件可重读）"。`--cmd-file -` 读入 100KB 大脚本时单行 JSON 不再到 MB 级（实测 118901 字节脚本 → cmd 字段 8256 字节）；成功与失败路径（`_partial_extra`）都截断；凭据检测用完整 cmd 不受影响。**真机验证**：大脚本成功/失败路径 `cmd_truncated: true` + 头尾保留 + 输出/退出码正常，小命令 `false`。
+- **`cmd` 截断改字节级（补漏）**：判断与计数改用 `len(cmd.encode("utf-8"))` 而非字符数——多字节内容（中文）下旧实现低估 2-3 倍（marker 报错字节数），且字符数 < 8192 但字节数超限的"该截断没截断"（3000 中文字符 = 9000 字节）。截断边界用 `_utf8_boundary_cut` 对齐合法字符不切半字；marker 措辞改"完整命令见原始调用（--cmd-file 时为本地文件可重读）"（--cmd 来源无本地文件）。单元 5 例 + 真机 36028 字节中文脚本验证（marker 精确报字节数、头尾中文保留）。
 
 ### 文档
 - `docs/exec.md` / `docs/contract.md`：`cmd_truncated` 字段与截断语义。

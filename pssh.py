@@ -749,17 +749,24 @@ _WIN_RESERVED_NAMES = {
 
 
 def _truncate_cmd(cmd):
-    """cmd 回显截断：超过 CMD_ECHO_LIMIT 保留头尾 + 中间省略标记。
+    """cmd 回显截断：按【字节】超过 CMD_ECHO_LIMIT 保留头尾 + 中间省略标记。
 
-    返回 (显示文本, truncated 标志)。--cmd 命令行参数通常远小于上限，
-    只有 --cmd-file 读入的大脚本会触发。凭据检测（warn_sensitive_cmd）
-    用完整 cmd，不受本函数影响；截断只作用于结果 JSON 的回显字段。"""
-    if len(cmd) <= CMD_ECHO_LIMIT:
-        return cmd, False
+    返回 (显示文本, truncated 标志, 原始字节数)。用字节而非字符计数/截断：
+    多字节内容（中文等）下字符数会低估真实大小 2-3 倍（工具记账风格是
+    字节级精确，同 stdout_omitted_bytes）。截断边界用 _utf8_boundary_cut
+    对齐合法字符，不切半个字符。--cmd 命令行参数通常远小于上限，只有
+    --cmd-file 读入的大脚本会触发。凭据检测（warn_sensitive_cmd）用完整
+    cmd，不受本函数影响；截断只作用于结果 JSON 的回显字段。"""
+    enc = cmd.encode("utf-8", errors="replace")
+    n = len(enc)
+    if n <= CMD_ECHO_LIMIT:
+        return cmd, False, n
     half = CMD_ECHO_LIMIT // 2
+    head = _utf8_boundary_cut(enc, half).decode("utf-8", errors="replace")
+    tail = _utf8_boundary_cut(enc, half, from_start=False).decode("utf-8", errors="replace")
     body = ("\n...[pssh: cmd 回显已截断，共 %d 字节"
-            "（完整命令在 --cmd-file 本地文件，可重读）]...\n" % len(cmd))
-    return cmd[:half] + body + cmd[-half:], True
+            "（完整命令见原始调用，--cmd-file 时为本地文件可重读）]...\n" % n)
+    return head + body + tail, True, n
 
 
 def _sanitize_log_text(s):
@@ -2114,7 +2121,7 @@ def cmd_exec(args):
         err_raw = b"".join(err_buf)
         out_cut, _, _ = _truncate_output(out_raw, args.max_output, "stdout")
         err_cut, _, _ = _truncate_output(err_raw, args.max_output, "stderr")
-        cmd_echo, cmd_cut = _truncate_cmd(cmd)
+        cmd_echo, cmd_cut, cmd_n = _truncate_cmd(cmd)
         extra = {
             "host": conn["host"],
             "user": conn["user"],
@@ -2134,7 +2141,7 @@ def cmd_exec(args):
             extra["warnings"] = list(warnings)
         if cmd_cut:
             extra.setdefault("warnings", []).append(
-                "cmd 字段已截断（完整命令 %d 字节，--cmd-file 本地文件可重读）" % len(cmd))
+                "cmd 字段已截断（完整命令 %d 字节，见原始调用；--cmd-file 时为本地文件可重读）" % cmd_n)
         return extra
 
     out_buf, err_buf = [], []  # _partial_extra 依赖（try 之前初始化）
@@ -2519,9 +2526,9 @@ def cmd_exec(args):
             warnings.append("远程退出码为 255，本地返回 254（255 保留给连接失败语义）")
         stdout_truncated = bool(out_trunc or drop_counter[0])
         stderr_truncated = bool(err_trunc or err_drop_counter[0])
-        cmd_echo, cmd_cut = _truncate_cmd(cmd)
+        cmd_echo, cmd_cut, cmd_n = _truncate_cmd(cmd)
         if cmd_cut:
-            warnings.append("cmd 字段已截断（完整命令 %d 字节，--cmd-file 本地文件可重读）" % len(cmd))
+            warnings.append("cmd 字段已截断（完整命令 %d 字节，见原始调用；--cmd-file 时为本地文件可重读）" % cmd_n)
         result = {
             "ok": True,          # 工具操作成功（连接+执行完成）；命令是否成功看 exit_success / exit_code
             "action": "exec",
