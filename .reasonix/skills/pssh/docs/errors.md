@@ -39,3 +39,5 @@
 | `upload_failed` / `download_failed` | 传输失败 | 查看 `message`（多为权限/磁盘/网络问题）；错误 JSON **恒带** `host`/`user`/`port` 和**已完成的 `file_list`**（含 transferred/skipped 状态，中断后直接全量重试或按清单断点重试都安全——下载/上传均 `.part` 原子收尾，不留半截最终文件）；`upload_timeout`/`download_timeout`/`ls_timeout`/`ls_failed`/`test_failed` 同样带 `host`/`user`（传输类还带 `port`/`file_list`/`warnings`） |
 | `upload_timeout` / `download_timeout` | SFTP 传输超时（30s 无数据，NAT/网络静默断开；分片下载为 120s/片） | 检查网络/防火墙；**download 超时优先加 `--parallel 8` 重试**（高丢包/跨境链路单连接吞吐塌陷，多连接近似线性提速） |
 | `ls_failed` / `ls_timeout` / `test_failed` | ls 兜底错误 / ls 的 SFTP 30s 无数据超时（退出码 1）/ test 兜底错误 | 查看 `message`（多为权限/磁盘/网络问题）；`ls_timeout` 查网络后重试 |
+
+> **凭据 WARN**：命令含疑似凭据时打的 WARN（`warnings` 字段，不阻断执行）其判定形态与已测正反例，见 `pssh.py` 中 `_SENSITIVE_CMD_RE` 定义处注释（29 条验收案例，改判定规则时对照自查）。

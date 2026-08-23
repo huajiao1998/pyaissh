@@ -46,3 +46,4 @@
 - **补漏（同轮收口）**：复审发现 4 处"同值但违背调参只改一处"的遗漏并修正——`cmd_test` 一处 16 空格缩进的 `recv_stderr(65536)`（replace_all 只覆盖了 20 空格版本）；`parse_target`/`resolve_conn`/`_port` 三处错误消息里的 `(1-65535)` 字面量改为 `(1-%d) % MAX_PORT`；`_fix_msys_local_path` 的 `timeout=5`（cygpath 子进程超时）收口为新常量 `CYGPATH_TIMEOUT=5`。docstring/help/epilog 文本保持字面量（属文档范畴）。
 - **代码地图（AI 可维护性）**：文件顶部 `VERSION` 下新增"代码地图"——按区域列出关键函数与对应 docs 子文档（函数名作锚点、不写死行号），AI 改代码路径 = 文档导航 → 地图定位 → grep 函数名，无需理解包结构。
 - **凭据正则验收案例表（使用者 AI 自查护栏）**：`_SENSITIVE_CMD_RE` 定义处新增 29 条正反例注释（含历史回归点：`--profile`/`--parallel`/`--progress` 双横线误报、`-p 22`/`-p'22'` 纯数字端口、`mysql -u root -p`、工具 `-p` 排除表）——使用者 AI 修正则后对照注释自查，无需测试框架（已逐条验证与真实行为一致）。
+- `docs/errors.md`：文末新增"凭据 WARN"注记，指向 `pssh.py` 中 `_SENSITIVE_CMD_RE` 定义处的判定形态与已测案例。
