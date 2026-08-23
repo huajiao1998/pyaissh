@@ -1206,7 +1206,15 @@ def _do_connect(conn, jump_client, is_jump=False):
     is_jump=True 表示本次连接的是跳板机本身（认证提示要说对变量名）。
     """
     global paramiko  # 惰性 import 绑定到模块全局（cmd_download/cmd_ls/_sftp_put_atomic
-    import paramiko  # 等模块级函数引用 paramiko.X；函数内裸 import 是局部名会 NameError）
+    try:             # 等模块级函数引用 paramiko.X；函数内裸 import 是局部名会 NameError）
+        import paramiko
+    except ImportError as e:
+        # 依赖缺失独立分类：误导 AI 查网络（此前实测归 connection_failed 且
+        # retryable:true，AI 会白白重试）。dependency_missing 不在
+        # _RETRYABLE_ERRORS → retryable=false（装依赖前重试无意义）
+        raise SshError(
+            "依赖缺失: %s（pip install paramiko 可安装；pssh 的 SSH 底层库未就绪，"
+            "与目标主机/网络无关，重试前请先安装依赖）" % e, "dependency_missing")
     if _SIGTERM_RECEIVED:
         # 连接尚未开始即拿到信号（transport 未注册、响应线程无从 close）：
         # 在我们自己的帧里抛 KI 是安全的，走正常中断路径 130
