@@ -118,7 +118,7 @@ except (ValueError, OSError, ImportError):
 
 import paramiko  # 慢 import：handler 已注册，此窗口内的信号走 handler 而非默认动作
 
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -208,6 +208,8 @@ JOIN_GRACE = 1.5             # 读线程 join 宽限（秒）
 RETRY_SLEEP = 0.5            # Windows 句柄未释放等场景的删除重试等待
 PUT_RETRY_SLEEP = 0.3        # 远端 .part 清理重试等待
 CYGPATH_TIMEOUT = 5          # cygpath 子进程超时（MSYS 路径转换，本地工具不应挂死）
+RESUME_MIN_SIZE = 50 * 1024 * 1024   # 单文件 ≥ 此大小且未用 --resume 时提示推荐启用
+                             # （断点续传收益与文件大小/链路速度相关，做成常量可调）
 
 # --- 正则模式（模块级编译一次；片段化让每个分支可独立注释/测试） ---
 _RE_IPV4 = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
@@ -1464,7 +1466,7 @@ def open_sftp(client, io_timeout=None):
     return sftp
 
 
-def _parallel_fetch(conn, args_, remote, local, size, k):
+def _parallel_fetch(conn, args_, remote, local, size, k, resume=False):
     """多连接分片下载：k 条独立 SSH 连接各下载一段，写入同一本地文件。
 
     背景（实测）：paramiko 单连接的 SFTP 读是"发一个请求等一个响应"，
@@ -1475,7 +1477,9 @@ def _parallel_fetch(conn, args_, remote, local, size, k):
     本地文件生命周期：调用方应传 <目标>.part 路径——全部连接建立成功后
     才创建/清空 .part，任一分片失败抛 SshError（download_failed/download_timeout）
     或建连失败抛连接类 SshError，由调用方负责删除 .part 并原子改名收尾。
-    """
+    resume=True（--resume 分片续传）：不清空已有 .part；每个分片完成后写
+    <目标>.part.done.<i> 标记，重跑时存在标记的分片直接跳过（省已完成分片
+    的传输量）。调用方在全部完成后负责清理 .done.* 并 os.replace。"""
     workers = []   # [client, sftp, start, end, got]
     errors = []
     shared_jump = None
@@ -1511,11 +1515,20 @@ def _parallel_fetch(conn, args_, remote, local, size, k):
                         pass
                 raise
             workers.append([client, sftp, start, end, 0])
-        with open(local, "wb"):
-            pass  # 连接全部就绪后才预创建清空 .part，分片线程以 r+b 各自定位写入
+        if resume:
+            open(local, "ab").close()  # 续传：保留已有数据（ab 模式不清空；不存在则创建）
+        else:
+            with open(local, "wb"):
+                pass  # 连接全部就绪后才预创建清空 .part，分片线程以 r+b 各自定位写入
 
         def _run(i):
             client, sftp, start, end, _ = workers[i]
+            done_path = "%s.done.%d" % (local, i)
+            if resume and os.path.exists(done_path):
+                # 该分片上次已完整写完（done 标记存在）：跳过，节省传输量
+                workers[i][4] = end - start
+                log("[SKIP] 分片 %d/%d 已完成（续传点），跳过" % (i + 1, k))
+                return
             rf = lf = None
             try:
                 rf = sftp.open(remote, "rb")
@@ -1538,6 +1551,12 @@ def _parallel_fetch(conn, args_, remote, local, size, k):
                     off += len(data)
                     workers[i][4] = off - start
                     _sftp_touch_activity(sftp)
+                # 分片完整写完：写 done 标记（--resume 重跑时跳过已完成分片）
+                if resume:
+                    try:
+                        open(done_path, "wb").close()
+                    except Exception:
+                        pass
             except KeyboardInterrupt:
                 # 信号中断归位：不记入 errors（否则主线程会把信号误报成
                 # download_failed），由主线程检查 _SIGTERM_RECEIVED 走 130 路径
@@ -1709,36 +1728,44 @@ def _part_path(target):
     return "%s.part.%d" % (target, os.getpid())
 
 
-def _atomic_local_write(write_fn, local):
-    """本地原子落盘：write_fn(part) 写进程唯一的 .part，成功后 os.replace。
-    失败/中断删除 .part——绝不留下"看似完整实则损坏"的半截文件
-    （空洞文件会被 --skip-existing 按大小误判为已传完）。"""
-    part = _part_path(local)
+def _atomic_local_write(write_fn, local, resume=False):
+    """本地原子落盘：write_fn(part) 写 .part，成功后 os.replace。
+    失败/中断默认删除 .part——绝不留下"看似完整实则损坏"的半截文件
+    （空洞文件会被 --skip-existing 按大小误判为已传完）。
+    resume=True（--resume 续传模式）：.part 用固定名 <目标>.part（跨进程
+    可续传），失败/中断【保留】它供下次 --resume 续传（log TIP 提示）。"""
+    part = local + ".part" if resume else _part_path(local)
     try:
         write_fn(part)
         os.replace(part, local)
     except BaseException:
-        try:
-            if os.path.exists(part):
-                os.remove(part)
-        except OSError:
-            # Windows 下句柄未释放等会让删除失败：稍等重试一次，
-            # 仍失败至少留 WARN（静默残留违背"不留半截文件"承诺）
-            time.sleep(RETRY_SLEEP)
+        if not resume:
             try:
-                os.remove(part)
+                if os.path.exists(part):
+                    os.remove(part)
             except OSError:
-                log("[WARN] 清理临时文件失败（可能有进程占用）： %s" % part)
+                # Windows 下句柄未释放等会让删除失败：稍等重试一次，
+                # 仍失败至少留 WARN（静默残留违背"不留半截文件"承诺）
+                time.sleep(RETRY_SLEEP)
+                try:
+                    os.remove(part)
+                except OSError:
+                    log("[WARN] 清理临时文件失败（可能有进程占用）： %s" % part)
+        else:
+            # 续传模式：保留 .part 作为续传点，提示下次可续传
+            log("[TIP] 已保留续传点 %s（下次重试加 --resume 从断点继续）" % part)
         raise
 
 
-def _sftp_put_atomic(sftp, local, remote, progress=None):
-    """SFTP 上传 + 远端原子改名：先传进程唯一的 remote.part.<pid>，成功后
-    posix-rename 覆盖。服务器不支持 posix-rename 扩展时退化为 remove+rename
-    （非原子，WARN 一次）；回退前先确认 .part 仍在，防止把别的进程刚改完名的
-    成果误删。progress 可选 [0] 列表：put 回调累计已传字节（中断/失败时
-    结果 JSON 能报真实进度，而不是恒 0）。"""
-    part = _part_path(remote)
+def _sftp_put_atomic(sftp, local, remote, progress=None, resume=False):
+    """SFTP 上传 + 远端原子改名：先传 .part（默认进程唯一名 <pid>；--resume 时
+    固定名 <remote>.part 且支持断点续传），成功后 posix-rename 覆盖。服务器不
+    支持 posix-rename 扩展时退化为 remove+rename（非原子，WARN 一次）；回退前
+    先确认 .part 仍在，防止把别的进程刚改完名的成果误删。progress 可选 [0]
+    列表：累计已传字节（中断/失败时结果 JSON 能报真实进度，而不是恒 0）。
+    resume=True：远端 .part 已存在且小于本地大小 → 从断点续传；大于等于本地
+    大小 → 视为已完成/损坏，覆盖重传；中断保留续传点（不清理、不告警残留）。"""
+    part = remote + ".part" if resume else _part_path(remote)
     # .part 是否已被创建/写入：put 回调置位。清理失败时据此区分
     # "残留几乎必然存在"（已开始写入）与"可能根本没创建"（put 开头就失败），
     # 配合 stat 确认决定是否告警（详见 except 分支注释）
@@ -1752,8 +1779,63 @@ def _sftp_put_atomic(sftp, local, remote, progress=None):
         last[0] = transferred
         sftp._pssh_last_activity = time.time()
 
+    # 续传决策（--resume）：远端 .part 大小决定走全量 / 续传 / 覆盖重传
+    resume_from = 0
+    if resume:
+        local_size = os.path.getsize(local)
+        try:
+            _sftp_touch_activity(sftp)
+            part_size = sftp.stat(part).st_size
+        except (socket.timeout, TimeoutError):
+            raise
+        except IOError:
+            part_size = 0  # 不存在：全量传
+        if part_size > 0 and part_size < local_size:
+            resume_from = part_size
+            log("[RESUME] 远端续传点 %s 已有 %s，从断点继续"
+                % (part, format_size(part_size)))
+        elif part_size >= local_size:
+            # 续传点大小异常（>= 源大小）：绝不续一个坏尾巴，覆盖重传
+            try:
+                sftp.remove(part)
+            except (socket.timeout, TimeoutError):
+                raise
+            except Exception:
+                pass
+            log("[WARN] 续传点大小异常（>= 源大小），覆盖重传: %s" % part)
+
     try:
-        sftp.put(local, part, callback=_cb)
+        if resume_from:
+            # 手动续传：本地从 offset 读，远端 part 以 r+ 定位写（paramiko put 不支持 offset）
+            lf = open(local, "rb")
+            lf.seek(resume_from)
+            rf = sftp.open(part, "r+b")
+            rf.seek(resume_from)
+            got = resume_from
+            try:
+                while got < local_size:
+                    if _SIGTERM_RECEIVED:
+                        raise KeyboardInterrupt("SIGTERM")
+                    data = lf.read(RECV_CHUNK)
+                    if not data:
+                        raise IOError("本地文件在偏移 %d 处提前 EOF" % got)
+                    rf.write(data)
+                    got += len(data)
+                    part_touched[0] = True
+                    if progress is not None:
+                        progress[0] += len(data)
+                    _sftp_touch_activity(sftp)
+            finally:
+                lf.close()
+                try:
+                    rf.close()
+                except Exception:
+                    pass
+            if got != local_size:
+                raise IOError("上传续传不完整：得到 %d/%d 字节" % (got, local_size))
+            log("[FILE] 续传完成 %s (%s)" % (remote, format_size(local_size)))
+        else:
+            sftp.put(local, part, callback=_cb)
         try:
             sftp.posix_rename(part, remote)
         except Exception as rename_err:
@@ -1790,6 +1872,13 @@ def _sftp_put_atomic(sftp, local, remote, progress=None):
     except BaseException as e:
         if getattr(e, "keep_part", False):
             raise  # 回退双丢防护：.part 是新数据唯一副本，保留不清理（已告警）
+        if resume:
+            # 续传模式：保留远端 .part 作为续传点（不清理、不告警残留），
+            # 提示下次重试加 --resume 从断点继续
+            log("[TIP] 已保留远端续传点 %s（下次重试加 --resume 从断点继续）" % part)
+            _PUT_RESIDUE_WARNINGS.append(
+                "上传中断，远端续传点已保留: %s（下次重试加 --resume 从断点继续）" % part)
+            raise
         # 连接坏掉时清不掉远端 .part：重试一次，仍失败必须 WARN 并记录进
         # 结果 warnings（静默残留会让远端磁盘按次泄漏且 AI 无从得知）。
         # 判定 .part 是否真的还在：
@@ -1823,6 +1912,47 @@ def _sftp_put_atomic(sftp, local, remote, progress=None):
             log("[WARN] " + msg)
             _PUT_RESIDUE_WARNINGS.append(msg)
         raise
+
+
+def _sftp_get_resume(sftp, remote, part, total_size):
+    """下载断点续传（--resume 串行路径）：本地 .part 已有 N 字节 → 从 N 续传剩余。
+
+    规则：part 不存在 → 全量写；已有 < 远端大小 → seek 续传；已有 >= 远端大小
+    → 视为损坏/过时，清空覆盖重传（绝不续一个坏尾巴）。完成时 .part 大小必须
+    等于 total_size（大小校验）。返回本次实际传输字节数（增量）。"""
+    existing = os.path.getsize(part) if os.path.exists(part) else 0
+    if existing > total_size:
+        log("[WARN] 本地续传点 %s 大小异常（%d > 远端 %d），覆盖重传" % (part, existing, total_size))
+        existing = 0
+    if existing:
+        log("[RESUME] 本地续传点 %s 已有 %s，从断点继续" % (part, format_size(existing)))
+    rf = sftp.open(remote, "rb")
+    rf.seek(existing)
+    lf = open(part, "r+b" if existing else "wb")
+    lf.seek(existing)
+    got = existing
+    try:
+        while got < total_size:
+            if _SIGTERM_RECEIVED:
+                raise KeyboardInterrupt("SIGTERM")
+            data = rf.read(min(RECV_CHUNK, total_size - got))
+            if not data:
+                raise IOError("远端在偏移 %d 处提前 EOF（文件传输中被修改？）" % got)
+            lf.write(data)
+            got += len(data)
+            _sftp_touch_activity(sftp)
+    finally:
+        try:
+            rf.close()
+        except Exception:
+            pass
+        try:
+            lf.close()
+        except Exception:
+            pass
+    if got != total_size:
+        raise IOError("下载续传不完整：得到 %d/%d 字节" % (got, total_size))
+    return got - existing
 
 
 def _transfer_extra(conn, **kw):
@@ -2537,6 +2667,11 @@ def cmd_upload(args):
                            "请写明确的完整路径" % remote, "bad_args")
         file_list = []  # 每项 {"path","size","transferred","skipped"}：失败时 AI 可精确断点重试
 
+        if args.resume and is_dir:
+            msg = "--resume 仅对单文件上传生效；目录上传忽略 --resume"
+            log("[WARN] " + msg)
+            walk_warnings.append(msg)
+
         if is_dir and no_recur:
             # 目录但 --no-recursive: 不递归，只创建远程目录壳
             if not args.dry_run:
@@ -2579,6 +2714,11 @@ def cmd_upload(args):
             # 单文件
             size = os.path.getsize(local)
             name = os.path.basename(local)
+            if size >= RESUME_MIN_SIZE and not args.resume:
+                tip = ("文件 %s ≥ %s，建议加 --resume 断点续传"
+                       "（中断后重试不重传已传部分）" % (name, format_size(RESUME_MIN_SIZE)))
+                log("[TIP] " + tip)
+                walk_warnings.append(tip)
             rstat = None
             if not args.dry_run:  # dry-run 应零远端 I/O
                 try:
@@ -2633,7 +2773,8 @@ def cmd_upload(args):
                 parent = posixpath.dirname(remote)
                 if parent:
                     sftp_makedirs(sftp, parent)
-                _sftp_put_atomic(sftp, local, remote, progress=bytes_uploaded)
+                _sftp_put_atomic(sftp, local, remote, progress=bytes_uploaded,
+                                 resume=bool(args.resume))
                 entry["transferred"] = True
                 files_transferred = 1
                 bytes_transferred = size
@@ -2751,6 +2892,13 @@ def cmd_download(args):
 
     def _fail_extra():
         """失败/中断的统一 extra：host/user/port（与连接期错误一致）+ 传输进度。"""
+        # --resume 中断：本地固定续传点保留时，warnings 提示下次可续传
+        #（串行路径的 _atomic_local_write 只 log stderr TIP，这里补 JSON 通道；
+        #  分片路径的 except 已单独加过，靠内容去重）
+        if getattr(args, "resume", False) and os.path.exists(local + ".part"):
+            tip = "下载中断，本地续传点已保留: %s（下次重试加 --resume 从断点继续）" % (local + ".part")
+            if tip not in dl_warnings:
+                dl_warnings.append(tip)
         return _transfer_extra(
             conn,
             file_list=file_list or [],
@@ -2798,6 +2946,11 @@ def cmd_download(args):
             remote, local, tag, ", dry-run" if args.dry_run else ""))
 
         file_list = []  # 每项 {"path","size","transferred","skipped"}：失败时 AI 可精确断点重试
+
+        if args.resume and is_dir:
+            msg = "--resume 仅对单文件下载生效；目录下载忽略 --resume"
+            log("[WARN] " + msg)
+            dl_warnings.append(msg)
 
         if is_dir and os.path.isfile(local):
             # 本地目标已存在且是文件：os.makedirs(..., exist_ok=True) 会抛
@@ -2899,6 +3052,11 @@ def cmd_download(args):
         else:
             size = rstat.st_size
             name = os.path.basename(remote)
+            if size >= RESUME_MIN_SIZE and not args.resume:
+                tip = ("文件 %s ≥ %s，建议加 --resume 断点续传"
+                       "（中断后重试不重传已传部分）" % (name, format_size(RESUME_MIN_SIZE)))
+                log("[TIP] " + tip)
+                dl_warnings.append(tip)
             if not name:
                 emit_error(args.json, "bad_args",
                            "无法从远程路径 %s 确定文件名（根目录/以 / 结尾），"
@@ -2938,29 +3096,52 @@ def cmd_download(args):
                     except Exception:
                         pass
                     sftp = None
-                    part = _part_path(local)
+                    part = local + ".part" if args.resume else _part_path(local)
                     try:
-                        _parallel_fetch(conn, args, remote, part, size, k)
+                        _parallel_fetch(conn, args, remote, part, size, k,
+                                        resume=bool(args.resume))
+                        # 清理分片 done 标记（--resume 续传时产生），再原子改名
+                        if args.resume:
+                            for i in range(k):
+                                dp = "%s.done.%d" % (part, i)
+                                if os.path.exists(dp):
+                                    try:
+                                        os.remove(dp)
+                                    except OSError:
+                                        pass
                         os.replace(part, local)
                     except BaseException:
-                        try:
-                            if os.path.exists(part):
-                                os.remove(part)
-                        except OSError:
-                            # Windows 下句柄未释放等会让删除失败：稍等重试一次，
-                            # 仍失败至少留 WARN（静默残留违背"不留半截文件"承诺）
-                            time.sleep(RETRY_SLEEP)
+                        if not args.resume:
                             try:
-                                os.remove(part)
+                                if os.path.exists(part):
+                                    os.remove(part)
                             except OSError:
-                                log("[WARN] 清理临时文件失败（可能有进程占用）： %s" % part)
+                                # Windows 下句柄未释放等会让删除失败：稍等重试一次，
+                                # 仍失败至少留 WARN（静默残留违背"不留半截文件"承诺）
+                                time.sleep(RETRY_SLEEP)
+                                try:
+                                    os.remove(part)
+                                except OSError:
+                                    log("[WARN] 清理临时文件失败（可能有进程占用）： %s" % part)
+                        else:
+                            # 续传模式：保留 .part + done 标记作为续传资产
+                            log("[TIP] 已保留本地续传点 %s（下次重试加 --resume 从断点继续）" % part)
+                            dl_warnings.append(
+                                "下载中断，本地续传点已保留: %s（下次重试加 --resume 从断点继续）" % part)
                         raise
                 else:
                     # 串行单连接同样走 .part + 原子改名：原子性不应随文件大小/
                     # 并行度静默变化（小文件中断也曾留下最终名的半截文件）
-                    _atomic_local_write(
-                        lambda part: sftp.get(remote, part, callback=_make_sftp_touch(sftp)),
-                        local)
+                    if args.resume:
+                        # --resume：从本地 .part 已有字节续传（_sftp_get_resume 内部
+                        # 处理"不存在全量/已有续传/大小异常覆盖"三种情形）
+                        _atomic_local_write(
+                            lambda part: _sftp_get_resume(sftp, remote, part, size),
+                            local, resume=True)
+                    else:
+                        _atomic_local_write(
+                            lambda part: sftp.get(remote, part, callback=_make_sftp_touch(sftp)),
+                            local)
                 try:
                     os.chmod(local, stat.S_IMODE(rstat.st_mode) & 0o777)  # 掩掉 setuid 等特殊位
                 except OSError:
@@ -3561,6 +3742,10 @@ def build_parser():
     p.add_argument("--dry-run", action="store_true", help="只打印清单不实际传输")
     p.add_argument("--skip-existing", dest="skip_existing", action="store_true",
                    help="目标文件已存在且大小一致则跳过（幂等重传，失败重试不重复传）")
+    p.add_argument("--resume", action="store_true",
+                   help="断点续传：中断后保留远端 .part，重试从断点继续（仅单文件；"
+                        "续传点基于大小，极端损坏场景可下载后 md5sum 复核；"
+                        "--resume 模式禁用并发写同一目标）")
     p.set_defaults(func=cmd_upload)
 
     # download
@@ -3579,6 +3764,10 @@ def build_parser():
     p.add_argument("--dry-run", action="store_true", help="只打印清单不实际传输")
     p.add_argument("--skip-existing", dest="skip_existing", action="store_true",
                    help="本地文件已存在且大小一致则跳过（幂等重下，失败重试不重复传）")
+    p.add_argument("--resume", action="store_true",
+                   help="断点续传：中断后保留本地 .part，重试从断点继续（仅单文件；"
+                        "续传点基于大小，极端损坏场景可下载后 md5sum 复核；"
+                        "--resume 模式禁用并发写同一目标）")
     p.add_argument("--parallel", type=_positive_int, choices=range(1, 9), metavar="1-8",
                    help="大文件分片下载的并行连接数 (默认自动：≥8MB 用 4，实际值见结果 "
                         "parallel_used 字段；跨境高丢包链路可试 8——若 8 失败"

@@ -80,8 +80,9 @@ python3 pssh.py ls root@1.2.3.4 --path '~'          # ~ 自动展开
 python3 pssh.py upload root@1.2.3.4 --local ./dist --remote /opt/app/dist
 python3 pssh.py download root@1.2.3.4 --remote /var/log/x.log --local ./x.log
 python3 pssh.py download root@1.2.3.4 --remote big.tar.gz --local . --parallel 8   # 大文件提速
+python3 pssh.py upload root@1.2.3.4 --local big.bin --remote /tmp/big.bin --resume  # 断点续传（≥50MB 未启用时会 TIP 提示）
 ```
-路径语义（`~` 展开、尾斜杠=目录意图、目录内容放入不嵌套）、并行分片、`.part` 原子性/双丢防护/中断残留、`file_list` 断点重试、`--dry-run`/`--skip-existing`/`--no-recursive`、符号链接处理完整语义见 **docs/transfer.md**
+路径语义（`~` 展开、尾斜杠=目录意图、目录内容放入不嵌套）、并行分片、`.part` 原子性/双丢防护/中断残留、**断点续传 `--resume`**（默认关；固定 `.part` 续传点、禁并发、分片 done 标记、基于大小校验）、`file_list` 断点重试、`--dry-run`/`--skip-existing`/`--no-recursive`、符号链接处理完整语义见 **docs/transfer.md**
 
 ### 跳板机
 ```bash
