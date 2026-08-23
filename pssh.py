@@ -120,7 +120,7 @@ except (ValueError, OSError, ImportError):
 # 时才 import。错误路径（--version/--help/bad_args/缺用户名/别名未配置）从
 # ~300ms 降到 ~30ms；极早期信号窗口也更短（handler 注册后只剩标准库 import）。
 
-VERSION = "1.5.5"
+VERSION = "1.5.6"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -214,6 +214,19 @@ RESUME_MIN_SIZE = 50 * 1024 * 1024   # 单文件 ≥ 此大小且未用 --resume
                              # （断点续传收益与文件大小/链路速度相关，做成常量可调）
 CMD_ECHO_LIMIT = 8192        # 结果 JSON 的 cmd 字段回显上限：--cmd-file 读入的大脚本
                              # 原样回显会让单行 JSON 到 MB 级撑爆调用方上下文；超限保留头尾
+# 错误类型的重试建议（emit_error 统一带出 retryable 字段，机器可读的重试决策）：
+#   True  = 同类错误重试可能成功且重试本身安全（网络/传输类）。exec 超时类
+#           retryable=True 仅表示"值得一试"——远程进程可能仍在运行/命令可能有
+#           副作用，重试前必须读 message 的"远程进程可能仍在运行"提示并先
+#           pgrep 确认/清理（bool 给机器"值不值得试"，message 给人"怎么试才安全"）。
+#   False = 重试无意义或需先改输入（凭据/参数/本地文件/命令本身失败）。
+# 未列出的类型（jump_failed 等混合原因类）默认 False（保守，message 说明具体原因）。
+_RETRYABLE_ERRORS = {
+    "connection_timeout", "connection_refused", "connection_failed", "dns_failed",
+    "connection_lost", "interrupted",
+    "upload_failed", "download_failed", "upload_timeout", "download_timeout",
+    "exec_idle_timeout", "exec_total_timeout", "exec_timeout",
+}
 
 # --- 正则模式（模块级编译一次；片段化让每个分支可独立注释/测试） ---
 _RE_IPV4 = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
@@ -582,6 +595,7 @@ def emit_error(use_json, error_type, message, extra=None):
     duration_ms 自 main() 启动计时，warnings 为空列表（extra 可覆盖）。
     """
     err = {"ok": False, "error": error_type, "message": message,
+           "retryable": error_type in _RETRYABLE_ERRORS,
            "version": VERSION,
            "action": _CURRENT_ACTION,
            "duration_ms": int((time.time() - _MAIN_START) * 1000) if _MAIN_START else None,
@@ -3615,7 +3629,8 @@ class PsshArgumentParser(argparse.ArgumentParser):
             # 不打印不输出，由外层 error() 统一打印一次（否则 JSON 会
             # 重复输出两行，破坏"单行 JSON"契约）
             raise SystemExit(2)
-        err = {"ok": False, "error": "bad_args", "message": "参数错误: %s" % message}
+        err = {"ok": False, "error": "bad_args", "message": "参数错误: %s" % message,
+               "retryable": False}  # 参数错不可重试（重试同样失败）
         if not self._want_text_mode():
             # 默认 JSON 模式：整行 JSON（与成功路径一致，AI 直接 loads）
             print(json.dumps(err, ensure_ascii=False), flush=True)

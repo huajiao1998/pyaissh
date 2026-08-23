@@ -3,6 +3,15 @@
 > 这是 pssh skill 的**子文档**（位于技能目录 `docs/` 子目录下，按需读取、不随 SKILL.md 自动注入）：契约（stdout 单行 JSON）以 SKILL.md 为准，本文是退出码与 error 类型的**完整**参考表。
 > **何时读**：任何失败场景需要精确分类与建议动作时；SKILL.md 只留高频摘要。
 
+## retryable 字段（v1.5.6，错误 JSON 恒有）
+
+错误 JSON 统一带 `retryable`（bool）：**机器可读的重试决策**——AI 自动重试策略直接读它，不必解析 message 文本。
+
+- **`true`** = 同类错误重试可能成功且重试本身安全：`connection_timeout` / `connection_refused` / `connection_failed` / `dns_failed` / `connection_lost` / `interrupted` / `upload_failed` / `download_failed` / `upload_timeout` / `download_timeout` / `exec_idle_timeout` / `exec_total_timeout` / `exec_timeout`
+- **`false`** = 重试无意义或需先改输入：`auth_failed`（凭据错，重试浪费）/ `host_key_rejected`（安全）/ `bad_args`（参数错）/ `read_cmd_failed`（本地文件）/ `exec_failed`（命令本身失败）/ `jump_failed`（混合原因，保守，message 说明具体）
+- **`exec_*_timeout` 的 `retryable=true` 仅表示"值得一试"**：远程进程可能仍在运行、命令可能有副作用——重试前必须读 message 的"远程进程可能仍在运行"提示并先 pgrep 确认/清理（bool 给机器"值不值得试"，message 给"怎么试才安全"）。`interrupted` 同理，非幂等命令谨慎重试
+- 成功结果**无** `retryable` 字段（仅错误 JSON 恒有）
+
 ## 退出码语义（完整版）
 
 | 码 | 含义 | 说明 |
