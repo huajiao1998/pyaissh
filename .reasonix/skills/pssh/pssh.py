@@ -120,6 +120,39 @@ import paramiko  # 慢 import：handler 已注册，此窗口内的信号走 han
 
 VERSION = "1.5.2"
 
+# =========================================================================
+# 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
+# 行号随编辑漂移）→ 行为细节见对应 docs 子文档。
+#   区域            关键函数                                对应文档
+#   信号/入口        _sigterm_handler / _signal_responder /   docs/errors.md（退出码 130）
+#                   _setup_signal_handlers / main             docs/edge-cases.md（极早期信号窗口）
+#   配置加载         _parse_env_file / load_env /             docs/setup.md
+#                   parse_target / _alias_env /
+#                   resolve_conn / resolve_jump
+#   路径             _fix_msys_remote_path /                 docs/setup.md
+#                   _fix_msys_local_path /
+#                   _sftp_home / _normalize_remote_path
+#   输出层           log / emit / emit_error /                docs/contract.md
+#                   _truncate_output / _utf8_boundary_cut /
+#                   _sanitize_log_text / _strip_ansi /
+#                   _clean_pty_text / warn_sensitive_cmd
+#   异常类型         SshError / ExecIdleTimeout /             docs/errors.md
+#                   ExecTotalTimeout
+#   连接层           connect / _do_connect /                  docs/setup.md（凭据/host key）
+#                   _host_key_known / _AtomicAutoAddPolicy    docs/edge-cases.md（known_hosts 原子写）
+#   SFTP 传输层      open_sftp / _sftp_watchdog /             docs/transfer.md
+#                   _parallel_fetch / _sftp_put_atomic /
+#                   _atomic_local_write / sftp_makedirs /
+#                   sftp_walk / _remote_size_is / _part_path
+#   exec            cmd_exec（读线程 _read / _drain_rest）    docs/exec.md
+#   upload/download cmd_upload / cmd_download /               docs/transfer.md
+#                   _win_safe_rel_path
+#   test / ls       cmd_test / cmd_ls                         SKILL.md「子命令速览」
+#   参数解析         build_parser / PsshArgumentParser /      SKILL.md「参数默认值」
+#                   _port / _max_time / _exec_timeout
+#   常量/正则        _CONSTANTS（本文件顶部）                 调参只改此处
+# =========================================================================
+
 # --text 模式分隔标记的随机 nonce：远程输出无法预测它，伪造不出有效标记
 # （标记形如 ---STDOUT.1a2b3c---，每个标记携带本次运行的 nonce 后缀）
 _TEXT_NONCE = os.urandom(3).hex()
