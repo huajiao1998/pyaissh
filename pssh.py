@@ -118,7 +118,7 @@ except (ValueError, OSError, ImportError):
 
 import paramiko  # 慢 import：handler 已注册，此窗口内的信号走 handler 而非默认动作
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 
 # --text 模式分隔标记的随机 nonce：远程输出无法预测它，伪造不出有效标记
 # （标记形如 ---STDOUT.1a2b3c---，每个标记携带本次运行的 nonce 后缀）
@@ -138,6 +138,94 @@ _ACTIVE_TRANSPORTS = []
 # _sftp_put_atomic 中断时远端 .part 清理失败的记录（连接已坏清不掉）：
 # 合并进 upload 结果/失败的 warnings，AI 才知道远端有残留待清理
 _PUT_RESIDUE_WARNINGS = []
+
+
+# =========================================================================
+# 常量区（v1.5.2 集中）：所有"魔数"与正则模式定义在此，逻辑/消息统一引用，
+# 调参只改一处；每个常量带"为什么是这个值"的注释（从原位置搬移，不丢语义）。
+# =========================================================================
+
+# --- 超时与时长上限（秒） ---
+MAX_TIME_CAP = 1200          # --max-time/--idle-timeout 上限；exec 总时长硬顶（构建/编译类长任务）
+DEFAULT_MIN_TOTAL = 120      # exec 默认总时长下限：未指定 --max-time 时 max(2×idle, 120)
+MAX_PORT = 65535             # 端口范围上限（1-65535）
+SFTP_IO_TIMEOUT = 30         # 单次网络读无数据的超时秒数：防 NAT 断链/网络黑洞导致无限悬挂
+PARALLEL_MIN_SIZE = 8 * 1024 * 1024   # 大文件分片阈值：低于此大小单连接（建连开销大于收益）
+                             # 背景：单条 TCP 流在高丢包/长 RTT 链路（如跨境）吞吐塌陷
+                             #（实测单流 ~20KB/s，8 条独立连接 ~104KB/s），达阈值自动并行
+PARALLEL_IO_TIMEOUT = 120    # 分片工作线程的看门狗窗口：高丢包链路单流可能长时间停滞，
+                             # 用 30s 会误杀仍然存活的慢传输
+DRAIN_WINDOW = 10            # exec 收尾排水窗口上限：min(exec_timeout, 10)
+STATUS_GRACE = 2             # test 收到 stdout EOF 后等 exit-status 的最长宽限（高延迟链路实测会晚到）
+STDERR_EOF_WINDOW = 1        # test stdout EOF 后收 stderr 尾部的窗口（秒）
+SILENCE_GRACE = 1            # 静默超时判定的额外宽限（exit-status 包可能还在路上时避免误判挂死）
+
+# --- 轮询 / 缓冲 / IO 块（秒 / 字节） ---
+POLL_TICK = 0.05             # exec 主循环 / test 状态等待的轮询间隔
+RESPONDER_TICK = 0.05        # 信号救援线程空闲轮询 tick
+RESPONDER_GRACE = 0.2        # 救援线程置标志后的宽限（避免误杀刚建立/即将恢复的连接）
+RESPONDER_AFTER = 0.5        # 救援线程关闭连接后的再轮询间隔（兜住分片重建）
+WATCHDOG_TICK = 5            # SFTP 看门狗检查间隔
+RECV_CHUNK = 65536           # 单次 recv 读块（64KB）
+PARALLEL_READ_CHUNK = 262144  # 分片下载单次读块（256KB；与 DEFAULT_MAX_OUTPUT 同值不同义，分开命名）
+DEFAULT_MAX_OUTPUT = 262144  # exec 单流默认最大保留字节（256KB：内存缓冲与显示截断同源）
+BUF_ALIGN_WINDOW = 4096      # 截断行对齐时回退搜索窗口（字节）
+MIN_BUF_FLOOR = 4096         # 内存缓冲下限：max(args.max_output, 4096) 保证小档位也有可用缓冲
+JOIN_GRACE = 1.5             # 读线程 join 宽限（秒）
+RETRY_SLEEP = 0.5            # Windows 句柄未释放等场景的删除重试等待
+PUT_RETRY_SLEEP = 0.3        # 远端 .part 清理重试等待
+
+# --- 正则模式（模块级编译一次；片段化让每个分支可独立注释/测试） ---
+_RE_IPV4 = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
+_RE_IPV6_SEG = re.compile(r"[0-9a-fA-F]{1,4}")
+_RE_IPV6_ZONE = re.compile(r"[0-9a-zA-Z._+-]+")
+_RE_WIN_ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
+
+# 疑似凭据模式片段（保守匹配，避免误报）。拼接顺序与历史 alternation 完全一致
+#（等价变换，L4 矩阵 40 例验证）。匹配形态：
+#   - password=xxx / password: xxx / --password xxx / --password=xxx
+#   - -p'xxx' / -p"xxx" / -psecret / -p secret（排除纯数字端口：-p 22 / -p'22' / -p123456）
+#   - mysql -u root -p xxx / curl -u user:pass
+_P_SENS_PASSWORD = r"passw[o0]?rd\s*[=:]\s*\S+|--password(?:\s+|=)\S+"
+_P_SENS_USER = r"--user\s+\S+:\S+"          # curl --user admin:pw 长形式
+_P_SENS_URL = r"\b[a-z][a-z0-9+.-]*://[^\s/@]+:[^\s/@]+@"   # https://user:pass@host/
+_P_SENS_ENV = r"\b\w*(?:PASS(?:WORD|WD|CODE)?|PWD)\s*[=:]\s*\S+"   # DB_PASS=x / DB_PASS: x / MYSQL_PWD=
+_P_SENS_P_QUOTED = r"-p['\"](?!\d+['\"])[^'\"]+['\"]"   # -p'secret'（排除 -p'22' 纯数字端口/ID）
+# -psecret 紧贴形态（-p 后必须非空白，空格形态交给 _P_SENS_P_SPACE）：
+# 前缀 lookbehind 排除常见非密码工具（scp/rsync/curl/make/install/find/perl/echo/unzip/gcc/xargs/awk）
+_P_SENS_P_ATTACH = (
+    r"(?<!scp )(?<!rsync )(?<!curl )(?<!make )(?<!install )"
+    r"(?<!find )(?<!perl )(?<!echo )(?<!unzip )(?<!gcc )(?<!xargs )(?<!awk )"
+    r"(?<!-)-p(?!['\"]?\d+(?:['\"]|\b))(?!\s)"
+    r"(?!rin|rune|thread|pe\b|roxy|ort|ath|ass|lain)\S+"
+)
+# -p secret（空格分隔）：lookbehind 排除常见非密码工具（cp/mkdir/ls/tar/scp/rsync/curl/
+# make/install/unzip/pytest/awk/xargs/wget，覆盖单/双空格）；(?!--)/(?!-) 排除 -p 后跟选项；
+# 词表排除选项名、工具参数与协议名；[^\s/]+ 排除路径类参数（rsync -p /x、mkdir -p a/b 的兜底）
+_P_SENS_P_SPACE = (
+    r"(?<!cp )(?<!cp  )(?<!ls )(?<!ls  )(?<!tar )(?<!tar  )(?<!scp )(?<!scp  )"
+    r"(?<!mkdir )(?<!mkdir  )(?<!rsync )(?<!rsync  )(?<!curl )(?<!curl  )"
+    r"(?<!make )(?<!make  )(?<!install )(?<!install  )"
+    r"(?<!unzip )(?<!unzip  )(?<!pytest )(?<!pytest  )(?<!awk )(?<!awk  )"
+    r"(?<!xargs )(?<!xargs  )(?<!wget )(?<!wget  )"
+    r"-p\s+(?!\d+\b)(?!--)(?!-)(?!proxy\b|roxy\b|port\b|path\b|pass\b|plain\b|"
+    r"log\b|diff\b|show\b|status\b|add\b|commit\b|clone\b|pull\b|push\b|remote\b|"
+    r"branch\b|checkout\b|merge\b|tag\b|stash\b|init\b|config\b|fetch\b|rebase\b|"
+    r"reset\b|rm\b|mv\b|help\b|version\b|verbose\b|git\b|docker\b|nmap\b|"
+    r"tcp\b|udp\b|icmp\b)"
+    r"[^\s/]+"
+)
+_P_SENS_MYSQL = r"mysql\s+-u\s*\S+\s+-p\s*\S*"
+_P_SENS_CURL_U = r"curl\s+.*-u\s*\S+:\S+"
+
+_SENSITIVE_CMD_RE = re.compile(
+    r"(?i)(%s|%s|%s|%s|%s|%s|%s|%s|%s)" % (
+        _P_SENS_PASSWORD, _P_SENS_USER, _P_SENS_URL, _P_SENS_ENV,
+        _P_SENS_P_QUOTED, _P_SENS_P_ATTACH, _P_SENS_P_SPACE,
+        _P_SENS_MYSQL, _P_SENS_CURL_U,
+    ))
+
+_ANSI_RE = re.compile(r"\x1b\][^\x07]*\x07|\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][0-9A-Za-z]|\x1b.")
 
 
 def _safe_int(value, default, name="端口"):
@@ -568,11 +656,11 @@ def _truncate_output(data, limit, stream_name):
         # 行对齐：头尾边界各自退到最近的换行（限窗 4KB；二进制流无换行则保持
         # 字节边界）——逐行解析的消费者不会拿到首尾各一行"缺半"的残行。
         # 只向后退不会超出 limit；省略量在行对齐后重算，记账与实际字节严格一致
-        nl = head.rfind(b"\n", max(0, len(head) - 4096))
+        nl = head.rfind(b"\n", max(0, len(head) - BUF_ALIGN_WINDOW))
         if nl != -1:
             head = head[:nl + 1]
         t_start = len(data) - len(tail)
-        nl2 = data.rfind(b"\n", max(0, t_start - 4096), t_start)
+        nl2 = data.rfind(b"\n", max(0, t_start - BUF_ALIGN_WINDOW), t_start)
         if nl2 != -1:
             tail = data[nl2 + 1:]
         omitted = len(data) - len(head) - len(tail)
@@ -597,41 +685,6 @@ def _truncate_output(data, limit, stream_name):
         return cut, True, len(data) - len(cut)
     return result, True, omitted
 
-
-# 疑似凭据模式（保守匹配，避免误报）：
-#   - password=xxx / password: xxx / --password xxx / --password=xxx
-#   - -p'xxx' / -p"xxx" / -psecret / -p secret（排除纯数字端口：-p 22 / -p'22' / -p123456）
-#   - mysql -u root -p xxx / curl -u user:pass
-_SENSITIVE_CMD_RE = re.compile(
-    r"(?i)(passw[o0]?rd\s*[=:]\s*\S+|--password(?:\s+|=)\S+|"
-    r"--user\s+\S+:\S+|"  # curl --user admin:pw 长形式
-    r"\b[a-z][a-z0-9+.-]*://[^\s/@]+:[^\s/@]+@|"  # https://user:pass@host/
-    r"\b\w*(?:PASS(?:WORD|WD|CODE)?|PWD)\s*[=:]\s*\S+|"  # DB_PASS=x / DB_PASS: x / MYSQL_PWD=
-    r"-p['\"](?!\d+['\"])[^'\"]+['\"]|"  # -p'secret'（排除 -p'22' 纯数字端口/ID）
-    r"(?<!scp )(?<!rsync )(?<!curl )(?<!make )(?<!install )"
-    r"(?<!find )(?<!perl )(?<!echo )(?<!unzip )(?<!gcc )(?<!xargs )(?<!awk )"
-    r"(?<!-)-p(?!['\"]?\d+(?:['\"]|\b))(?!\s)"
-    r"(?!rin|rune|thread|pe\b|roxy|ort|ath|ass|lain)\S+|"  # -psecret 紧贴形态（-p 后必须非空白，空格形态交给下一分支）
-    # -p secret（空格分隔）：lookbehind 排除常见非密码工具（cp/mkdir/tar/ls/scp/rsync/curl/
-    # make/pip install，覆盖单/双空格）；(?!--)/(?!-) 排除 -p 后跟选项；词表排除选项名、
-    # 工具参数与协议名；[^\s/]+ 排除路径类参数（rsync -p /x、mkdir -p a/b 的兜底）
-    r"(?<!cp )(?<!cp  )(?<!ls )(?<!ls  )(?<!tar )(?<!tar  )(?<!scp )(?<!scp  )"
-    r"(?<!mkdir )(?<!mkdir  )(?<!rsync )(?<!rsync  )(?<!curl )(?<!curl  )"
-    r"(?<!make )(?<!make  )(?<!install )(?<!install  )"
-    r"(?<!unzip )(?<!unzip  )(?<!pytest )(?<!pytest  )(?<!awk )(?<!awk  )"
-    r"(?<!xargs )(?<!xargs  )(?<!wget )(?<!wget  )"
-    r"-p\s+(?!\d+\b)(?!--)(?!-)(?!proxy\b|roxy\b|port\b|path\b|pass\b|plain\b|"
-    r"log\b|diff\b|show\b|status\b|add\b|commit\b|clone\b|pull\b|push\b|remote\b|"
-    r"branch\b|checkout\b|merge\b|tag\b|stash\b|init\b|config\b|fetch\b|rebase\b|"
-    r"reset\b|rm\b|mv\b|help\b|version\b|verbose\b|git\b|docker\b|nmap\b|"
-    r"tcp\b|udp\b|icmp\b)"
-    r"[^\s/]+|"
-    r"mysql\s+-u\s*\S+\s+-p\s*\S*|"
-    r"curl\s+.*-u\s*\S+:\S+)"
-)
-
-
-_ANSI_RE = re.compile(r"\x1b\][^\x07]*\x07|\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][0-9A-Za-z]|\x1b.")
 
 # Windows 保留设备名（下载路径防护）：任何盘符下这些名字都无法作为文件创建
 # （含扩展名变体 CON.txt 也算），递归下载遇到会整体中止
@@ -740,7 +793,7 @@ def parse_target(target):
                     port = int(rest[1:])
                 except ValueError:
                     raise SshError("目标端口非数字: %s" % rest[1:], "bad_args")
-                if not 1 <= port <= 65535:
+                if not 1 <= port <= MAX_PORT:
                     raise SshError("目标端口超出范围 (1-65535): %s" % rest[1:], "bad_args")
     elif target.count(":") == 1:
         # 普通 host:port
@@ -749,7 +802,7 @@ def parse_target(target):
             port = int(port_s)
         except ValueError:
             raise SshError("目标端口非数字: %s" % port_s, "bad_args")
-        if not 1 <= port <= 65535:
+        if not 1 <= port <= MAX_PORT:
             raise SshError("目标端口超出范围 (1-65535): %s" % port_s, "bad_args")
     elif target.count(":") > 1:
         # 裸 IPv6（多个冒号）：校验每段是合法 hex（1-4 位），
@@ -764,16 +817,16 @@ def parse_target(target):
             if i == len(segs) - 1 and "%" in s:
                 # zone id：接口名（eth0、enp0s3、%25 编码等）
                 addr_part, _, zone = s.partition("%")
-                if not zone or not re.fullmatch(r"[0-9a-zA-Z._+-]+", zone):
+                if not zone or not _RE_IPV6_ZONE.fullmatch(zone):
                     raise SshError("目标格式错误（IPv6 zone id 非法）: %s" % target, "bad_args")
                 s = addr_part
-            if i == len(segs) - 1 and re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", s):
+            if i == len(segs) - 1 and _RE_IPV4.fullmatch(s):
                 # IPv4-mapped 尾段（::ffff:1.2.3.4）：dotted-quad 是合法 IPv6
                 # 字面量的一部分，此前被当非法 hex 段拒绝；逐段校验 0-255
                 if any(int(o) > 255 for o in s.split(".")):
                     raise SshError("目标格式错误（IPv4 尾段越界）: %s" % target, "bad_args")
                 continue
-            if s and not re.fullmatch(r"[0-9a-fA-F]{1,4}", s):
+            if s and not _RE_IPV6_SEG.fullmatch(s):
                 raise SshError("目标格式错误（多冒号但非合法 IPv6 地址）: %s" % target, "bad_args")
         host = target
     else:
@@ -831,7 +884,7 @@ def resolve_conn(args):
     port = args.port if args.port is not None else t_port
     if port is None:
         port = _safe_int(os.environ.get("PSSH_PORT"), 22, "PSSH_PORT")
-    if not port or not 1 <= port <= 65535:
+    if not port or not 1 <= port <= MAX_PORT:
         # 命令行 --port 已由 argparse 校验（1-65535）；这里只管 env 与 target
         # 内嵌端口：0/负值/越界/非数字一律回退默认 22 并打 WARN
         log("[WARN] 端口 %r 超出范围 (1-65535)，回退默认 22" % port)
@@ -1275,14 +1328,6 @@ def close_all(client):
 # SFTP 辅助：远程目录操作
 # =========================================================================
 
-SFTP_IO_TIMEOUT = 30  # 单次网络读无数据的超时秒数：防 NAT 断链/网络黑洞导致无限悬挂
-
-# 大文件分片下载：单条 TCP 流在高丢包/长 RTT 链路（如跨境）吞吐会塌陷
-# （实测：单流 ~20KB/s，8 条独立连接 ~104KB/s）。文件达到阈值自动并行。
-PARALLEL_MIN_SIZE = 8 * 1024 * 1024   # 低于此大小单连接（建连开销大于收益）
-PARALLEL_IO_TIMEOUT = 120             # 分片工作线程的看门狗窗口：高丢包链路单流可能长时间停滞，
-                                      # 用 30s 会误杀仍然存活的慢传输
-
 
 def _sftp_touch_activity(sftp):
     """刷新 SFTP 看门狗活动时间：任何 SFTP 操作（含 listdir/stat/mkdir/walk）
@@ -1314,7 +1359,7 @@ def _sftp_watchdog(sftp):
     io_timeout = getattr(sftp, "_pssh_io_timeout", SFTP_IO_TIMEOUT)
     try:
         while True:
-            time.sleep(5)
+            time.sleep(WATCHDOG_TICK)
             try:
                 # paramiko 5.0 的 SFTPClient：self.sock 是 channel（有 closed），
                 # transport 通过 sock.get_transport() 取
@@ -1436,7 +1481,7 @@ def _parallel_fetch(conn, args_, remote, local, size, k):
                         # （实测 --parallel 2/4 中断延迟 90-145s）。
                         raise KeyboardInterrupt("SIGTERM")
                     rf.seek(off)
-                    data = rf.read(min(262144, end - off))
+                    data = rf.read(min(PARALLEL_READ_CHUNK, end - off))
                     if not data:
                         raise IOError("远端在偏移 %d 处提前 EOF（文件传输中被修改？）" % off)
                     lf.seek(off)
@@ -1630,7 +1675,7 @@ def _atomic_local_write(write_fn, local):
         except OSError:
             # Windows 下句柄未释放等会让删除失败：稍等重试一次，
             # 仍失败至少留 WARN（静默残留违背"不留半截文件"承诺）
-            time.sleep(0.5)
+            time.sleep(RETRY_SLEEP)
             try:
                 os.remove(part)
             except OSError:
@@ -1711,7 +1756,7 @@ def _sftp_put_atomic(sftp, local, remote, progress=None):
                 removed = True
                 break
             except Exception:
-                time.sleep(0.3)
+                time.sleep(PUT_RETRY_SLEEP)
         if not removed and not part_touched[0]:
             # 未开始写入：用 stat 确认；只有明确"文件不存在"才不告警
             try:
@@ -1764,7 +1809,7 @@ def _win_safe_rel_path(rel, used, warnings):
             return None
         # 控制字符（0x00-0x1f、0x7f）在 Windows 文件名里非法：
         # open() 会抛 Errno 22 中止整个下载——同样替换为 _
-        safe_parts.append(re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', "_", p))
+        safe_parts.append(_RE_WIN_ILLEGAL.sub("_", p))
     safe_rel = "/".join(safe_parts)
     if safe_rel != rel:
         warnings.append(_sanitize_log_text(
@@ -1868,8 +1913,8 @@ def cmd_exec(args):
         # 的是空（实测：总超时时 3.8MB 已读输出全部丢失）
         if stop_drain is not None:
             stop_drain.set()
-            t_out.join(1.5)
-            t_err.join(1.5)
+            t_out.join(JOIN_GRACE)
+            t_err.join(JOIN_GRACE)
         out_raw = b"".join(out_buf)
         err_raw = b"".join(err_buf)
         out_cut, _, _ = _truncate_output(out_raw, args.max_output, "stdout")
@@ -1936,7 +1981,7 @@ def cmd_exec(args):
         # 中间溢出丢弃并累计 dropped——防止大输出（cat 大文件/恶意流）无限吃内存，
         # --max-output 不只是"最后截显示"，而是真正限制内存占用。
         # （计数器已在 try 之前预置，这里只复用，不重新定义）
-        buf_limit = max(args.max_output, 4096)
+        buf_limit = max(args.max_output, MIN_BUF_FLOOR)
         # 头尾配额直接各取 buf_limit//2：不给接缝标记单独预留。之前预留 512B
         # 导致输出量介于 limit-512 与 limit 之间时内存层就提前溢出丢弃（假截断
         # 丢尾，实测 4000 字节/4096 上限丢 416 字节）。head+seam+tail ≤ limit
@@ -1952,7 +1997,7 @@ def cmd_exec(args):
             why = "timeout"  # 循环条件退出=静默超时；EOF/异常/stop_drain 会改写
             while time.time() < silence_deadline[0] and not stop_drain.is_set():
                 try:
-                    data = recv_fn(65536)
+                    data = recv_fn(RECV_CHUNK)
                 except (socket.timeout, TimeoutError):
                     continue  # 无数据 tick，回到循环头检查 deadline
                 except Exception:
@@ -2012,7 +2057,7 @@ def cmd_exec(args):
             was_line_boundary = False
             if real_gap and head_part:
                 was_line_boundary = head_part[-1:] == b"\n"
-                nl = head_part.rfind(b"\n", max(0, len(head_part) - 4096))
+                nl = head_part.rfind(b"\n", max(0, len(head_part) - BUF_ALIGN_WINDOW))
                 if nl != -1:
                     drop_cnt[0] += len(head_part) - (nl + 1)
                     head_part = head_part[:nl + 1]
@@ -2023,7 +2068,7 @@ def cmd_exec(args):
                 # tail 就是一行），该行是完整行——消费它会把尾部整段丢掉
                 # （实测 --max-output<=8192 时单行大输出尾部全丢且无 seam
                 # 标记，warnings 还谎称"仅保留头尾"），必须保留
-                nl2 = tail_part.find(b"\n", 0, 4096)
+                nl2 = tail_part.find(b"\n", 0, BUF_ALIGN_WINDOW)
                 if nl2 != -1 and nl2 < len(tail_part) - 1:
                     drop_cnt[0] += nl2 + 1
                     tail_part = tail_part[nl2 + 1:]
@@ -2103,15 +2148,15 @@ def cmd_exec(args):
         # （读线程持续排水，不会触发大输出死锁）。
         # 总超时兜底：静默超时只覆盖"无输出"场景；持续输出但不结束的命令
         # （如 while true; echo x）会无限重置静默计时，必须有硬上限。
-        # 默认 max(2×exec-timeout, 120)，长任务（构建/编译）用 --max-time 手动调大（最高 1200）。
-        total_limit = args.max_time if args.max_time is not None else max(args.exec_timeout * 2, 120)
-        if total_limit > 1200:
+        # 默认 max(2×exec-timeout, DEFAULT_MIN_TOTAL)，长任务（构建/编译）用 --max-time 手动调大（最高 MAX_TIME_CAP）。
+        total_limit = args.max_time if args.max_time is not None else max(args.exec_timeout * 2, DEFAULT_MIN_TOTAL)
+        if total_limit > MAX_TIME_CAP:
             # 告警同时进 JSON warnings：只看 stdout 的 AI 必须知道实际生效上限被改小
-            msg = ("总时长上限 %ds 超过 1200，本次按 1200 执行（与 --max-time 上限一致；"
-                   "更久任务请用 nohup 后台化 + 轮询）" % total_limit)
+            msg = ("总时长上限 %ds 超过 %d，本次按 %d 执行（与 --max-time 上限一致；"
+                   "更久任务请用 nohup 后台化 + 轮询）" % (total_limit, MAX_TIME_CAP, MAX_TIME_CAP))
             log("[WARN] " + msg)
             warnings.append(msg)
-            total_limit = 1200
+            total_limit = MAX_TIME_CAP
         total_deadline = time.time() + total_limit
         while not chan.exit_status_ready():
             if _SIGTERM_RECEIVED:
@@ -2130,7 +2175,7 @@ def cmd_exec(args):
                 if out_reason[0] == "timeout" or err_reason[0] == "timeout":
                     # 读线程因静默超时退出而远程未结束 -> 判定挂死
                     # （留 1s 宽限，避免 exit-status 包还在路上时误判）
-                    if time.time() > silence_deadline[0] + 1.0:
+                    if time.time() > silence_deadline[0] + SILENCE_GRACE:
                         raise ExecIdleTimeout(
                             "命令执行超时（连续无输出 %ss）。注意：远程进程可能仍在运行"
                             "（断开连接不会杀掉它），副作用类命令重试前请先 pgrep 确认/清理；"
@@ -2151,9 +2196,9 @@ def cmd_exec(args):
                         % (args.exec_timeout, total_limit))
                 raise ExecTotalTimeout(
                     "命令执行超时（持续输出但未结束，总时长超过 %ds）。长任务请用 --max-time "
-                    "调大（最高 1200）；注意：远程进程可能仍在运行，重试前请先 pgrep 确认/清理"
-                    % total_limit)
-            time.sleep(0.05)
+                    "调大（最高 %d）；注意：远程进程可能仍在运行，重试前请先 pgrep 确认/清理"
+                    % (total_limit, MAX_TIME_CAP))
+            time.sleep(POLL_TICK)
         exit_code = chan.exit_status if chan.exit_status_ready() else -1
         if exit_code == -1:
             # 通道已关闭但未收到退出状态（网络中断/远程异常断开）：
@@ -2167,7 +2212,7 @@ def cmd_exec(args):
         # 收尾阶段【不】缩短 silence_deadline：读线程必须因 EOF（数据收完）退出才算完整；
         # 若因静默超时退出说明输出未完，会被 drain_deadline 强制截断并标记 truncated，
         # 避免"输出被丢但无标记"让 AI 误判完整。drain_deadline 单独兜底返回时长。
-        drain_limit = min(args.exec_timeout, 10)
+        drain_limit = min(args.exec_timeout, DRAIN_WINDOW)
         drain_deadline = time.time() + drain_limit
         while (t_out.is_alive() or t_err.is_alive()) and time.time() < drain_deadline:
             if _SIGTERM_RECEIVED:
@@ -2175,7 +2220,7 @@ def cmd_exec(args):
                 # 否则 responder 关 socket 会让 drain 读到"通道异常"误标
                 # output_truncated，AI 看到"命令成功但输出被截断"而非"被中断"
                 raise KeyboardInterrupt("SIGTERM")
-            time.sleep(0.05)
+            time.sleep(POLL_TICK)
         t_out.join(0.5)
         t_err.join(0.5)
         drain_truncated = (t_out.is_alive() or t_err.is_alive())
@@ -2192,7 +2237,7 @@ def cmd_exec(args):
             limit = args.max_output  # 排空也限内存：超限即视为不完整
             while time.time() < deadline:
                 try:
-                    data = recv_fn(65536)
+                    data = recv_fn(RECV_CHUNK)
                 except (socket.timeout, TimeoutError):
                     continue
                 except Exception:
@@ -2222,8 +2267,8 @@ def cmd_exec(args):
             stop_drain.set()
             # 读线程可能正阻塞在 recv（最长 1s tick），set 后等它醒来收完
             # 最后一块数据再退出，避免 join 后组装时漏掉最后一块输出
-            t_out.join(1.5)
-            t_err.join(1.5)
+            t_out.join(JOIN_GRACE)
+            t_err.join(JOIN_GRACE)
             warnings.append("输出已截断：命令已结束但输出流仍被后台进程占用，输出可能不完整")
             log("[WARN] 命令已结束但输出流仍被后台进程占用，已截断（输出可能不完整）")
         else:
@@ -2855,7 +2900,7 @@ def cmd_download(args):
                         except OSError:
                             # Windows 下句柄未释放等会让删除失败：稍等重试一次，
                             # 仍失败至少留 WARN（静默残留违背"不留半截文件"承诺）
-                            time.sleep(0.5)
+                            time.sleep(RETRY_SLEEP)
                             try:
                                 os.remove(part)
                             except OSError:
@@ -3000,11 +3045,11 @@ def cmd_test(args):
                 #  拼出 ok:true + 退出码 0，信号被完全吞掉——实测 P1）
                 raise KeyboardInterrupt("SIGTERM")
             try:
-                data = chan.recv(65536)
+                data = chan.recv(RECV_CHUNK)
             except (socket.timeout, TimeoutError):
                 # 无 stdout 数据：趁机收 stderr（BUG-9：EOF 后 stderr 尾部不能丢）
                 try:
-                    ed = chan.recv_stderr(65536)
+                    ed = chan.recv_stderr(RECV_CHUNK)
                     if ed:
                         err_chunks.append(ed)
                 except Exception:
@@ -3016,9 +3061,9 @@ def cmd_test(args):
                 # stdout EOF：命令已结束（uname 类），短窗口（1s）收完 stderr 尾部
                 # 即退出，不再空转到固定 deadline（否则每次 test 固定耗时 --timeout 秒）
                 eof_at = time.time()
-                while time.time() - eof_at < 1.0:
+                while time.time() - eof_at < STDERR_EOF_WINDOW:
                     try:
-                        ed = chan.recv_stderr(65536)
+                        ed = chan.recv_stderr(RECV_CHUNK)
                     except Exception:
                         break
                     if not ed:
@@ -3036,9 +3081,9 @@ def cmd_test(args):
         if not status_ready:
             # stdout EOF 后 exit-status 包可能还在路上（高延迟链路实测会晚到）：
             # 短等 2s 再下结论，避免把成功的探测误报成"超时/未完成"
-            _status_wait = time.time() + 2
+            _status_wait = time.time() + STATUS_GRACE
             while time.time() < _status_wait and not chan.exit_status_ready():
-                time.sleep(0.05)
+                time.sleep(POLL_TICK)
             status_ready = chan.exit_status_ready()
         out_s = b"".join(chunks).decode("utf-8", errors="replace").strip().splitlines()
         err_s = b"".join(err_chunks).decode("utf-8", errors="replace").strip()
@@ -3310,7 +3355,7 @@ def _port(value):
         v = int(value)
     except (ValueError, TypeError):
         raise argparse.ArgumentTypeError("端口必须为整数（收到 %r，如 22）" % (value,))
-    if not 1 <= v <= 65535:
+    if not 1 <= v <= MAX_PORT:
         raise argparse.ArgumentTypeError("端口必须在 1-65535 之间")
     return v
 
@@ -3321,8 +3366,9 @@ def _max_time(value):
         v = int(value)
     except (ValueError, TypeError):
         raise argparse.ArgumentTypeError("总时长上限必须为整数秒（收到 %r，如 600）" % (value,))
-    if not 1 <= v <= 1200:
-        raise argparse.ArgumentTypeError("总时长上限必须在 1-1200 秒之间（构建/编译等长任务最高 1200）")
+    if not 1 <= v <= MAX_TIME_CAP:
+        raise argparse.ArgumentTypeError("总时长上限必须在 1-%d 秒之间（构建/编译等长任务最高 %d）"
+                                         % (MAX_TIME_CAP, MAX_TIME_CAP))
     return v
 
 
@@ -3336,8 +3382,9 @@ def _exec_timeout(value):
         v = int(value)
     except (ValueError, TypeError):
         raise argparse.ArgumentTypeError("静默超时必须为整数秒（收到 %r，如 60）" % (value,))
-    if not 1 <= v <= 1200:
-        raise argparse.ArgumentTypeError("静默超时必须在 1-1200 秒之间（与 --max-time 上限一致）")
+    if not 1 <= v <= MAX_TIME_CAP:
+        raise argparse.ArgumentTypeError("静默超时必须在 1-%d 秒之间（与 --max-time 上限一致）"
+                                         % MAX_TIME_CAP)
     return v
 
 
@@ -3434,7 +3481,7 @@ def build_parser():
     p.add_argument("--max-time", dest="max_time", type=_max_time,
                    help="命令总时长上限秒数（wall clock；默认 2×idle-timeout 且至少 120，"
                         "不得小于 --idle-timeout；构建/编译等长任务请调大，最高 1200）")
-    p.add_argument("--max-output", dest="max_output", type=_positive_int, default=262144,
+    p.add_argument("--max-output", dest="max_output", type=_positive_int, default=DEFAULT_MAX_OUTPUT,
                    help="stdout/stderr 单流最大保留字节，超出保留头尾各一半 (默认 256KB)")
     p.add_argument("--no-credential-warn", dest="no_credential_warn", action="store_true",
                    help="关闭\"命令含疑似凭据\"的 WARN 提示（启发式误报时用；仍建议敏感凭据走环境变量注入）")
@@ -3532,7 +3579,7 @@ def _signal_responder():
     deadline = None
     closed_once = False
     while True:
-        time.sleep(0.05)
+        time.sleep(RESPONDER_TICK)
         if not _SIGTERM_RECEIVED:
             # 空闲自复位：进程内复用（AI 嵌入/测试 harness 同进程多次 main()）
             # 时，上一轮中断的 deadline/closed_once 不残留到下一轮（否则新
@@ -3541,7 +3588,7 @@ def _signal_responder():
             closed_once = False
             continue
         if deadline is None:
-            deadline = time.time() + 0.2
+            deadline = time.time() + RESPONDER_GRACE
         if time.time() < deadline:
             continue
         n = 0
@@ -3555,7 +3602,7 @@ def _signal_responder():
         if n and not closed_once:
             closed_once = True
             log("[WARN] 信号中断：已强制断开 %d 条连接解除阻塞" % n)
-        time.sleep(0.5)
+        time.sleep(RESPONDER_AFTER)
 
 
 def _setup_signal_handlers():
