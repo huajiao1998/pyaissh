@@ -1693,10 +1693,15 @@ def _remote_size_is(sftp, rpath, size):
 
 
 def sftp_makedirs(sftp, remote_dir):
-    """递归创建远程目录（类似 os.makedirs，已存在则跳过）"""
+    """递归创建远程目录（类似 os.makedirs，已存在则跳过）。
+
+    返回本次【新建】的目录列表（外层→内层顺序；已存在的不算）。
+    v1.5.6 起：单文件上传用它自动建父目录后，调用方据返回值提示
+    AI 新建了哪些目录（拼写错误的垃圾目录树可被发现）；目录传输的
+    自动创建是文档明示行为，调用方不检查返回值即保持静默。"""
     remote_dir = remote_dir.rstrip("/")
     if remote_dir in ("", ".", "/"):
-        return
+        return []
     try:
         _sftp_touch_activity(sftp)
         st = sftp.stat(remote_dir)
@@ -1705,7 +1710,7 @@ def sftp_makedirs(sftp, remote_dir):
         if not stat.S_ISDIR(st.st_mode):
             raise SshError("远程路径已存在且不是目录: %s（请换目标路径或先处理该文件）"
                            % remote_dir, "bad_args")
-        return  # 已存在
+        return []  # 已存在
     except (socket.timeout, TimeoutError):
         raise
     except SshError:
@@ -1713,8 +1718,9 @@ def sftp_makedirs(sftp, remote_dir):
     except IOError:
         pass
     parent = posixpath.dirname(remote_dir)
+    created = []
     if parent and parent != remote_dir:
-        sftp_makedirs(sftp, parent)
+        created = sftp_makedirs(sftp, parent)
     try:
         _sftp_touch_activity(sftp)
         sftp.mkdir(remote_dir)
@@ -1731,6 +1737,9 @@ def sftp_makedirs(sftp, remote_dir):
             raise
         except IOError:
             raise
+        return created  # 并发下已存在：不算本次新建
+    created.append(remote_dir)  # 递归先建父、自身后建：列表保持外层→内层
+    return created
 
 
 def sftp_walk(sftp, remote_dir, warnings=None):
@@ -2842,8 +2851,16 @@ def cmd_upload(args):
                 log("[SKIP] %s (%s, 远端已存在同大小文件)" % (name, format_size(size)))
             elif not args.dry_run:
                 parent = posixpath.dirname(remote)
+                created = []
                 if parent:
-                    sftp_makedirs(sftp, parent)
+                    created = sftp_makedirs(sftp, parent)
+                if created:
+                    # 单文件上传自动 mkdir -p 父目录：warnings 提示新建了哪些目录
+                    #（AI 可见；拼写错误的垃圾目录树（如 /usr/loca/bin/x）可被发现）
+                    tip = ("已自动创建远端父目录: %s（单文件上传 mkdir -p 语义；"
+                           "若为路径拼写错误请检查 remote）" % ", ".join(created))
+                    log("[MKDIR] " + tip)
+                    walk_warnings.append(tip)
                 _sftp_put_atomic(sftp, local, remote, progress=bytes_uploaded,
                                  resume=bool(args.resume))
                 entry["transferred"] = True
