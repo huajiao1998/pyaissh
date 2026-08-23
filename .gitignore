@@ -19,3 +19,6 @@ Thumbs.db
 # DSH/Reasonix 会话元数据（非项目文件）
 .reasonix/tasks/
 .reasonix/desktop-topic-*.json
+
+# 技能打包产物（构建/导出生成，非源码）
+*.zip
