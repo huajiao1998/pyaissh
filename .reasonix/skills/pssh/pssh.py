@@ -1107,6 +1107,7 @@ def _atomic_auto_add_policy():
     错误路径（--version/bad_args 等）不付 ~190ms import 开销。"""
     global _ATOMIC_POLICY
     if _ATOMIC_POLICY is None:
+        global paramiko  # 统一绑定全局：类方法引用 paramiko.HostKeys 等
         import paramiko
 
         class _AtomicAutoAddPolicy(paramiko.AutoAddPolicy):
@@ -1189,7 +1190,8 @@ def _do_connect(conn, jump_client, is_jump=False):
 
     is_jump=True 表示本次连接的是跳板机本身（认证提示要说对变量名）。
     """
-    import paramiko  # 惰性 import（v1.5.5）：paramiko 只在真正建连时加载
+    global paramiko  # 惰性 import 绑定到模块全局（cmd_download/cmd_ls/_sftp_put_atomic
+    import paramiko  # 等模块级函数引用 paramiko.X；函数内裸 import 是局部名会 NameError）
     if _SIGTERM_RECEIVED:
         # 连接尚未开始即拿到信号（transport 未注册、响应线程无从 close）：
         # 在我们自己的帧里抛 KI 是安全的，走正常中断路径 130
@@ -3175,10 +3177,15 @@ def cmd_download(args):
                                 except OSError:
                                     log("[WARN] 清理临时文件失败（可能有进程占用）： %s" % part)
                         else:
-                            # 续传模式：保留 .part + done 标记作为续传资产
-                            log("[TIP] 已保留本地续传点 %s（下次重试加 --resume 从断点继续）" % part)
-                            dl_warnings.append(
-                                "下载中断，本地续传点已保留: %s（下次重试加 --resume 从断点继续）" % part)
+                            # 续传模式：保留 .part + done 标记作为续传资产；
+                            # 中断若发生在分片建连阶段（.part 未创建）则如实说明
+                            if os.path.exists(part):
+                                log("[TIP] 已保留本地续传点 %s（下次重试加 --resume 从断点继续）" % part)
+                                dl_warnings.append(
+                                    "下载中断，本地续传点已保留: %s（下次重试加 --resume 从断点继续）" % part)
+                            else:
+                                log("[TIP] 下载中断于分片建连阶段，未产生续传点；"
+                                    "下次重试加 --resume 全量重传")
                         raise
                 else:
                     # 串行单连接同样走 .part + 原子改名：原子性不应随文件大小/
