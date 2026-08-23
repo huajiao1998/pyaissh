@@ -1,0 +1,32 @@
+# pssh 前置条件完整规则（子文档）
+
+> 这是 pssh skill 的**子文档**（位于技能目录 `docs/` 子目录下，按需读取、不随 SKILL.md 自动注入）：SKILL.md 的"快速开始"只留调用方式与一句话规则，本文是目标格式/别名/凭据/`.env` 的**完整**参考。
+> **何时读**：配置主机别名、凭据优先级疑问、`.env` 加载行为、IPv6/端口解析细节时。
+
+## 目标格式与主机别名
+
+- 目标格式：`[user@]host[:port]`，如 `root@1.2.3.4:22`；支持 IPv6：`user@[2001:db8::1]:22`、`[2001:db8::1]`、裸 IPv6 地址；**主机别名**：`.env` 配 `PSSH_HOST_<名称>=user@host:port`（如 `PSSH_HOST_PROD=root@1.2.3.4:22`），target 写 `@名称` 即可引用（如 `pssh test @prod`；**键名整体大小写不敏感**：`PSSH_HOST_PROD` / `pssh_host_prod` / `PSSH_host_prod` 都能命中，Linux 与 Windows 行为一致）；**显式 `-p/--port` 优先于 target/别名内嵌端口**（与 ssh 惯例一致，写 `-p` 通常就是想纠正 target 里的端口）
+
+## 凭据（认证优先级）
+
+凭据：`--password` / `--key` 参数，或环境变量 `PSSH_USER` / `PSSH_PORT` / `PSSH_KEY` / `PSSH_PASSWORD`（也可写同目录 `.env`）。**认证优先级**：`--key` / `PSSH_KEY` > `--password` / `PSSH_PASSWORD` > 默认私钥 `~/.ssh/id_ed25519` > ssh-agent 兜底（仅当以上都没有时）——**注意：显式传 `--password` 也会被 `PSSH_KEY`/`--key` 静默压过（key 优先）**；**`--key` 指定的私钥文件不存在时直接报 `auth_failed`，不会回退密码**；**别名专属凭据**：`PSSH_HOST_<名称>_KEY` / `PSSH_HOST_<名称>_PASSWORD` 优先级介于显式参数与全局 env 之间，且**别名配了任一专属凭据时该主机不再取全局 `PSSH_KEY`/`PSSH_PASSWORD`**（别名主机凭据完全由别名决定，避免全局 key 抢先导致别名密码永远轮不到）；跳板机凭据同样支持环境变量 `PSSH_JUMP_KEY` / `PSSH_JUMP_PASSWORD`（**v1.4.9 起：跳板密码在两者都未配置时自动回退使用 `PSSH_PASSWORD`，密钥无此回落**）；完全无凭据时报 `auth_failed` 且 message 明确提示缺 `--password`/`PSSH_PASSWORD` 或 `--key`/`PSSH_KEY`
+
+## 凭据安全
+
+- 命令含疑似凭据（如 `mysql -p'xxx'`、`DB_PASS=...`）时 pssh 会在 stderr 打 WARN——照常执行，但注意日志可能泄露敏感信息，**敏感凭据用远程环境变量注入**
+- **远程命令原文会打印到日志**（超长截断、终端转义序列被替换为 `<ESC>`），避免在命令里内嵌长期凭据
+
+## `.env` 加载规则（供应链安全）
+
+- **配置样例见技能目录 `.env.example`**（`cp .env.example .env` 后按注释填写即可；人类/AI 均可照样例配置主机、密码、密钥、端口、跳板）
+- 环境变量优先（`.env` 不覆盖已存在的）；**默认只加载脚本目录 `.env`**（用户主动放入 pssh 工具目录的文件）
+- **工作目录 `.env` 默认不加载**——恶意仓库可自带 `.env` 注入 `PSSH_HOST_*` / `PSSH_PASSWORD` 把 AI 的 SSH 连接导向攻击者主机（钓鱼 SSH），需显式设 `PSSH_ALLOW_CWD_ENV=1`（环境变量或脚本目录 `.env` 中）才加载 cwd `.env` 并打 WARN
+- 支持行内注释（`KEY=value # comment`，`#` 前需有空格，**引号包裹的值内 `#` 不拆**：`KEY="a # b"` 值为 `a # b`，引号后也可跟注释）；文件编码 UTF-8（含 BOM 也能读）
+
+## 环境依赖
+
+- 环境有 `python3` + `paramiko`（`pip install paramiko`；Debian/Ubuntu 服务器也可 `apt install python3-paramiko`）
+- 调用方式（`<pssh_dir>` 即技能目录 `.reasonix/skills/pssh`）：
+  - Linux/macOS：`python3 <pssh_dir>/pssh.py <子命令> ...`
+  - Windows cmd：`<pssh_dir>\pssh.cmd <子命令> ...`；Git Bash：`<pssh_dir>/pssh <子命令> ...`
+- 若把 pssh 复制到了项目根目录，则按上述同目录规则调用

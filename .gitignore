@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+
+# 测试证据区（不进版本库：避免噪音与敏感输出；stest_tmp 是本地审计工作区）
+stest_tmp/
+
+# 真实凭据文件（.env.example 是公开样例，不受此规则影响）
+.env
+
+# 零散测试输出
+stest_r12_err1.txt
+stest_r12_err2.txt
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# DSH/Reasonix 会话元数据（非项目文件）
+.reasonix/tasks/
+.reasonix/desktop-topic-*.json
