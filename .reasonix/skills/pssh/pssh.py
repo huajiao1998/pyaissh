@@ -259,6 +259,21 @@ _SENSITIVE_CMD_RE = re.compile(
         _P_SENS_MYSQL, _P_SENS_CURL_U,
     ))
 
+# ---- 验收案例（改 _P_SENS_* 片段必对照自查；完整矩阵见开发机 verify_r3 L4）----
+# 应命中（疑似凭据）：
+#   -psecret / -p secret / -p'xxx' / -p"xxx"       紧贴与空格形态
+#   --password=abc / --password abc / password=abc 长选项与赋值
+#   mysql -u root -p secret / curl -u user:pass    工具专有形态
+#   https://user:pass@host/ / DB_PASS=abc / MYSQL_PWD=abc  URL/环境变量
+# 不应命中（工具 flag/端口/路径，历史误报点）：
+#   --profile x / --parallel 4 / --progress        双横线长选项（1.5.0 修）
+#   -p 22 / -p'22' / -p123456 / ssh -p 22 root@h   纯数字端口/ID
+#   mkdir -p a/b / tar -p x / cp -p a b / gcc -pthread  工具 -p
+#   rsync -p /x / wget -p https://... / pytest -p x     路径/参数
+#   echo -pabc / git push / --port 22              其他
+# 注意：_P_SENS_P_ATTACH 与 _P_SENS_P_SPACE 的排除表（cp/mkdir/tar/...）
+# 靠 lookbehind 前缀精确匹配——改排除表时上面每条都要重新过一遍。
+
 _ANSI_RE = re.compile(r"\x1b\][^\x07]*\x07|\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][0-9A-Za-z]|\x1b.")
 
 
