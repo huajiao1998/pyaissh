@@ -820,7 +820,8 @@ def _spill_writers(args):
     """
     def one(name):
         try:
-            base = args.spill_dir or tempfile.gettempdir()
+            # --spill-dir 同 --local：Git Bash 下 Unix 风格路径（/tmp/x）需 MSYS 转换
+            base = _fix_msys_local_path(args.spill_dir) if args.spill_dir else tempfile.gettempdir()
             os.makedirs(base, exist_ok=True)
             tf = tempfile.NamedTemporaryFile(prefix="pssh-%s-" % name, suffix=".spill",
                                              dir=base, delete=False)
@@ -2084,7 +2085,10 @@ def cmd_exec(args):
                 # utf-8-sig：自动剥离 UTF-8 BOM（\ufeff）——记事本/VS Code 等
                 # Windows 工具写出的命令文件带 BOM 时，首行命令会被拼进 BOM
                 # 字符而报 "command not found"（与 .env 解析同款处理）
-                with open(os.path.expanduser(args.cmd_file), encoding="utf-8-sig") as f:
+                # _fix_msys_local_path：Git Bash 下 /tmp/x.sh 等 Unix 风格本地路径
+                # 转 Windows 路径（与 --local 同款；内部含 ~ 展开），避免 Windows
+                # Python 把 /tmp 解析成盘根而报 Errno 2
+                with open(_fix_msys_local_path(args.cmd_file), encoding="utf-8-sig") as f:
                     cmd = f.read()
         except KeyboardInterrupt:
             raise  # 中断走 main 的 interrupted/130

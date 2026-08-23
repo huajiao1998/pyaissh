@@ -25,4 +25,5 @@ python3 pssh.py exec root@1.2.3.4 --pty --pty-strip-ansi --cmd 'watch -n 1 date'
 - **exec 错误 JSON 恒带 `stdout`/`stderr`/`output_incomplete`**（可能为空串；错误路径 `output_incomplete` **恒为 true**——命令被中断输出必然不完整，区别于成功路径的超限裁剪 `output_truncated`）：空串 = 命令没跑起来或零输出，非空 = 执行到一半中断，据此决定重试策略
 - `duration_ms` **含连接耗时**（跳板机/慢网络下偏大），评估命令本身耗时请减去连接时间；错误 JSON 同样带 `duration_ms`（已运行时长）
 - **`cmd` 字段与截断**：结果 JSON 的 `cmd` 回显命令原文（含凭据需脱敏，转发前处理）；超 `CMD_ECHO_LIMIT`（8KB）时截断——`cmd` 保留头尾 + 中间省略标记、`cmd_truncated: true`、warnings 提示（完整命令见原始调用，`--cmd-file` 时为本地文件可重读）。截断只影响回显，不影响执行与凭据检测
+- **Git Bash 路径**：`--cmd-file` / `--spill-dir` 与 `--local` 同款 MSYS 转换——经 `./pssh` 包装器（禁路径转换）时，Unix 风格路径（`/tmp/x.sh`）自动转 Windows 真实路径，不会落错位置或报 Errno 2；Linux 直接运行时原样透传
 - 远程退出码直接透传（255 例外：远程恰为 255 时本地返 254，见 SKILL.md 退出码表）
