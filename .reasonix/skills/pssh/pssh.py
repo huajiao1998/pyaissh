@@ -118,7 +118,7 @@ except (ValueError, OSError, ImportError):
 
 import paramiko  # 慢 import：handler 已注册，此窗口内的信号走 handler 而非默认动作
 
-VERSION = "1.5.3"
+VERSION = "1.5.4"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -210,6 +210,8 @@ PUT_RETRY_SLEEP = 0.3        # 远端 .part 清理重试等待
 CYGPATH_TIMEOUT = 5          # cygpath 子进程超时（MSYS 路径转换，本地工具不应挂死）
 RESUME_MIN_SIZE = 50 * 1024 * 1024   # 单文件 ≥ 此大小且未用 --resume 时提示推荐启用
                              # （断点续传收益与文件大小/链路速度相关，做成常量可调）
+CMD_ECHO_LIMIT = 8192        # 结果 JSON 的 cmd 字段回显上限：--cmd-file 读入的大脚本
+                             # 原样回显会让单行 JSON 到 MB 级撑爆调用方上下文；超限保留头尾
 
 # --- 正则模式（模块级编译一次；片段化让每个分支可独立注释/测试） ---
 _RE_IPV4 = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
@@ -744,6 +746,20 @@ _WIN_RESERVED_NAMES = {
     "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
     "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 }
+
+
+def _truncate_cmd(cmd):
+    """cmd 回显截断：超过 CMD_ECHO_LIMIT 保留头尾 + 中间省略标记。
+
+    返回 (显示文本, truncated 标志)。--cmd 命令行参数通常远小于上限，
+    只有 --cmd-file 读入的大脚本会触发。凭据检测（warn_sensitive_cmd）
+    用完整 cmd，不受本函数影响；截断只作用于结果 JSON 的回显字段。"""
+    if len(cmd) <= CMD_ECHO_LIMIT:
+        return cmd, False
+    half = CMD_ECHO_LIMIT // 2
+    body = ("\n...[pssh: cmd 回显已截断，共 %d 字节"
+            "（完整命令在 --cmd-file 本地文件，可重读）]...\n" % len(cmd))
+    return cmd[:half] + body + cmd[-half:], True
 
 
 def _sanitize_log_text(s):
@@ -2098,11 +2114,13 @@ def cmd_exec(args):
         err_raw = b"".join(err_buf)
         out_cut, _, _ = _truncate_output(out_raw, args.max_output, "stdout")
         err_cut, _, _ = _truncate_output(err_raw, args.max_output, "stderr")
+        cmd_echo, cmd_cut = _truncate_cmd(cmd)
         extra = {
             "host": conn["host"],
             "user": conn["user"],
             "port": conn["port"],
-            "cmd": cmd,  # 与成功路径对称：错误时也能看到命令原文（含凭据需脱敏）
+            "cmd": cmd_echo,  # 与成功路径对称：错误时也能看到命令原文（含凭据需脱敏；超限截断）
+            "cmd_truncated": cmd_cut,  # cmd 回显是否被截断（--cmd-file 大脚本）
             "stdout": _clean_pty_text(out_cut.decode("utf-8", errors="replace"), args),
             "stderr": _clean_pty_text(err_cut.decode("utf-8", errors="replace"), args),
             # 与成功路径语义一致：原始字节数（total_counter 在 exec_command
@@ -2114,6 +2132,9 @@ def cmd_exec(args):
         }
         if warnings:
             extra["warnings"] = list(warnings)
+        if cmd_cut:
+            extra.setdefault("warnings", []).append(
+                "cmd 字段已截断（完整命令 %d 字节，--cmd-file 本地文件可重读）" % len(cmd))
         return extra
 
     out_buf, err_buf = [], []  # _partial_extra 依赖（try 之前初始化）
@@ -2498,6 +2519,9 @@ def cmd_exec(args):
             warnings.append("远程退出码为 255，本地返回 254（255 保留给连接失败语义）")
         stdout_truncated = bool(out_trunc or drop_counter[0])
         stderr_truncated = bool(err_trunc or err_drop_counter[0])
+        cmd_echo, cmd_cut = _truncate_cmd(cmd)
+        if cmd_cut:
+            warnings.append("cmd 字段已截断（完整命令 %d 字节，--cmd-file 本地文件可重读）" % len(cmd))
         result = {
             "ok": True,          # 工具操作成功（连接+执行完成）；命令是否成功看 exit_success / exit_code
             "action": "exec",
@@ -2518,7 +2542,8 @@ def cmd_exec(args):
             "port": conn["port"],
             "pty": bool(args.pty),
             "pty_strip_ansi": bool(args.pty_strip_ansi),
-            "cmd": cmd,  # 完整回显（不截断）：含凭据的命令会原样出现在 JSON，转发结果前需脱敏
+            "cmd": cmd_echo,  # 回显命令（含凭据需脱敏；超 CMD_ECHO_LIMIT 截断，见 cmd_truncated）
+            "cmd_truncated": cmd_cut,  # cmd 回显是否被截断（--cmd-file 读入的大脚本）
             "output_truncated": bool(drain_truncated or stdout_truncated or stderr_truncated),
             "warnings": warnings,
             "duration_ms": duration,
