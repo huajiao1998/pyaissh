@@ -174,6 +174,7 @@ MIN_BUF_FLOOR = 4096         # 内存缓冲下限：max(args.max_output, 4096) �
 JOIN_GRACE = 1.5             # 读线程 join 宽限（秒）
 RETRY_SLEEP = 0.5            # Windows 句柄未释放等场景的删除重试等待
 PUT_RETRY_SLEEP = 0.3        # 远端 .part 清理重试等待
+CYGPATH_TIMEOUT = 5          # cygpath 子进程超时（MSYS 路径转换，本地工具不应挂死）
 
 # --- 正则模式（模块级编译一次；片段化让每个分支可独立注释/测试） ---
 _RE_IPV4 = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
@@ -410,7 +411,7 @@ def _fix_msys_local_path(path):
         return path  # 相对路径 / Windows 路径不受影响
     try:
         out = subprocess.run(["cygpath", "-w", path],
-                             capture_output=True, text=True, timeout=5)
+                             capture_output=True, text=True, timeout=CYGPATH_TIMEOUT)
         if out.returncode == 0 and out.stdout.strip():
             converted = out.stdout.strip()
             log("[PATH] 本地路径 MSYS 转换: %s -> %s" % (path, converted))
@@ -794,7 +795,7 @@ def parse_target(target):
                 except ValueError:
                     raise SshError("目标端口非数字: %s" % rest[1:], "bad_args")
                 if not 1 <= port <= MAX_PORT:
-                    raise SshError("目标端口超出范围 (1-65535): %s" % rest[1:], "bad_args")
+                    raise SshError("目标端口超出范围 (1-%d): %s" % (MAX_PORT, rest[1:]), "bad_args")
     elif target.count(":") == 1:
         # 普通 host:port
         host, _, port_s = target.partition(":")
@@ -803,7 +804,7 @@ def parse_target(target):
         except ValueError:
             raise SshError("目标端口非数字: %s" % port_s, "bad_args")
         if not 1 <= port <= MAX_PORT:
-            raise SshError("目标端口超出范围 (1-65535): %s" % port_s, "bad_args")
+            raise SshError("目标端口超出范围 (1-%d): %s" % (MAX_PORT, port_s), "bad_args")
     elif target.count(":") > 1:
         # 裸 IPv6（多个冒号）：校验每段是合法 hex（1-4 位），
         # 防 host:22:33 这类 host:port:port 拼错被静默当主机名连错机器。
@@ -887,7 +888,7 @@ def resolve_conn(args):
     if not port or not 1 <= port <= MAX_PORT:
         # 命令行 --port 已由 argparse 校验（1-65535）；这里只管 env 与 target
         # 内嵌端口：0/负值/越界/非数字一律回退默认 22 并打 WARN
-        log("[WARN] 端口 %r 超出范围 (1-65535)，回退默认 22" % port)
+        log("[WARN] 端口 %r 超出范围 (1-%d)，回退默认 22" % (port, MAX_PORT))
         port = 22
     # 凭据优先级：显式参数 > 别名专属（PSSH_HOST_<名称>_KEY/_PASSWORD）> 全局 env。
     # 别名配置了任一专属凭据时抑制全局 env：否则"别名只配密码 + 全局 PSSH_KEY"
@@ -3072,7 +3073,7 @@ def cmd_test(args):
                 break
             chunks.append(data)
             try:
-                ed = chan.recv_stderr(65536)
+                ed = chan.recv_stderr(RECV_CHUNK)
                 if ed:
                     err_chunks.append(ed)
             except Exception:
@@ -3356,7 +3357,7 @@ def _port(value):
     except (ValueError, TypeError):
         raise argparse.ArgumentTypeError("端口必须为整数（收到 %r，如 22）" % (value,))
     if not 1 <= v <= MAX_PORT:
-        raise argparse.ArgumentTypeError("端口必须在 1-65535 之间")
+        raise argparse.ArgumentTypeError("端口必须在 1-%d 之间" % MAX_PORT)
     return v
 
 
