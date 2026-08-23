@@ -24,5 +24,5 @@ python3 pssh.py exec root@1.2.3.4 --pty --pty-strip-ansi --cmd 'watch -n 1 date'
 - `--no-credential-warn`：关闭"命令含疑似凭据"的启发式 WARN。`--profile`/`--parallel` 这类双横线长选项已内置排除（`-p` 紧贴形态拒绝双横线前缀），一般不需要关；只在仍有误报时用——注意关闭后命令里的**真实凭据也不再被提示**，结果 JSON 的 `cmd` 字段仍会原样回显命令，脱敏责任回到调用方
 - **exec 错误 JSON 恒带 `stdout`/`stderr`/`output_incomplete`**（可能为空串；错误路径 `output_incomplete` **恒为 true**——命令被中断输出必然不完整，区别于成功路径的超限裁剪 `output_truncated`）：空串 = 命令没跑起来或零输出，非空 = 执行到一半中断，据此决定重试策略
 - `duration_ms` **含连接耗时**（跳板机/慢网络下偏大），评估命令本身耗时请减去连接时间；错误 JSON 同样带 `duration_ms`（已运行时长）
-- **`cmd` 字段与截断**：结果 JSON 的 `cmd` 回显命令原文（含凭据需脱敏，转发前处理）；`--cmd-file` 读入的大脚本（>8KB，常量 `CMD_ECHO_LIMIT`）会截断——`cmd` 保留头尾 + 中间省略标记、`cmd_truncated: true`、warnings 提示（完整命令在本地 cmd-file 可重读）。截断只影响回显，不影响执行与凭据检测
+- **`cmd` 字段与截断**：结果 JSON 的 `cmd` 回显命令原文（含凭据需脱敏，转发前处理）；超 `CMD_ECHO_LIMIT`（8KB）时截断——`cmd` 保留头尾 + 中间省略标记、`cmd_truncated: true`、warnings 提示（完整命令见原始调用，`--cmd-file` 时为本地文件可重读）。截断只影响回显，不影响执行与凭据检测
 - 远程退出码直接透传（255 例外：远程恰为 255 时本地返 254，见 SKILL.md 退出码表）
