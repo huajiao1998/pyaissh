@@ -68,3 +68,8 @@
 - `docs/exec.md` / `docs/contract.md`：`cmd_truncated` 字段与截断语义。
 - `docs/transfer.md`：`--skip-existing` 仅比大小（原子传输保证 pssh 自产最终文件完整；外部损坏可 md5 抽查）。
 - `docs/errors.md`：退出码 254 歧义提示（区分远程真实 254 vs 远程 255 映射，看 JSON 双字段）。
+
+## [1.5.5] - 2026-08-23
+
+### 修改
+- **paramiko 惰性 import（启动提速）**：`import paramiko` 从模块顶部挪进 `_do_connect`（唯一建连入口），`_AtomicAutoAddPolicy` 类改为 `_atomic_auto_add_policy()` 工厂（首次调用时 import + 定义 + 缓存单例）。**不需要连接的路径提速 ~2.7 倍**：`--version`/`--help`/`bad_args`/缺用户名/别名未配置 从 ~296ms 降到 ~110ms（纯解释器+标准库基线 59ms，剩余为模块解析冷启动）；极早期信号窗口更短（handler 注册后只剩标准库 import，paramiko 的 ~190ms 不再落在窗口内）。真实连接路径不受影响（paramiko 照常在建连时加载，实测 1766ms 连接正常）。实测依据：paramiko import 188ms（其中 `paramiko.config → invoke` 可选依赖链 ~120ms，pssh 不用 SSHConfig，但 invoke 是否加载取决于环境安装，代码侧无法卸载；惰性只优化错误路径，真实路径提速需环境侧卸载 invoke）。

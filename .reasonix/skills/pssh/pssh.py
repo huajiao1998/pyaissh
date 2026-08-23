@@ -116,9 +116,11 @@ try:
 except (ValueError, OSError, ImportError):
     pass  # 非主线程 / 平台不支持（Windows 下注册无副作用）
 
-import paramiko  # 慢 import：handler 已注册，此窗口内的信号走 handler 而非默认动作
+# 注意：paramiko 不在此 import——v1.5.5 起惰性化，只在真正建连（_do_connect）
+# 时才 import。错误路径（--version/--help/bad_args/缺用户名/别名未配置）从
+# ~300ms 降到 ~30ms；极早期信号窗口也更短（handler 注册后只剩标准库 import）。
 
-VERSION = "1.5.4"
+VERSION = "1.5.5"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -1094,76 +1096,92 @@ def _host_key_known(client, host, port):
         return False
 
 
-class _AtomicAutoAddPolicy(paramiko.AutoAddPolicy):
-    """AutoAddPolicy + 原子写盘（v1.4.8）。
+_ATOMIC_POLICY = None  # _AtomicAutoAddPolicy 单例缓存（惰性创建，见 _atomic_auto_add_policy）
 
-    paramiko 5.0 的 AutoAddPolicy 在 known_hosts 文件存在时会把新 host key
-    写回盘，但 save_host_keys 是直接 open(filename, "w") 覆写：
-      1) 多进程并发首次连接同一新主机 → read-merge-write 竞态，互相覆盖
-         丢记录；
-      2) 写盘中途进程崩溃 → known_hosts 文件本身被截断/半写损坏。
-    本策略保持"隐式接受"语义，但写盘改为：
-      - Linux：fcntl.flock 对 <known_hosts>.lock 加互斥锁（锁文件固定路径、
-        永不被 replace 换 inode），锁内重新加载磁盘最新内容、合并内存键、
-        写临时文件、os.replace 原子替换——并发进程串行化合并，既不丢记录
-        也不损坏文件；
-      - Windows：无 fcntl，仅原子替换（文件不会损坏；极端并发下仍可能
-        丢记录，属 paramiko 5.0 语义上限）。
-    写盘失败只打 WARN 不阻断连接（与 AutoAddPolicy 一致：内存已接受）。
-    """
 
-    def missing_host_key(self, client, hostname, key):
-        client._host_keys.add(hostname, key.get_name(), key)
-        fn = getattr(client, "_host_keys_filename", None)
-        if fn is None:
-            return
-        try:
-            self._atomic_save(client._host_keys, fn)
-        except Exception as e:
-            log("[WARN] 写 known_hosts 失败（host key 已在内存接受）: %s" % e)
+def _atomic_auto_add_policy():
+    """惰性创建 AutoAddPolicy+原子写盘策略实例（v1.4.8 设计，v1.5.5 惰性化）。
 
-    @staticmethod
-    def _atomic_save(host_keys, fn):
-        import tempfile
-        lock_fd = None
-        if os.name == "posix":
-            try:
-                import fcntl
-                lock_fd = open(fn + ".lock", "a+")
-                fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            except Exception:
+    类继承 paramiko.AutoAddPolicy，模块级定义会强制 import paramiko——改为
+    首次调用时 import + 定义 + 缓存实例。paramiko 只在真正建连时才加载，
+    错误路径（--version/bad_args 等）不付 ~190ms import 开销。"""
+    global _ATOMIC_POLICY
+    if _ATOMIC_POLICY is None:
+        import paramiko
+
+        class _AtomicAutoAddPolicy(paramiko.AutoAddPolicy):
+            """AutoAddPolicy + 原子写盘。
+
+            paramiko 5.0 的 AutoAddPolicy 在 known_hosts 文件存在时会把新 host key
+            写回盘，但 save_host_keys 是直接 open(filename, "w") 覆写：
+              1) 多进程并发首次连接同一新主机 → read-merge-write 竞态，互相覆盖
+                 丢记录；
+              2) 写盘中途进程崩溃 → known_hosts 文件本身被截断/半写损坏。
+            本策略保持"隐式接受"语义，但写盘改为：
+              - Linux：fcntl.flock 对 <known_hosts>.lock 加互斥锁（锁文件固定路径、
+                永不被 replace 换 inode），锁内重新加载磁盘最新内容、合并内存键、
+                写临时文件、os.replace 原子替换——并发进程串行化合并，既不丢记录
+                也不损坏文件；
+              - Windows：无 fcntl，仅原子替换（文件不会损坏；极端并发下仍可能
+                丢记录，属 paramiko 5.0 语义上限）。
+            写盘失败只打 WARN 不阻断连接（与 AutoAddPolicy 一致：内存已接受）。
+            """
+
+            def missing_host_key(self, client, hostname, key):
+                client._host_keys.add(hostname, key.get_name(), key)
+                fn = getattr(client, "_host_keys_filename", None)
+                if fn is None:
+                    return
+                try:
+                    self._atomic_save(client._host_keys, fn)
+                except Exception as e:
+                    log("[WARN] 写 known_hosts 失败（host key 已在内存接受）: %s" % e)
+
+            @staticmethod
+            def _atomic_save(host_keys, fn):
+                import tempfile
                 lock_fd = None
-        try:
-            merged = paramiko.HostKeys()
-            try:
-                merged.load(fn)  # 锁内重读磁盘最新内容，合并避免覆盖他人更新
-            except Exception:
-                pass
-            for hostname, keys in host_keys.items():
-                for keytype, key in keys.items():
-                    merged.add(hostname, keytype, key)
-            fd, tmp = tempfile.mkstemp(
-                dir=os.path.dirname(fn) or ".", prefix=".known_hosts.", suffix=".tmp")
-            try:
-                with os.fdopen(fd, "w") as f:
-                    for hostname, keys in merged.items():
+                if os.name == "posix":
+                    try:
+                        import fcntl
+                        lock_fd = open(fn + ".lock", "a+")
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                    except Exception:
+                        lock_fd = None
+                try:
+                    merged = paramiko.HostKeys()
+                    try:
+                        merged.load(fn)  # 锁内重读磁盘最新内容，合并避免覆盖他人更新
+                    except Exception:
+                        pass
+                    for hostname, keys in host_keys.items():
                         for keytype, key in keys.items():
-                            f.write("%s %s %s\n" % (hostname, keytype, key.get_base64()))
-                os.replace(tmp, fn)
-            except BaseException:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
-        finally:
-            if lock_fd is not None:
-                try:
-                    import fcntl
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                    lock_fd.close()
-                except Exception:
-                    pass
+                            merged.add(hostname, keytype, key)
+                    fd, tmp = tempfile.mkstemp(
+                        dir=os.path.dirname(fn) or ".", prefix=".known_hosts.", suffix=".tmp")
+                    try:
+                        with os.fdopen(fd, "w") as f:
+                            for hostname, keys in merged.items():
+                                for keytype, key in keys.items():
+                                    f.write("%s %s %s\n" % (hostname, keytype, key.get_base64()))
+                        os.replace(tmp, fn)
+                    except BaseException:
+                        try:
+                            os.unlink(tmp)
+                        except OSError:
+                            pass
+                        raise
+                finally:
+                    if lock_fd is not None:
+                        try:
+                            import fcntl
+                            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                            lock_fd.close()
+                        except Exception:
+                            pass
+
+        _ATOMIC_POLICY = _AtomicAutoAddPolicy()
+    return _ATOMIC_POLICY
 
 
 def _do_connect(conn, jump_client, is_jump=False):
@@ -1171,6 +1189,7 @@ def _do_connect(conn, jump_client, is_jump=False):
 
     is_jump=True 表示本次连接的是跳板机本身（认证提示要说对变量名）。
     """
+    import paramiko  # 惰性 import（v1.5.5）：paramiko 只在真正建连时加载
     if _SIGTERM_RECEIVED:
         # 连接尚未开始即拿到信号（transport 未注册、响应线程无从 close）：
         # 在我们自己的帧里抛 KI 是安全的，走正常中断路径 130
@@ -1227,7 +1246,7 @@ def _do_connect(conn, jump_client, is_jump=False):
             host_key_pre_known = None  # 取不到就不提示，不阻断连接
         # 原子写盘版 AutoAddPolicy（v1.4.8）：并发首连不丢记录、写盘不损坏
         # 文件（flock + 临时文件 + os.replace），见 _AtomicAutoAddPolicy 注释
-        client.set_missing_host_key_policy(_AtomicAutoAddPolicy())
+        client.set_missing_host_key_policy(_atomic_auto_add_policy())
 
     key_explicit = conn["key"]  # 显式指定的私钥（None 表示未指定，回退默认）
     password = conn["password"]
