@@ -3920,6 +3920,7 @@ def build_parser():
   ls -la /var/log
   EOF
   pyaissh upload root@1.2.3.4 --local ./dist --remote /opt/app/dist --skip-existing
+  pyaissh upload root@1.2.3.4 --local big.bin --remote /tmp/big.bin --parallel 8  # 慢链路大文件上传分片提速（v1.5.8）
   pyaissh download root@1.2.3.4 --remote /var/log/x.log --local ./x.log
   pyaissh download root@1.2.3.4 --remote big.tar.gz --local . --parallel 8   # --local . 可用（scp 语义）
   pyaissh test root@1.2.3.4

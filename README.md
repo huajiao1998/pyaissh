@@ -9,6 +9,7 @@ pyaissh is a command-line SSH tool built on paramiko, designed for non-interacti
 ```bash
 pyaissh exec root@1.2.3.4 --cmd 'uname -a'
 pyaissh upload root@1.2.3.4 --local ./dist --remote /opt/app/dist
+pyaissh upload root@1.2.3.4 --local big.bin --remote /tmp/big.bin --parallel 8   # 慢链路大文件上传分片提速（v1.5.8）
 pyaissh download root@1.2.3.4 --remote big.tar.gz --local . --parallel 8
 pyaissh test root@1.2.3.4
 pyaissh ls root@1.2.3.4 --path /etc --long
@@ -20,7 +21,7 @@ pyaissh ls root@1.2.3.4 --path /etc --long
 |---|---|---|
 | 🧭 结构化契约 | stdout 恒单行 JSON，直接 `json.loads`；24 类错误类型 + `retryable` 机器可读重试建议 | Structured contract: single-line JSON + typed errors with machine-readable retry hints |
 | 🛡 防挂死 | 三重超时（静默/总时长/看门狗）——AI 调它永远不会卡死 | Triple timeout protection — never hangs |
-| 🔄 可靠传输 | `.part` 原子写 + `--resume` 断点续传 + 并行分片下载 + `file_list` 断点重试 | Atomic transfer + resumable upload/download + parallel sharding |
+| 🔄 可靠传输 | `.part` 原子写 + `--resume` 断点续传 + **并行分片下载/上传**（`--parallel 1-8`，v1.5.8 起上传也支持）+ `file_list` 断点重试 | Atomic transfer + resumable upload/download + **parallel-sharded upload & download** + retryable file lists |
 | 🔋 零 token 传输 | 文件内容从不回传 JSON——AI 只消费元数据，大文件不烧上下文 | Zero-token transfer: file content never enters the LLM context |
 | ⚡ 快速启动 | paramiko 惰性 import——错误路径启动 296ms → 110ms | Lazy import: error paths start 2.7× faster |
 | 🔗 网络能力 | 跳板机（共享隧道）、主机别名（@名称）、IPv6 | Jump hosts, host aliases, IPv6 |
