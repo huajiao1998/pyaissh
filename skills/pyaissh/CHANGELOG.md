@@ -92,3 +92,14 @@
 - **零 token 传输卖点文档化**：pyaissh 从设计上就不把文件内容回传 JSON（upload/download 结果只含 `files`/`bytes`/`file_list` 元数据）——对比 MCP SSH 生态普遍把传输内容塞进 LLM 上下文的通病，这是天然卖点。SKILL.md（description + 定位段）与 `--help` epilog 新增"传输零 token 消耗"说明（实测：1MB 随机文件传输后结果 JSON 仅 410 字节纯元数据）。
 - **品牌与命名统一为 pyaissh（开源发布准备）**：仓库/命令/文件名/文档全量统一为一个名字——`pyaissh.py`、`pyaissh.cmd`、bash 包装 `pyaissh`、`--help` 的 prog、输出标记（`[pyaissh: 已截断]`、seam/`[pyaissh]` 前缀）、spill 文件前缀（`pyaissh-stdout-`）、SKILL.md 与全部 docs 的调用示例与描述。环境变量 `PYAISSH_*`、内部属性 `_pyaissh_*`、技能目录 `skills/pyaissh/` 与 `SKILL.md name: pyaissh` 全项目一致。
 - **环境变量与内部属性统一为 PYAISSH 前缀（破坏性变更）**：环境变量统一 `PYAISSH_*`（`PYAISSH_PASSWORD`/`PYAISSH_KEY`/`PYAISSH_USER`/`PYAISSH_PORT`/`PYAISSH_JUMP_KEY`/`PYAISSH_JUMP_PASSWORD`/`PYAISSH_HOST_<名称>`（含 `_PASSWORD`/`_KEY` 专属凭据）/`PYAISSH_ALLOW_CWD_ENV`，小写示例 `pyaissh_host_prod`）；内部属性统一 `_pyaissh_*`（`_pyaissh_home`/`_pyaissh_last_activity`/`_pyaissh_io_timeout`/`_pyaissh_watchdog`/`_pyaissh_watchdog_killed`/`_pyaissh_posix_rename_warned`）；测试 harness 的 `PYAISSH_PY`、测试脚本 env 全量同步；技能目录 `pyaissh`（`SKILL.md name: pyaissh`）。**注意**：部署/CI/.env 需使用 `PYAISSH_*` 前缀配置（发布前完成，无既有用户受影响）。验证：verify_r3 54/54、v3_sig_unit 3/3、s2_stale 通过、双机 test 正常。
+
+## [1.5.8] - 2026-08-24
+
+### 新增
+- **上传分片 `--parallel`（dogfood 实测痛点修复）**：`upload` 新增 `--parallel 1-8`（对称下载分片）——高丢包/慢链路大文件上传提速（实测 318KB 单连接 22.7s 的痛点）。新函数 `_parallel_put`：k 条独立 SSH 连接各上传本地文件一段到远端同一 `.part`（主连接预创建空文件，worker r+b seek 写；共享跳板隧道；信号中断秒级退出；完成大小校验），原子改名单抽取 `_sftp_atomic_rename` 供串行/分片共用（posix-rename + 回退 + 双丢防护语义不变）。**默认行为零变化**（仅显式 `--parallel` 且 ≥64KB 才分片，无自动档）；与 `--resume` 互斥（同时给 WARN 忽略 `--resume`）；中断清理远端 `.part`（keep_part 双丢防护保留）。真机验证：50MB 分片 4 连接成功 + 远端 md5 一致 + 1MB 分片 + 互斥 WARN + 中断 130 且远端零残留。
+
+### 修改
+- **复杂命令失败提示 shell 转义（dogfood ①）**：`exec` 的 `--cmd` 来源命令含 shell 特殊字符（`$()`/反引号/换行/管道等）且执行失败时，错误 message 附加"建议改用 --cmd-file - 从 stdin 读脚本，绕过所有转义"（`_shell_escape_hint`；`--cmd-file` 来源与简单命令不加）。单元 6 例验证。
+
+### 文档
+- **凭据安全实践强化（dogfood ③）**：SKILL.md 快速开始与 docs/setup.md 新增"不要把 token/密码内联进 `--cmd` 或脚本内容——cmd 字段会原样回显，触发凭据 WARN；凭据走参数/env/.env 或脚本从文件读取"。发布类操作（git push token URL）同理。

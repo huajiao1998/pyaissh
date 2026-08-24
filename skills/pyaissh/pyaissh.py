@@ -120,7 +120,7 @@ except (ValueError, OSError, ImportError):
 # 时才 import。错误路径（--version/--help/bad_args/缺用户名/别名未配置）从
 # ~300ms 降到 ~30ms；极早期信号窗口也更短（handler 注册后只剩标准库 import）。
 
-VERSION = "1.5.7"
+VERSION = "1.5.8"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -789,6 +789,20 @@ def _truncate_cmd(cmd):
     body = ("\n...[pyaissh: cmd 回显已截断，共 %d 字节"
             "（完整命令见原始调用，--cmd-file 时为本地文件可重读）]...\n" % n)
     return head + body + tail, True, n
+
+
+def _shell_escape_hint(cmd):
+    """--cmd 来源且含 shell 特殊字符的命令失败时，提示改用 --cmd-file -。
+
+    --cmd-file 来源（args.cmd 为 None）不加；纯文本/简单命令不加。
+    启发式字符集：$() 反引号、换行、分号/管道/重定向/尖括号（SKILL.md 第 8 条
+    速查的"含特殊字符走 --cmd-file -"场景，dogfood 实测的转义坑）。"""
+    if not cmd:
+        return ""
+    if re.search(r"[\$`\n;|&><]", cmd) or "(" in cmd or ")" in cmd:
+        return ("（若为 shell 转义问题：命令含特殊字符/换行，建议改用 "
+                "--cmd-file - 从 stdin 读脚本，绕过所有转义）")
+    return ""
 
 
 def _sanitize_log_text(s):
@@ -1693,6 +1707,140 @@ def _parallel_fetch(conn, args_, remote, local, size, k, resume=False):
             close_all(shared_jump)
 
 
+def _parallel_put(conn, args_, local, remote, size, k):
+    """多连接分片上传：k 条独立 SSH 连接各上传本地文件的一段，写入远端同一 .part。
+
+    对称于 _parallel_fetch（下载分片）：高丢包/长 RTT 链路单连接 SFTP 写吞吐
+    同样塌陷，多连接近似线性提升（dogfood 实测：慢链路上传大文件是真实痛点，
+    --parallel 仅下载生效的缺口在此补齐）。共享跳板隧道（只建一条跳板连接）。
+    远端 .part 由主连接预创建（worker 以 r+b seek 写；并发 w+b 会互截空），
+    全部写满后**用活跃的 worker 连接完成原子改名**（_sftp_atomic_rename）——
+    不能用调用方的主 sftp：分片上传期间主连接空闲 30s 会被看门狗强断（实测
+    dogfood 踩坑：50MB 分片 257s 后 rename 用主连接 -> 连接已死 upload_timeout）。
+    失败/中断时用活跃 worker 连接清理 .part（keep_part 双丢防护保留）。"""
+    part = _part_path(remote)  # 进程唯一名（分片上传不做续传）
+    workers = []   # [client, sftp, start, end, got]
+    errors = []
+    shared_jump = None
+    try:
+        bounds = [(i * size // k, (i + 1) * size // k if i < k - 1 else size)
+                  for i in range(k)]
+        jump_conn = resolve_jump(args_, conn["user"])
+        if jump_conn:
+            try:
+                shared_jump = _do_connect(jump_conn, None, is_jump=True)
+            except SshError as e:
+                raise SshError("[跳板机 %s@%s] %s" % (jump_conn["user"], jump_conn["host"], e),
+                               e.error_type)
+            log("[JUMP] 分片共享跳板连接 -> %s@%s:%s"
+                % (jump_conn["user"], jump_conn["host"], jump_conn["port"]))
+        for i, (start, end) in enumerate(bounds):
+            client = None
+            try:
+                client = _do_connect(conn, shared_jump)
+                sftp = open_sftp(client, io_timeout=PARALLEL_IO_TIMEOUT)
+            except BaseException:
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                raise
+            workers.append([client, sftp, start, end, 0])
+        # 主连接预创建远端空 .part（worker 的 r+b 需要文件已存在）
+        _sftp_touch_activity(workers[0][1])
+        f0 = workers[0][1].open(part, "wb")
+        f0.close()
+
+        def _run(i):
+            client, sftp, start, end, _ = workers[i]
+            lf = rf = None
+            try:
+                lf = open(local, "rb")
+                rf = sftp.open(part, "r+b")  # 各线程独立句柄定位写入
+                off = start
+                while off < end:
+                    if _SIGTERM_RECEIVED:
+                        # 信号已到：不再发新写请求，尽快退出让主线程 join 收尾
+                        #（同 _parallel_fetch：不加检查点会阻塞在慢链路的
+                        #  paramiko 内部读写里，拖到看门狗才释放）
+                        raise KeyboardInterrupt("SIGTERM")
+                    lf.seek(off)
+                    data = lf.read(min(PARALLEL_READ_CHUNK, end - off))
+                    if not data:
+                        raise IOError("本地文件在偏移 %d 处提前 EOF" % off)
+                    rf.seek(off)
+                    rf.write(data)
+                    off += len(data)
+                    workers[i][4] = off - start
+                    _sftp_touch_activity(sftp)
+            except KeyboardInterrupt:
+                pass
+            except Exception as e:
+                errors.append((i, e))
+            finally:
+                for h in (lf, rf):
+                    try:
+                        if h is not None:
+                            h.close()
+                    except Exception as ce:
+                        errors.append((i, ce))
+
+        log("[PART] %d 连接分片上传 %s（每片约 %s）"
+            % (k, format_size(size), format_size(size // k)))
+        threads = [threading.Thread(target=_run, args=(i,), daemon=True) for i in range(k)]
+        for t in threads:
+            t.start()
+        while any(t.is_alive() for t in threads):
+            if _SIGTERM_RECEIVED:
+                raise KeyboardInterrupt("SIGTERM")
+            for t in threads:
+                t.join(POLL_TICK)
+        if errors:
+            timed_out = any(
+                getattr(workers[i][1], "_pyaissh_watchdog_killed", False)
+                or isinstance(e, (socket.timeout, TimeoutError))
+                for i, e in errors)
+            if timed_out:
+                raise SshError("并行分片上传超时（%d 连接，单片 %d 秒无数据；"
+                               "高丢包链路可调整 --parallel 重试——过高反而可能适得其反"
+                               "（8 不行试 4/2），或稍后重试）"
+                               % (k, PARALLEL_IO_TIMEOUT), "upload_timeout")
+            i, e = errors[0]
+            raise SshError("并行分片 %d/%d 上传失败: %s" % (i + 1, k, e), "upload_failed")
+        got = sum(w[4] for w in workers)
+        if got != size:
+            raise SshError("上传不完整：得到 %d/%d 字节" % (got, size), "upload_failed")
+        # 大小校验：所有分片写满区间后 .part 应等于本地大小
+        _sftp_touch_activity(workers[0][1])
+        rsize = workers[0][1].stat(part).st_size
+        if rsize != size:
+            raise SshError("分片上传大小校验失败（远端 %d != 本地 %d）"
+                           % (rsize, size), "upload_failed")
+        # 原子改名用活跃的 worker 连接（主 sftp 空闲 30s 会被看门狗杀）
+        _sftp_atomic_rename(workers[0][1], part, remote)
+    except BaseException as e:
+        # 失败/中断：用活跃 worker 连接清理 .part（主连接可能已被看门狗杀；
+        # keep_part 双丢防护：改名回退失败时 part 是新数据唯一副本，保留不删）
+        if not getattr(e, "keep_part", False):
+            for _, sftp, *_ in workers:
+                try:
+                    sftp.remove(part)
+                    break
+                except Exception:
+                    continue
+        raise
+    finally:
+        for client, sftp, start, end, _ in workers:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+            close_all(client)
+        if shared_jump is not None:
+            close_all(shared_jump)
+
+
 def _remote_size_is(sftp, rpath, size):
     """远程文件存在且大小一致（--skip-existing 的判断依据：仅比大小，不比内容/时间）"""
     try:
@@ -1839,6 +1987,46 @@ def _atomic_local_write(write_fn, local, resume=False):
         raise
 
 
+def _sftp_atomic_rename(sftp, part, remote):
+    """远端原子改名：posix-rename 覆盖；服务器不支持时退化为 remove+rename
+    （非原子，WARN 一次）；回退前守卫防误删他人成果；回退也失败保留 part
+    （keep_part 双丢防护标记，外层跳过清理）。从 _sftp_put_atomic 抽出，
+    供串行上传与分片上传共用同一原子收尾。"""
+    try:
+        sftp.posix_rename(part, remote)
+    except Exception as rename_err:
+        # 回退前守卫：part 不在了说明状态已异常（如被外部动过），
+        # 此时 remove(remote) 可能删掉别人的成果——抛原始的 rename 错误
+        # （不能 bare raise：那会重抛内层 stat 的异常，错误消息指向不准）
+        try:
+            sftp.stat(part)
+        except Exception:
+            raise rename_err
+        if not getattr(sftp, "_pyaissh_posix_rename_warned", False):
+            sftp._pyaissh_posix_rename_warned = True
+            log("[WARN] 服务器不支持原子改名（posix-rename 扩展），"
+                "本次用删除+改名代替（该服务器上中断可能留下 .part 或旧文件）")
+        try:
+            sftp.remove(remote)
+        except IOError:
+            pass  # 目标原本不存在，直接改名即可
+        try:
+            sftp.rename(part, remote)
+        except Exception as fallback_err:
+            # 回退也失败：绝不删 .part——它是新数据的唯一副本，删了就是
+            # "旧文件已删 + 新数据也丢"的双丢。保留 part 并明确告警，
+            # AI 能手动恢复或安全重试（keep_part 标记让外层跳过清理）
+            msg = ("远端原子改名失败且回退改名也失败（旧文件已删除，新数据"
+                   "保留在临时文件 %s）：%s" % (part, fallback_err))
+            log("[WARN] " + msg)
+            _PUT_RESIDUE_WARNINGS.append(msg)
+            err = SshError("上传失败：远端原子改名失败且回退也失败，"
+                           "新数据保留在 %s（旧文件已删除，请手动恢复或重试）: %s"
+                           % (part, fallback_err), "upload_failed")
+            err.keep_part = True
+            raise err
+
+
 def _sftp_put_atomic(sftp, local, remote, progress=None, resume=False):
     """SFTP 上传 + 远端原子改名：先传 .part（默认进程唯一名 <pid>；--resume 时
     固定名 <remote>.part 且支持断点续传），成功后 posix-rename 覆盖。服务器不
@@ -1918,39 +2106,7 @@ def _sftp_put_atomic(sftp, local, remote, progress=None, resume=False):
             log("[FILE] 续传完成 %s (%s)" % (remote, format_size(local_size)))
         else:
             sftp.put(local, part, callback=_cb)
-        try:
-            sftp.posix_rename(part, remote)
-        except Exception as rename_err:
-            # 回退前守卫：part 不在了说明状态已异常（如被外部动过），
-            # 此时 remove(remote) 可能删掉别人的成果——抛原始的 rename 错误
-            # （不能 bare raise：那会重抛内层 stat 的异常，错误消息指向不准）
-            try:
-                sftp.stat(part)
-            except Exception:
-                raise rename_err
-            if not getattr(sftp, "_pyaissh_posix_rename_warned", False):
-                sftp._pyaissh_posix_rename_warned = True
-                log("[WARN] 服务器不支持原子改名（posix-rename 扩展），"
-                    "本次用删除+改名代替（该服务器上中断可能留下 .part 或旧文件）")
-            try:
-                sftp.remove(remote)
-            except IOError:
-                pass  # 目标原本不存在，直接改名即可
-            try:
-                sftp.rename(part, remote)
-            except Exception as fallback_err:
-                # 回退也失败：绝不删 .part——它是新数据的唯一副本，删了就是
-                # "旧文件已删 + 新数据也丢"的双丢。保留 part 并明确告警，
-                # AI 能手动恢复或安全重试（keep_part 标记让外层跳过清理）
-                msg = ("远端原子改名失败且回退改名也失败（旧文件已删除，新数据"
-                       "保留在临时文件 %s）：%s" % (part, fallback_err))
-                log("[WARN] " + msg)
-                _PUT_RESIDUE_WARNINGS.append(msg)
-                err = SshError("上传失败：远端原子改名失败且回退也失败，"
-                               "新数据保留在 %s（旧文件已删除，请手动恢复或重试）: %s"
-                               % (part, fallback_err), "upload_failed")
-                err.keep_part = True
-                raise err
+        _sftp_atomic_rename(sftp, part, remote)
     except BaseException as e:
         if getattr(e, "keep_part", False):
             raise  # 回退双丢防护：.part 是新数据唯一副本，保留不清理（已告警）
@@ -2673,6 +2829,9 @@ def cmd_exec(args):
             error_type = "exec_timeout"
         else:
             error_type = "exec_failed"
+        hint = _shell_escape_hint(args.cmd)
+        if hint:
+            msg += hint
         emit_error(args.json, error_type, msg, extra=_partial_extra())
         return 124 if error_type != "exec_failed" else 255
     finally:
@@ -2875,8 +3034,29 @@ def cmd_upload(args):
                            "若为路径拼写错误请检查 remote）" % ", ".join(created))
                     log("[MKDIR] " + tip)
                     walk_warnings.append(tip)
-                _sftp_put_atomic(sftp, local, remote, progress=bytes_uploaded,
-                                 resume=bool(args.resume))
+                if args.parallel and size >= 64 * 1024:
+                    # 显式 --parallel：分片上传（对称下载分片，慢链路提速）。
+                    # 默认不加自动档（upload 行为零变化，用户主动提速才用）；
+                    # 与 --resume 互斥：分片上传不做续传
+                    if args.resume:
+                        walk_warnings.append("--parallel 上传与 --resume 互斥，忽略 --resume"
+                                             "（分片上传不做续传）")
+                        log("[WARN] --parallel 上传与 --resume 互斥，忽略 --resume")
+                    parallel_used = args.parallel
+                    try:
+                        # _parallel_put 内部用活跃 worker 连接完成原子改名与
+                        # 失败清理（主 sftp 空闲 30s 会被看门狗杀，不能参与）
+                        _parallel_put(conn, args, local, remote, size, args.parallel)
+                    except BaseException:
+                        # 兜底清理：worker 连接清理失败时主连接再试一次
+                        try:
+                            sftp.remove(_part_path(remote))
+                        except Exception:
+                            pass
+                        raise
+                else:
+                    _sftp_put_atomic(sftp, local, remote, progress=bytes_uploaded,
+                                     resume=bool(args.resume))
                 entry["transferred"] = True
                 files_transferred = 1
                 bytes_transferred = size
@@ -3855,7 +4035,11 @@ def build_parser():
     p.add_argument("--resume", action="store_true",
                    help="断点续传：中断后保留远端 .part，重试从断点继续（仅单文件；"
                         "续传点基于大小，极端损坏场景可下载后 md5sum 复核；"
-                        "--resume 模式禁用并发写同一目标）")
+                        "--resume 模式禁用并发写同一目标；与 --parallel 互斥）")
+    p.add_argument("--parallel", type=_positive_int, choices=range(1, 9), metavar="1-8",
+                   help="单文件分片上传连接数（1-8）：高丢包/慢链路大文件提速，"
+                        "对称下载分片（默认单连接；显式给出时 ≥64KB 即分片；"
+                        "与 --resume 互斥）")
     p.set_defaults(func=cmd_upload)
 
     # download
