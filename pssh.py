@@ -224,7 +224,13 @@ CMD_ECHO_LIMIT = 8192        # 结果 JSON 的 cmd 字段回显上限：--cmd-fi
 _RETRYABLE_ERRORS = {
     "connection_timeout", "connection_refused", "connection_failed", "dns_failed",
     "connection_lost", "interrupted",
+    # 所有 SFTP 传输/超时类统一 true（upload/download/ls 的 _failed/_timeout 同性质：
+    # 操作目标资源时的网络/通道问题，重试可能成功，message 说明具体原因）
     "upload_failed", "download_failed", "upload_timeout", "download_timeout",
+    "ls_failed", "ls_timeout",
+    # test 连接成功后的通道/传输异常兜底（test 只跑系统查询，命令本身几乎不会
+    # 失败；信号中断已单独归 interrupted）——与 connection_lost 同类，可重试
+    "test_failed",
     "exec_idle_timeout", "exec_total_timeout", "exec_timeout",
 }
 
