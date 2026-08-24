@@ -22,3 +22,4 @@ Thumbs.db
 
 # 技能打包产物（构建/导出生成，非源码）
 *.zip
+.freebuff/
