@@ -1,11 +1,11 @@
 ---
 name: pssh
-description: 通过 pssh（paramiko CLI）执行远程 SSH 操作：exec/upload/download/test/ls，默认输出整行 JSON 供 AI 精确解析；支持跳板机、主机别名（@名称）、大文件并行分片下载、多级超时防挂死
+description: 通过 pssh（paramiko CLI）执行远程 SSH 操作：exec/upload/download/test/ls，默认输出整行 JSON 供 AI 精确解析；支持跳板机、主机别名（@名称）、大文件并行分片下载、多级超时防挂死、断点续传；传输零 token 消耗（文件内容永不回传，AI 只消费元数据）
 ---
 
 # pssh — 结构化 SSH 工具（给 AI 用）
 
-pssh 是基于 paramiko 的命令行 SSH 工具，专为非交互的 AI/脚本使用设计。需要操作远程主机（执行命令、传文件、查目录）时，用本工具而不是裸调 ssh：它的输出是结构化、可精确解析的。
+pssh 是基于 paramiko 的命令行 SSH 工具，专为非交互的 AI/脚本使用设计。需要操作远程主机（执行命令、传文件、查目录）时，用本工具而不是裸调 ssh：它的输出是结构化、可精确解析的。**传输零 token 消耗**：upload/download 文件内容从不回传 JSON——AI 只消费元数据（`files`/`bytes`/`file_list`），大文件/二进制不会烧爆 LLM 上下文。
 
 ## 速查（先读这 8 条）
 

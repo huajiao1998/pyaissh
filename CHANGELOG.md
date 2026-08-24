@@ -87,3 +87,6 @@
 
 ### 修改
 - **retryable 映射哲学统一（补 ls_failed/ls_timeout/test_failed）**：v1.5.6 初版映射漏了三个同性质类型——`ls_failed`/`ls_timeout` 与 upload/download 的 `_failed/_timeout` 完全同性质（SFTP 网络/通道问题），`test_failed` 是连接成功后的通道/传输异常兜底（test 只跑系统查询，命令本身几乎不会失败；信号中断已单独归 interrupted）。三者挪入 true 集，统一原则："**所有 SFTP 传输/超时类 + test_failed → true**；凭据/参数/本地文件/命令失败类 → false"。验证：静态映射确认 + emit_error 单元输出（ls_failed/ls_timeout/test_failed → true，auth_failed/bad_args → false）；真机 ls 权限拒绝触发因 root 忽略权限位不可行（环境限制，映射逻辑由单元覆盖）。
+
+### 文档
+- **零 token 传输卖点文档化**：pssh 从设计上就不把文件内容回传 JSON（upload/download 结果只含 `files`/`bytes`/`file_list` 元数据）——对比 MCP SSH 生态普遍把传输内容塞进 LLM 上下文的通病，这是天然卖点。SKILL.md（description + 定位段）与 `--help` epilog 新增"传输零 token 消耗"说明（实测：1MB 随机文件传输后结果 JSON 仅 410 字节纯元数据）。

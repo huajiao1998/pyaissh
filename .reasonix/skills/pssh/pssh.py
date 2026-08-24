@@ -3765,6 +3765,8 @@ def build_parser():
       stdout_bytes(原始接收字节)、stdout_truncated(该流是否截断，省略量见
       stdout_omitted_bytes)；upload/download 的 bytes=清单总大小、
       bytes_transferred=实际传输；ls 的 entries 含 mode/mtime(epoch 秒,UTC)/is_symlink
+特性: 传输零 token 消耗——upload/download 的文件内容从不回传 JSON，AI 只消费
+      元数据（files/bytes/file_list），大文件/二进制不会烧爆 LLM 上下文
 环境变量 (.env 或系统): PSSH_USER / PSSH_PORT / PSSH_KEY / PSSH_PASSWORD /
                         PSSH_JUMP_KEY / PSSH_JUMP_PASSWORD / PSSH_HOST_<名称>
 """,
