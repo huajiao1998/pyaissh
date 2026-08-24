@@ -90,3 +90,5 @@
 
 ### 文档
 - **零 token 传输卖点文档化**：pssh 从设计上就不把文件内容回传 JSON（upload/download 结果只含 `files`/`bytes`/`file_list` 元数据）——对比 MCP SSH 生态普遍把传输内容塞进 LLM 上下文的通病，这是天然卖点。SKILL.md（description + 定位段）与 `--help` epilog 新增"传输零 token 消耗"说明（实测：1MB 随机文件传输后结果 JSON 仅 410 字节纯元数据）。
+- **品牌改名 pssh → pyaissh（开源发布准备）**：仓库/命令/文件名/文档全量改名——pssh.py→pyaissh.py、pssh.cmd→pyaissh.cmd、bash 包装 pssh→pyaissh、--help 的 prog、输出标记（[pssh: 已截断]→[pyaissh: 已截断]、seam/[pssh] 前缀）、spill 文件前缀（pssh-stdout-→pyaissh-stdout-）、SKILL.md 与全部 docs 的调用示例与描述。**刻意保留**：PSSH_* 环境变量（运行时协议，改名是破坏性变更，pssh_host_prod 小写示例同步保留）、_pssh_* 内部属性（paramiko 对象上的实现细节）、技能目录路径 .reasonix/skills/pssh/ 与 SKILL.md 
+ame: pssh（skill 加载 id 稳定）、pssh.py.bak（历史备份）、历史 CHANGELOG 条目（记录不改）。git 历史中的旧文件名随提交记录保留。

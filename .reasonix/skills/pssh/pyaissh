@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# pssh - paramiko SSH 工具包装器（Git Bash / MSYS / Linux / macOS 通用）
-# 定位与包装脚本同目录的 pssh.py（跟随符号链接），避免硬编码路径。
+# pyaissh - paramiko SSH 工具包装器（Git Bash / MSYS / Linux / macOS 通用）
+# 定位与包装脚本同目录的 pyaissh.py（跟随符号链接），避免硬编码路径。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 case "$(uname -s)" in
@@ -20,4 +20,4 @@ case "$(uname -s)" in
         ;;
 esac
 
-exec "$PY" "$SCRIPT_DIR/pssh.py" "$@"
+exec "$PY" "$SCRIPT_DIR/pyaissh.py" "$@"

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""SIGTERM/SIGINT harness: import pssh.py as module, call main() in-process as
+"""SIGTERM/SIGINT harness: import pyaissh.py as module, call main() in-process as
 the real main thread, raise the signal after DELAY ms via signal.raise_signal.
-Usage: PSSH_PY=/path/pssh.py SIG=TERM python sigterm_harness.py <delay_ms> -- <pssh args...>
+Usage: PSSH_PY=/path/pyaissh.py SIG=TERM python sigterm_harness.py <delay_ms> -- <pssh args...>
 Prints HARNESS_RC=<rc> HARNESS_SECS=<wall> HARNESS_SIG=<which> to stderr."""
 import sys, os, time, signal, threading, importlib.util
 

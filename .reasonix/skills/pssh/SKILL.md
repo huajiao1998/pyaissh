@@ -1,11 +1,11 @@
 ---
 name: pssh
-description: 通过 pssh（paramiko CLI）执行远程 SSH 操作：exec/upload/download/test/ls，默认输出整行 JSON 供 AI 精确解析；支持跳板机、主机别名（@名称）、大文件并行分片下载、多级超时防挂死、断点续传；传输零 token 消耗（文件内容永不回传，AI 只消费元数据）
+description: 通过 pyaissh（paramiko CLI）执行远程 SSH 操作：exec/upload/download/test/ls，默认输出整行 JSON 供 AI 精确解析；支持跳板机、主机别名（@名称）、大文件并行分片下载、多级超时防挂死、断点续传；传输零 token 消耗（文件内容永不回传，AI 只消费元数据）
 ---
 
-# pssh — 结构化 SSH 工具（给 AI 用）
+# pyaissh — 结构化 SSH 工具（给 AI 用）
 
-pssh 是基于 paramiko 的命令行 SSH 工具，专为非交互的 AI/脚本使用设计。需要操作远程主机（执行命令、传文件、查目录）时，用本工具而不是裸调 ssh：它的输出是结构化、可精确解析的。**传输零 token 消耗**：upload/download 文件内容从不回传 JSON——AI 只消费元数据（`files`/`bytes`/`file_list`），大文件/二进制不会烧爆 LLM 上下文。
+pyaissh 是基于 paramiko 的命令行 SSH 工具，专为非交互的 AI/脚本使用设计。需要操作远程主机（执行命令、传文件、查目录）时，用本工具而不是裸调 ssh：它的输出是结构化、可精确解析的。**传输零 token 消耗**：upload/download 文件内容从不回传 JSON——AI 只消费元数据（`files`/`bytes`/`file_list`），大文件/二进制不会烧爆 LLM 上下文。
 
 ## 速查（先读这 8 条）
 
@@ -20,7 +20,7 @@ pssh 是基于 paramiko 的命令行 SSH 工具，专为非交互的 AI/脚本�
 
 ## 快速开始
 
-- **本 skill 自带 `pssh.py`**（技能目录 `.reasonix/skills/pssh/` 下）：Linux/macOS `python3 <pssh_dir>/pssh.py <子命令> ...`；Windows cmd `<pssh_dir>\pssh.cmd ...`；Git Bash `<pssh_dir>/pssh ...`；环境需 `python3` + `paramiko`（`pip install paramiko`）
+- **本 skill 自带 `pyaissh.py`**（技能目录 `.reasonix/skills/pssh/` 下）：Linux/macOS `python3 <pyaissh_dir>/pyaissh.py <子命令> ...`；Windows cmd `<pyaissh_dir>\pyaissh.cmd ...`；Git Bash `<pyaissh_dir>/pyaissh ...`；环境需 `python3` + `paramiko`（`pip install paramiko`）
 - 目标格式 `[user@]host[:port]`（如 `root@1.2.3.4:22`）；**IPv6 必须加方括号**：`user@[2001:db8::1]:22`、`[2001:db8::1]`（裸 IPv6 直接写也行）；支持主机别名 `@名称`、`-p/--port` 优先于内嵌端口；凭据 `--password`/`--key` 或环境变量 `PSSH_PASSWORD`/`PSSH_KEY` 等（也可写**技能目录下**的 `.env`——**配置样例见同目录 `.env.example`**；工作目录 `.env` 默认不加载，完整规则见 docs/setup.md）
 - **完整规则**（认证优先级、别名专属凭据、`.env` 加载与供应链安全、IPv6/端口解析细节）见 **docs/setup.md**
 
@@ -55,14 +55,14 @@ pssh 是基于 paramiko 的命令行 SSH 工具，专为非交互的 AI/脚本�
 
 ### test — 先测连接
 ```bash
-python3 pssh.py test root@1.2.3.4
+python3 pyaissh.py test root@1.2.3.4
 ```
 返回 `hostname` / `os` / `kernel` / `arch`。**连接任何主机前先 test**，失败按错误类型处理。
 
 ### exec — 执行远程命令
 ```bash
-python3 pssh.py exec root@1.2.3.4 --cmd 'df -h'
-python3 pssh.py exec root@1.2.3.4 --cmd-file - <<'EOF'   # 长脚本/特殊字符走 stdin
+python3 pyaissh.py exec root@1.2.3.4 --cmd 'df -h'
+python3 pyaissh.py exec root@1.2.3.4 --cmd-file - <<'EOF'   # 长脚本/特殊字符走 stdin
 ls -la /var/log
 EOF
 ```
@@ -70,31 +70,31 @@ EOF
 
 ### ls — 列远程目录
 ```bash
-python3 pssh.py ls root@1.2.3.4 --path /etc         # entries JSON
-python3 pssh.py ls root@1.2.3.4 --path '~'          # ~ 自动展开
+python3 pyaissh.py ls root@1.2.3.4 --path /etc         # entries JSON
+python3 pyaissh.py ls root@1.2.3.4 --path '~'          # ~ 自动展开
 ```
 `entries[]` 恒含 `name`（目录带 `/` 后缀）/ `mode` / `size`（**目录为 null**）/ `is_dir` / `is_symlink` / `mtime`（epoch 秒 UTC）；不支持通配符
 
 ### upload / download — 传输文件
 ```bash
-python3 pssh.py upload root@1.2.3.4 --local ./dist --remote /opt/app/dist
-python3 pssh.py download root@1.2.3.4 --remote /var/log/x.log --local ./x.log
-python3 pssh.py download root@1.2.3.4 --remote big.tar.gz --local . --parallel 8   # 大文件提速
-python3 pssh.py upload root@1.2.3.4 --local big.bin --remote /tmp/big.bin --resume  # 断点续传（≥50MB 未启用时会 TIP 提示）
+python3 pyaissh.py upload root@1.2.3.4 --local ./dist --remote /opt/app/dist
+python3 pyaissh.py download root@1.2.3.4 --remote /var/log/x.log --local ./x.log
+python3 pyaissh.py download root@1.2.3.4 --remote big.tar.gz --local . --parallel 8   # 大文件提速
+python3 pyaissh.py upload root@1.2.3.4 --local big.bin --remote /tmp/big.bin --resume  # 断点续传（≥50MB 未启用时会 TIP 提示）
 ```
 路径语义（`~` 展开、尾斜杠=目录意图、目录内容放入不嵌套）、并行分片、`.part` 原子性/双丢防护/中断残留、**断点续传 `--resume`**（默认关；固定 `.part` 续传点、禁并发、分片 done 标记、基于大小校验）、`file_list` 断点重试、`--dry-run`/`--skip-existing`/`--no-recursive`、符号链接处理完整语义见 **docs/transfer.md**
 
 ### 跳板机
 ```bash
-python3 pssh.py exec root@10.0.0.5 --jump root@1.2.3.4:2222 --jump-password 'xxx' --cmd 'hostname'
-python3 pssh.py exec root@10.0.0.5 --jump @bastion --cmd 'hostname'   # 跳板也支持 @别名
+python3 pyaissh.py exec root@10.0.0.5 --jump root@1.2.3.4:2222 --jump-password 'xxx' --cmd 'hostname'
+python3 pyaissh.py exec root@10.0.0.5 --jump @bastion --cmd 'hostname'   # 跳板也支持 @别名
 ```
 跳板未配置专属密码（`PSSH_JUMP_PASSWORD`/`--jump-password` 都没有）时自动回退用 `PSSH_PASSWORD`（v1.4.9 起，仅密码、密钥不回落）；凭据优先级、用户名回退、错误前缀、分片共享隧道细节见 **docs/jump.md**
 
 ## 安全规则
 
 - 凭据优先用环境变量 `PSSH_PASSWORD` / `PSSH_KEY` 或 `.env`，**不要写进命令行参数**（进程列表可见）
-- 命令含疑似凭据（如 `mysql -p'xxx'`、`DB_PASS=...`）时 pssh 会在 stderr 打 WARN——照常执行，但注意日志可能泄露敏感信息
+- 命令含疑似凭据（如 `mysql -p'xxx'`、`DB_PASS=...`）时 pyaissh 会在 stderr 打 WARN——照常执行，但注意日志可能泄露敏感信息
 - **JSON 结果的 `cmd`/`stdout`/`stderr` 字段同样含凭据且不截断**：把结果转发/落盘/写入任务记录前先脱敏
 
 ## 参数默认值
@@ -105,7 +105,7 @@ python3 pssh.py exec root@10.0.0.5 --jump @bastion --cmd 'hostname'   # 跳板�
 
 - **`--pty` 下全屏交互程序（vi/vim、sudo 密码输入）不可用**；sudo 密码无法用 stdin 管道（`sudo -S` 不适用），需 `sudo -n`（免密）或密码写进远程环境变量
 - **默认 AutoAddPolicy 隐式接受新 host key**（paramiko≥5.0 会写回 known_hosts，写盘为原子替换：并发不丢记录、不损坏文件；首次连接的新主机 stderr 会打 `[WARN] 新主机 host key 已隐式接受`）；敏感环境加 `--strict`
-- **Git Bash 下远程路径参数会被 MSYS 改写**（用 `./pssh` 包装或加 `MSYS_NO_PATHCONV=1` 前缀）
+- **Git Bash 下远程路径参数会被 MSYS 改写**（用 `./pyaissh` 包装或加 `MSYS_NO_PATHCONV=1` 前缀）
 - **远程命令自杀伤**：`pkill -f "dsh web"` 这类按自身 cmdline 模式匹配的杀进程命令，会把自己（承载 SSH 会话的 bash）一起杀掉 → `connection_lost`、结果不可信。用 `pkill -f '[d]sh web'` 括号转义规避（详见 docs/edge-cases.md）
 - 其他边界（ANSI 风险、MaxStartups 并发上限、极早期信号窗口、Windows 下载文件名安全化、后台进程 drain 窗口、pkill 自杀伤等）见 **docs/edge-cases.md**
 
@@ -115,7 +115,7 @@ python3 pssh.py exec root@10.0.0.5 --jump @bastion --cmd 'hostname'   # 跳板�
 
 ## 文档导航（按需读取，节省上下文）
 
-> **维护约定**：每次更新/修改/修复 pssh，必须在 **CHANGELOG.md** **末尾追加**一条记录（**最新在最后**，文件只增不减、历史条目禁止覆盖或删除——末尾追加是对 AI 最安全的更新方式，避免"往开头插入"误伤标题/约定；版本号与 `pssh.py` 的 `VERSION` 常量一致），并同步技能目录（`/skills/pssh/`） `pssh.py` / `CHANGELOG.md`。
+> **维护约定**：每次更新/修改/修复 pyaissh，必须在 **CHANGELOG.md** **末尾追加**一条记录（**最新在最后**，文件只增不减、历史条目禁止覆盖或删除——末尾追加是对 AI 最安全的更新方式，避免"往开头插入"误伤标题/约定；版本号与 `pyaissh.py` 的 `VERSION` 常量一致），并同步技能目录（`/skills/pssh/`） `pyaissh.py` / `CHANGELOG.md`。
 
 | 场景 | 读哪个文档 |
 |---|---|
@@ -127,5 +127,5 @@ python3 pssh.py exec root@10.0.0.5 --jump @bastion --cmd 'hostname'   # 跳板�
 | upload/download 并行分片 / 原子性 / 断点重试 / 符号链接 | **docs/transfer.md** |
 | 跳板机凭据 / 隧道 / 分片 | **docs/jump.md** |
 | PTY/ANSI / host key / MaxStartups / 信号 / Windows / Git Bash 等边界 | **docs/edge-cases.md** |
-| 单个参数的准确语义（默认值/取值范围） | `python3 pssh.py <子命令> --help` |
+| 单个参数的准确语义（默认值/取值范围） | `python3 pyaissh.py <子命令> --help` |
 | 契约本身（JSON 字段 / 退出码 / 错误类型） | 本文档（速查 + 输出约定核心 + 退出码表 + 错误类型摘要） |

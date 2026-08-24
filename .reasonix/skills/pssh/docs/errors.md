@@ -1,6 +1,6 @@
-# pssh 错误类型与退出码（子文档）
+# pyaissh 错误类型与退出码（子文档）
 
-> 这是 pssh skill 的**子文档**（位于技能目录 `docs/` 子目录下，按需读取、不随 SKILL.md 自动注入）：契约（stdout 单行 JSON）以 SKILL.md 为准，本文是退出码与 error 类型的**完整**参考表。
+> 这是 pyaissh skill 的**子文档**（位于技能目录 `docs/` 子目录下，按需读取、不随 SKILL.md 自动注入）：契约（stdout 单行 JSON）以 SKILL.md 为准，本文是退出码与 error 类型的**完整**参考表。
 > **何时读**：任何失败场景需要精确分类与建议动作时；SKILL.md 只留高频摘要。
 
 ## retryable 字段（v1.5.6，错误 JSON 恒有）
@@ -43,11 +43,11 @@
 | `connection_lost` | 执行中连接中断，未收到退出状态，**输出可能不完整** | 不要信任部分结果，重跑命令核对 |
 | `interrupted` | 用户中断（Ctrl+C 或 SIGTERM），退出码 130 | 任务被手动/超时机制终止；错误 JSON 带已读到的部分进展——exec 为 `stdout`/`stderr`，upload/download 为已传 `file_list`（upload 的 `bytes_transferred` 为真实已传字节）——据此判断命令是否已部分执行，`rm`/`apt install`/`git push` 等非幂等命令**谨慎重试**；上传中断可能残留 `.part`（warnings 会明示路径与清理命令），重试前先清理；下载中断不留 `.part` 残留 |
 | `ssh_error` | SSH 协商/协议错误（`--strict` 下新主机不在 known_hosts 时常见） | 查看 `message`；`--strict` 场景先确认主机或清理 known_hosts |
-| `internal_error` | 工具内部未预期异常（理论不可达，兜底分支） | 属于 pssh 自身缺陷：把 stderr 的 traceback 与复现命令反馈给维护者；可安全重试 |
+| `internal_error` | 工具内部未预期异常（理论不可达，兜底分支） | 属于 pyaissh 自身缺陷：把 stderr 的 traceback 与复现命令反馈给维护者；可安全重试 |
 | `read_cmd_failed` | `--cmd-file` 读取失败（退出码 2） | 检查文件路径与编码 |
 | `dependency_missing` | 本地依赖缺失（如未安装 paramiko），退出码 255，`retryable=false` | **本地环境问题，与目标主机/网络无关**——`pip install paramiko` 安装后重试；重试前无需排查网络/目标机（v1.5.6 起独立分类；此前误归 `connection_failed` 且 retryable=true 导致 AI 白白重试） |
 | `upload_failed` / `download_failed` | 传输失败 | 查看 `message`（多为权限/磁盘/网络问题）；错误 JSON **恒带** `host`/`user`/`port` 和**已完成的 `file_list`**（含 transferred/skipped 状态，中断后直接全量重试或按清单断点重试都安全——下载/上传均 `.part` 原子收尾，不留半截最终文件）；`upload_timeout`/`download_timeout`/`ls_timeout`/`ls_failed`/`test_failed` 同样带 `host`/`user`（传输类还带 `port`/`file_list`/`warnings`） |
 | `upload_timeout` / `download_timeout` | SFTP 传输超时（30s 无数据，NAT/网络静默断开；分片下载为 120s/片） | 检查网络/防火墙；**download 超时优先加 `--parallel 8` 重试**（高丢包/跨境链路单连接吞吐塌陷，多连接近似线性提速） |
 | `ls_failed` / `ls_timeout` / `test_failed` | ls 兜底错误 / ls 的 SFTP 30s 无数据超时（退出码 1）/ test 兜底错误 | 查看 `message`（多为权限/磁盘/网络问题）；`ls_timeout` 查网络后重试 |
 
-> **凭据 WARN**：命令含疑似凭据时打的 WARN（`warnings` 字段，不阻断执行）其判定形态与已测正反例，见 `pssh.py` 中 `_SENSITIVE_CMD_RE` 定义处注释（29 条验收案例，改判定规则时对照自查）。
+> **凭据 WARN**：命令含疑似凭据时打的 WARN（`warnings` 字段，不阻断执行）其判定形态与已测正反例，见 `pyaissh.py` 中 `_SENSITIVE_CMD_RE` 定义处注释（29 条验收案例，改判定规则时对照自查）。

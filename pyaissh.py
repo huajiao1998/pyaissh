@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""pssh - 基于 paramiko 的命令行 SSH 工具（给 AI 用）
+"""pyaissh - 基于 paramiko 的命令行 SSH 工具（给 AI 用）
 
 工作原理：
     封装 paramiko，提供 exec / upload / download / test / ls 五个子命令。
@@ -34,27 +34,27 @@
        curl -u user:pass）会留在记录里；建议敏感凭据用远程环境变量注入。
 
 用法示例：
-    pssh exec root@1.2.3.4 --cmd 'uname -a'
-    pssh exec root@1.2.3.4 --cmd 'apt upgrade' --max-time 1200   # 长任务调大总时长上限
-    pssh exec root@1.2.3.4 --cmd 'make' --idle-timeout 120       # 静默超时（连续无输出的窗口）
-    pssh exec @prod --cmd 'uname -a'                            # 主机别名（.env 配 PSSH_HOST_PROD）
-    pssh exec root@1.2.3.4 --pty --cmd 'tty'                    # 分配 PTY（需要 TTY 的非交互命令）
-    pssh exec root@1.2.3.4 --pty --pty-strip-ansi --cmd 'top -b -n 1'  # PTY + 剥离 ANSI 供 AI 解析
-    pssh exec root@1.2.3.4 --cmd-file - <<'EOF'
+    pyaissh exec root@1.2.3.4 --cmd 'uname -a'
+    pyaissh exec root@1.2.3.4 --cmd 'apt upgrade' --max-time 1200   # 长任务调大总时长上限
+    pyaissh exec root@1.2.3.4 --cmd 'make' --idle-timeout 120       # 静默超时（连续无输出的窗口）
+    pyaissh exec @prod --cmd 'uname -a'                            # 主机别名（.env 配 PSSH_HOST_PROD）
+    pyaissh exec root@1.2.3.4 --pty --cmd 'tty'                    # 分配 PTY（需要 TTY 的非交互命令）
+    pyaissh exec root@1.2.3.4 --pty --pty-strip-ansi --cmd 'top -b -n 1'  # PTY + 剥离 ANSI 供 AI 解析
+    pyaissh exec root@1.2.3.4 --cmd-file - <<'EOF'
     ls -la /var/log
     EOF
-    pssh upload root@1.2.3.4 --local ./dist --remote /opt/app/dist --skip-existing
-    pssh download root@1.2.3.4 --remote /var/log/x.log --local ./x.log
-    pssh download root@1.2.3.4 --remote big.tar.gz --local . --parallel 8  # 高丢包链路提速
-    pssh test root@1.2.3.4
-    pssh ls root@1.2.3.4 --path /etc --long
+    pyaissh upload root@1.2.3.4 --local ./dist --remote /opt/app/dist --skip-existing
+    pyaissh download root@1.2.3.4 --remote /var/log/x.log --local ./x.log
+    pyaissh download root@1.2.3.4 --remote big.tar.gz --local . --parallel 8  # 高丢包链路提速
+    pyaissh test root@1.2.3.4
+    pyaissh ls root@1.2.3.4 --path /etc --long
 
     # 通过跳板机连接（跳板用密码，目标用密钥）
-    pssh exec root@10.0.0.5 --jump root@156.233.234.206:22024 \
+    pyaissh exec root@10.0.0.5 --jump root@156.233.234.206:22024 \
         --jump-password 'xxx' --cmd 'hostname'
 
 路径语义：
-    远端路径支持 ~ 与 ~/（SFTP 协议本身不展开，pssh 自动转换为绝对路径，
+    远端路径支持 ~ 与 ~/（SFTP 协议本身不展开，pyaissh 自动转换为绝对路径，
     实际路径回显在结果的 remote/path 字段）；不支持通配符（SFTP 无 glob，
     请先 ls 拿到明确文件名）。传目录时源目录的【内容】放入目标目录下
     （不额外嵌套一层）；单文件传到已存在的目录 = 放入该目录（scp 语义）。
@@ -355,7 +355,7 @@ def _parse_env_file(env_path):
 def load_env():
     """加载 .env 文件（不覆盖已存在的环境变量）。
 
-    供应链安全设计：**默认只加载脚本目录的 .env**（用户主动放入 pssh
+    供应链安全设计：**默认只加载脚本目录的 .env**（用户主动放入 pyaissh
     工具目录、自己可控的文件）。工作目录（cwd）的 .env 默认【不】加载——
     恶意仓库可自带 .env 注入 PSSH_HOST_* / PSSH_PASSWORD 等变量，把 AI
     的 SSH 连接导向攻击者主机（钓鱼 SSH）。仅当显式设置
@@ -384,7 +384,7 @@ def _fix_msys_remote_path(path):
 
     场景：Git Bash 在没有 MSYS_NO_PATHCONV=1 时，会把 Unix 绝对路径
     （如 /tmp/xxx、/root/xxx、/opt/app）自动转成 Windows 路径，
-    传给 pssh.py 后导致 SFTP 拿到错误路径。
+    传给 pyaissh.py 后导致 SFTP 拿到错误路径。
     此函数检测并逆转常见转换模式。
     """
     if not path or os.name != "nt":
@@ -402,7 +402,7 @@ def _fix_msys_remote_path(path):
     if temp and path.startswith(temp):
         rest = path[len(temp):]
         recovered = "/tmp" + rest
-        log("[WARN] MSYS 路径转换检测: %s → %s (建议用 pssh 命令而非 python pssh.py)" % (path, recovered))
+        log("[WARN] MSYS 路径转换检测: %s → %s (建议用 pyaissh 命令而非 python pyaissh.py)" % (path, recovered))
         return recovered
 
     # 模式 2：MSYS 前缀转换 /root/xxx -> C:/Program Files/Git/root/xxx
@@ -415,7 +415,7 @@ def _fix_msys_remote_path(path):
             if path.startswith(msys_root + "/"):
                 rest = path[len(msys_root):]
                 recovered = rest  # rest is the original /xxx/yyy
-                log("[WARN] MSYS 路径转换检测: %s → %s (建议用 pssh 命令而非 python pssh.py)" % (path, recovered))
+                log("[WARN] MSYS 路径转换检测: %s → %s (建议用 pyaissh 命令而非 python pyaissh.py)" % (path, recovered))
                 return recovered
     except Exception:
         pass
@@ -464,16 +464,16 @@ def _normalize_remote_path(sftp, path):
 def _remote_glob_error(path):
     """构造"路径不存在且含通配符"的专属错误消息（SFTP 无 glob，按字面量找必然不存在）。"""
     return ("远端路径不存在: %s —— 路径含通配符（SFTP 不做 glob 展开），"
-            "请先 pssh ls 列出目录拿到明确文件名，再逐个传输" % path)
+            "请先 pyaissh ls 列出目录拿到明确文件名，再逐个传输" % path)
 
 
 def _fix_msys_local_path(path):
-    """Git Bash 经 ./pssh 包装器（MSYS_NO_PATHCONV=1）运行时，把 /tmp/... 这类
+    """Git Bash 经 ./pyaissh 包装器（MSYS_NO_PATHCONV=1）运行时，把 /tmp/... 这类
     Unix 风格【本地】路径转换成真实 Windows 路径。
 
     背景：包装器禁用了 MSYS 路径转换后，--local /tmp/x 会原样到达 Windows Python，
     被解析成当前盘根 D:\\tmp\\x——shell 视角路径明明存在却报"不存在"，下载方向
-    更会写错位置。直接 python pssh.py 运行时 MSYS 已提前转换，路径到这儿已是
+    更会写错位置。直接 python pyaissh.py 运行时 MSYS 已提前转换，路径到这儿已是
     Windows 风格，本函数原样返回。
     """
     if not path or os.name != "nt" or not os.environ.get("MSYSTEM"):
@@ -560,7 +560,7 @@ def _setup_console_utf8():
             pass
 
 
-# 模块级立即生效（不只在 main()）：import 路径（`python -c "import pssh"`、
+# 模块级立即生效（不只在 main()）：import 路径（`python -c "import pyaissh"`、
 # AI 嵌入、测试 harness）下 stdout/stderr 也保证 UTF-8，否则管道捕获时
 # 中文日志（WARN 等）按本地代码页（GBK）写出会被 UTF-8 解码成乱码。
 # main() 里再调一次是幂等兜底（脚本路径双跑无副作用）。
@@ -641,7 +641,7 @@ def _interrupt_msg():
 # =========================================================================
 
 class SshError(Exception):
-    """pssh 内部错误（携带 error_type 用于结构化输出）"""
+    """pyaissh 内部错误（携带 error_type 用于结构化输出）"""
     def __init__(self, message, error_type="error"):
         super().__init__(message)
         self.error_type = error_type
@@ -714,7 +714,7 @@ def _truncate_output(data, limit, stream_name):
     # marker 前导/后随换行做成可选的：head 已以换行结尾时不再补前导换行、
     # tail 已以换行开头时不再补后随换行，避免 4096 最小档出现空行（AI 按行
     # 号解析会跳号）。构造时用 \x01/\x02 占位，拼装时按 head/tail 实际形态替换。
-    marker_tpl = ("\x01...[pssh: %s 已截断，省略 %d 字节（原文 %d 字节；"
+    marker_tpl = ("\x01...[pyaissh: %s 已截断，省略 %d 字节（原文 %d 字节；"
                   "调大 --max-output 可取全文，尾部信息重要时用 tail]...\x02")
     # 先用真实数字的位数上限（各按 10 位估）预留 marker 空间再算 half：
     # 若按单字符占位估，真实数字（如 15831 比 N 多 4 字节）会让拼装结果
@@ -786,7 +786,7 @@ def _truncate_cmd(cmd):
     half = CMD_ECHO_LIMIT // 2
     head = _utf8_boundary_cut(enc, half).decode("utf-8", errors="replace")
     tail = _utf8_boundary_cut(enc, half, from_start=False).decode("utf-8", errors="replace")
-    body = ("\n...[pssh: cmd 回显已截断，共 %d 字节"
+    body = ("\n...[pyaissh: cmd 回显已截断，共 %d 字节"
             "（完整命令见原始调用，--cmd-file 时为本地文件可重读）]...\n" % n)
     return head + body + tail, True, n
 
@@ -843,7 +843,7 @@ def _spill_writers(args):
             # --spill-dir 同 --local：Git Bash 下 Unix 风格路径（/tmp/x）需 MSYS 转换
             base = _fix_msys_local_path(args.spill_dir) if args.spill_dir else tempfile.gettempdir()
             os.makedirs(base, exist_ok=True)
-            tf = tempfile.NamedTemporaryFile(prefix="pssh-%s-" % name, suffix=".spill",
+            tf = tempfile.NamedTemporaryFile(prefix="pyaissh-%s-" % name, suffix=".spill",
                                              dir=base, delete=False)
             return tf, tf.name
         except Exception:
@@ -968,7 +968,7 @@ def resolve_conn(args):
                 # 只看 stdout 的 AI 需要"为什么我写了 .env 还是找不到"的答案：
                 # 工作目录 .env 默认不加载（供应链防护），真实原因此前只在 stderr
                 msg += ("（检测到工作目录 .env 但默认不加载——防恶意仓库注入；如需启用设 "
-                        "PSSH_ALLOW_CWD_ENV=1，或把 .env 放到 pssh 脚本目录）")
+                        "PSSH_ALLOW_CWD_ENV=1，或把 .env 放到 pyaissh 脚本目录）")
             raise SshError(msg, "bad_args")
         log("[ALIAS] @%s -> %s" % (alias, val))
         target = val
@@ -1219,7 +1219,7 @@ def _do_connect(conn, jump_client, is_jump=False):
         # retryable:true，AI 会白白重试）。dependency_missing 不在
         # _RETRYABLE_ERRORS → retryable=false（装依赖前重试无意义）
         raise SshError(
-            "依赖缺失: %s（pip install paramiko 可安装；pssh 的 SSH 底层库未就绪，"
+            "依赖缺失: %s（pip install paramiko 可安装；pyaissh 的 SSH 底层库未就绪，"
             "与目标主机/网络无关，重试前请先安装依赖）" % e, "dependency_missing")
     if _SIGTERM_RECEIVED:
         # 连接尚未开始即拿到信号（transport 未注册、响应线程无从 close）：
@@ -1988,7 +1988,7 @@ def _sftp_put_atomic(sftp, local, remote, progress=None, resume=False):
                 pass
         if not removed:
             msg = ("远端临时文件可能残留: %s（连接中断无法清理。清理命令："
-                   "rm -f '%s'；批量清理 pssh 中断残留可用 "
+                   "rm -f '%s'；批量清理 pyaissh 中断残留可用 "
                    "find <目标目录> -name '*.part.*' -delete。重试上传前应先清掉，"
                    "否则 .part 会按次累积）" % (part, part))
             log("[WARN] " + msg)
@@ -2363,7 +2363,7 @@ def cmd_exec(args):
                 # 会各多一个空行（4096 最小档实测），拼接前先去重避免空行跳号。
                 lead = b"" if (head_part and head_part[-1:] == b"\n") else b"\n"
                 trail = b"" if (tail_part and tail_part[:1] == b"\n") else b"\n"
-                seam_body = ("[pssh: 中间省略 %d 字节（内存缓冲截断，--max-output 调整）]"
+                seam_body = ("[pyaissh: 中间省略 %d 字节（内存缓冲截断，--max-output 调整）]"
                              % drop_cnt[0]).encode("utf-8")
                 seam = lead + seam_body + trail
                 # 防显示层二次截断切真实尾部：head+seam+tail 超 buf_limit 时
@@ -2384,7 +2384,7 @@ def cmd_exec(args):
                     drop_cnt[0] += len(tail_part) - len(tp)
                     tail_part = tp
                     trail = b"" if (tail_part and tail_part[:1] == b"\n") else b"\n"
-                    seam_body = ("[pssh: 中间省略 %d 字节（内存缓冲截断，--max-output 调整）]"
+                    seam_body = ("[pyaissh: 中间省略 %d 字节（内存缓冲截断，--max-output 调整）]"
                                  % drop_cnt[0]).encode("utf-8")
                     seam = lead + seam_body + trail
             buf.append(head_part + seam + tail_part)
@@ -2695,7 +2695,7 @@ def cmd_upload(args):
         msg = "本地路径不存在: %s" % local
         if any(c in local for c in _MSYS_GLOB_CHARS) \
                 or any(c in _MSYS_PRIVATE_GLOB for c in local):
-            msg += "（路径含通配符：pssh 不做本地 glob 展开，请先在 shell 展开成明确路径）"
+            msg += "（路径含通配符：pyaissh 不做本地 glob 展开，请先在 shell 展开成明确路径）"
         emit_error(args.json, "bad_args", msg)
         return 2
 
@@ -3558,7 +3558,7 @@ def cmd_ls(args):
         content = "\n".join(lines if args.long else names)
 
         if truncated:
-            content += "\n[pssh] 共 %d 条，仅显示前 %d 条（--limit 调整）" % (total, len(items))
+            content += "\n[pyaissh] 共 %d 条，仅显示前 %d 条（--limit 调整）" % (total, len(items))
 
         duration = int((time.time() - start) * 1000)
         result = {
@@ -3728,28 +3728,28 @@ def _exec_timeout(value):
 
 def build_parser():
     parser = PsshArgumentParser(
-        prog="pssh",
+        prog="pyaissh",
         description="基于 paramiko 的命令行 SSH 工具（给 AI 用）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 示例:
-  pssh exec root@1.2.3.4 --cmd 'uname -a'
-  pssh exec root@1.2.3.4 --cmd 'apt upgrade' --max-time 1200   # 长任务调大总时长上限（最高 1200）
-  pssh exec root@1.2.3.4 --cmd 'make' --idle-timeout 120      # 慢命令调大静默窗口
-  pssh exec root@1.2.3.4 --cmd-file - <<'EOF'
+  pyaissh exec root@1.2.3.4 --cmd 'uname -a'
+  pyaissh exec root@1.2.3.4 --cmd 'apt upgrade' --max-time 1200   # 长任务调大总时长上限（最高 1200）
+  pyaissh exec root@1.2.3.4 --cmd 'make' --idle-timeout 120      # 慢命令调大静默窗口
+  pyaissh exec root@1.2.3.4 --cmd-file - <<'EOF'
   ls -la /var/log
   EOF
-  pssh upload root@1.2.3.4 --local ./dist --remote /opt/app/dist --skip-existing
-  pssh download root@1.2.3.4 --remote /var/log/x.log --local ./x.log
-  pssh download root@1.2.3.4 --remote big.tar.gz --local . --parallel 8   # --local . 可用（scp 语义）
-  pssh test root@1.2.3.4
-  pssh ls root@1.2.3.4 --path /etc --long --limit 500
+  pyaissh upload root@1.2.3.4 --local ./dist --remote /opt/app/dist --skip-existing
+  pyaissh download root@1.2.3.4 --remote /var/log/x.log --local ./x.log
+  pyaissh download root@1.2.3.4 --remote big.tar.gz --local . --parallel 8   # --local . 可用（scp 语义）
+  pyaissh test root@1.2.3.4
+  pyaissh ls root@1.2.3.4 --path /etc --long --limit 500
 
 跳板机 (--jump):
-  pssh exec root@10.0.0.5 --jump root@1.2.3.4:2222 --jump-password 'xxx' --cmd 'hostname'
+  pyaissh exec root@10.0.0.5 --jump root@1.2.3.4:2222 --jump-password 'xxx' --cmd 'hostname'
 
 主机别名 (.env 配 PSSH_HOST_PROD=root@1.2.3.4:22 后):
-  pssh exec @prod --cmd 'uname -a'
+  pyaissh exec @prod --cmd 'uname -a'
   # 别名专属凭据: PSSH_HOST_PROD_PASSWORD / PSSH_HOST_PROD_KEY
 
 路径语义:
