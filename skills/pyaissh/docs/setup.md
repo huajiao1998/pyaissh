@@ -26,7 +26,7 @@
 ## 环境依赖
 
 - 环境有 `python3` + `paramiko`（`pip install paramiko`；Debian/Ubuntu 服务器也可 `apt install python3-paramiko`）
-- 调用方式（`<pyaissh_dir>` 即技能目录 `.reasonix/skills/pyaissh`）：
+- 调用方式（`<pyaissh_dir>` 即技能目录 `skills/pyaissh`）：
   - Linux/macOS：`python3 <pyaissh_dir>/pyaissh.py <子命令> ...`
   - Windows cmd：`<pyaissh_dir>\pyaissh.cmd <子命令> ...`；Git Bash：`<pyaissh_dir>/pyaissh <子命令> ...`
 - 若把 pyaissh 复制到了项目根目录，则按上述同目录规则调用

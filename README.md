@@ -61,6 +61,14 @@ Credentials: `--password`/`--key` or env vars `PYAISSH_PASSWORD`/`PYAISSH_KEY` (
 
 Full skill docs: `SKILL.md` + `docs/`. Changelog: `CHANGELOG.md`.
 
+## 技能包 / Skill Package
+
+`skills/pyaissh/` 是标准技能包：`SKILL.md`（frontmatter + 完整文档）+ `docs/` + `pyaissh.py` / `pyaissh.cmd` / `pyaissh`（三平台入口）+ `.env.example`。
+
+**安装到你的 agent**：把 `skills/pyaissh/` 下的内容拷贝到你的智能体技能目录即可（各智能体技能路径约定不同，如 OpenClaw / Hermes Agent / QwenPaw 各有自己的目录）——技能本体与路径无关，任何能加载 `SKILL.md` 的 agent 都能用。
+
+`skills/pyaissh/` is a standard skill package: `SKILL.md` (frontmatter + full docs) + `docs/` + platform entry points + `.env.example`. **Install into your agent**: copy its contents into your agent's skill directory — the skill works regardless of path, any agent that loads `SKILL.md` can use it.
+
 ## License
 
 [MIT](LICENSE)

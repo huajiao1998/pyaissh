@@ -5,7 +5,7 @@
 > 2. 为什么"最新在最后"而不是"最新在顶部"：**末尾追加是对 AI 最安全的操作**——天然支持 `>>`、编辑器定位到文件末尾、或 edit 工具以文件最后一行作锚点；不存在"往文件开头插入"这种容易误伤标题/维护约定/历史条目的高风险操作，也符合"追加"的字面语义。
 > 3. **禁止整文件重写覆盖**。若确实用整文件写入方式更新（如 write 工具），只允许在末尾新增并保留全部历史内容；推荐优先用追加式写入。
 > 4. 条目版本号与 `pyaissh.py` 的 `VERSION` 常量保持一致；条目含日期，按「新增 / 修改 / 修复 / 文档」分类，说明改了什么、为什么改、影响什么（行为/参数/JSON 字段/错误语义变化要写清，AI 靠 `version` 字段与这些说明判断行为差异）。
-> 5. 技能目录（`.reasonix/skills/pyaissh/`）与根目录（`D:\工作目录\Leopold\pyssh\`）各有一份 `pyaissh.py` / `CHANGELOG.md`，改完**两份同步**（新增条目同样追加到两份的末尾）。
+> 5. 技能目录（`skills/pyaissh/`）与根目录（`D:\工作目录\Leopold\pyssh\`）各有一份 `pyaissh.py` / `CHANGELOG.md`，改完**两份同步**（新增条目同样追加到两份的末尾）。
 
 ---
 
@@ -90,5 +90,5 @@
 
 ### 文档
 - **零 token 传输卖点文档化**：pyaissh 从设计上就不把文件内容回传 JSON（upload/download 结果只含 `files`/`bytes`/`file_list` 元数据）——对比 MCP SSH 生态普遍把传输内容塞进 LLM 上下文的通病，这是天然卖点。SKILL.md（description + 定位段）与 `--help` epilog 新增"传输零 token 消耗"说明（实测：1MB 随机文件传输后结果 JSON 仅 410 字节纯元数据）。
-- **品牌与命名统一为 pyaissh（开源发布准备）**：仓库/命令/文件名/文档全量统一为一个名字——`pyaissh.py`、`pyaissh.cmd`、bash 包装 `pyaissh`、`--help` 的 prog、输出标记（`[pyaissh: 已截断]`、seam/`[pyaissh]` 前缀）、spill 文件前缀（`pyaissh-stdout-`）、SKILL.md 与全部 docs 的调用示例与描述。环境变量 `PYAISSH_*`、内部属性 `_pyaissh_*`、技能目录 `.reasonix/skills/pyaissh/` 与 `SKILL.md name: pyaissh` 全项目一致。
+- **品牌与命名统一为 pyaissh（开源发布准备）**：仓库/命令/文件名/文档全量统一为一个名字——`pyaissh.py`、`pyaissh.cmd`、bash 包装 `pyaissh`、`--help` 的 prog、输出标记（`[pyaissh: 已截断]`、seam/`[pyaissh]` 前缀）、spill 文件前缀（`pyaissh-stdout-`）、SKILL.md 与全部 docs 的调用示例与描述。环境变量 `PYAISSH_*`、内部属性 `_pyaissh_*`、技能目录 `skills/pyaissh/` 与 `SKILL.md name: pyaissh` 全项目一致。
 - **环境变量与内部属性统一为 PYAISSH 前缀（破坏性变更）**：环境变量统一 `PYAISSH_*`（`PYAISSH_PASSWORD`/`PYAISSH_KEY`/`PYAISSH_USER`/`PYAISSH_PORT`/`PYAISSH_JUMP_KEY`/`PYAISSH_JUMP_PASSWORD`/`PYAISSH_HOST_<名称>`（含 `_PASSWORD`/`_KEY` 专属凭据）/`PYAISSH_ALLOW_CWD_ENV`，小写示例 `pyaissh_host_prod`）；内部属性统一 `_pyaissh_*`（`_pyaissh_home`/`_pyaissh_last_activity`/`_pyaissh_io_timeout`/`_pyaissh_watchdog`/`_pyaissh_watchdog_killed`/`_pyaissh_posix_rename_warned`）；测试 harness 的 `PYAISSH_PY`、测试脚本 env 全量同步；技能目录 `pyaissh`（`SKILL.md name: pyaissh`）。**注意**：部署/CI/.env 需使用 `PYAISSH_*` 前缀配置（发布前完成，无既有用户受影响）。验证：verify_r3 54/54、v3_sig_unit 3/3、s2_stale 通过、双机 test 正常。
