@@ -20,7 +20,7 @@ pyaissh 是基于 paramiko 的命令行 SSH 工具，专为非交互的 AI/脚�
 
 ## 快速开始
 
-- **本 skill 自带 `pyaissh.py`**（技能目录 `.reasonix/skills/pssh/` 下）：Linux/macOS `python3 <pyaissh_dir>/pyaissh.py <子命令> ...`；Windows cmd `<pyaissh_dir>\pyaissh.cmd ...`；Git Bash `<pyaissh_dir>/pyaissh ...`；环境需 `python3` + `paramiko`（`pip install paramiko`）
+- **本 skill 自带 `pyaissh.py`**（技能目录 `.reasonix/skills/pyaissh/` 下）：Linux/macOS `python3 <pyaissh_dir>/pyaissh.py <子命令> ...`；Windows cmd `<pyaissh_dir>\pyaissh.cmd ...`；Git Bash `<pyaissh_dir>/pyaissh ...`；环境需 `python3` + `paramiko`（`pip install paramiko`）
 - 目标格式 `[user@]host[:port]`（如 `root@1.2.3.4:22`）；**IPv6 必须加方括号**：`user@[2001:db8::1]:22`、`[2001:db8::1]`（裸 IPv6 直接写也行）；支持主机别名 `@名称`、`-p/--port` 优先于内嵌端口；凭据 `--password`/`--key` 或环境变量 `PYAISSH_PASSWORD`/`PYAISSH_KEY` 等（也可写**技能目录下**的 `.env`——**配置样例见同目录 `.env.example`**；工作目录 `.env` 默认不加载，完整规则见 docs/setup.md）
 - **完整规则**（认证优先级、别名专属凭据、`.env` 加载与供应链安全、IPv6/端口解析细节）见 **docs/setup.md**
 
@@ -115,7 +115,7 @@ python3 pyaissh.py exec root@10.0.0.5 --jump @bastion --cmd 'hostname'   # 跳�
 
 ## 文档导航（按需读取，节省上下文）
 
-> **维护约定**：每次更新/修改/修复 pyaissh，必须在 **CHANGELOG.md** **末尾追加**一条记录（**最新在最后**，文件只增不减、历史条目禁止覆盖或删除——末尾追加是对 AI 最安全的更新方式，避免"往开头插入"误伤标题/约定；版本号与 `pyaissh.py` 的 `VERSION` 常量一致），并同步技能目录（`/skills/pssh/`） `pyaissh.py` / `CHANGELOG.md`。
+> **维护约定**：每次更新/修改/修复 pyaissh，必须在 **CHANGELOG.md** **末尾追加**一条记录（**最新在最后**，文件只增不减、历史条目禁止覆盖或删除——末尾追加是对 AI 最安全的更新方式，避免"往开头插入"误伤标题/约定；版本号与 `pyaissh.py` 的 `VERSION` 常量一致），并同步技能目录（`/skills/pyaissh/`） `pyaissh.py` / `CHANGELOG.md`。
 
 | 场景 | 读哪个文档 |
 |---|---|

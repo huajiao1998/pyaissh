@@ -5,7 +5,7 @@
 
 ## 目标格式与主机别名
 
-- 目标格式：`[user@]host[:port]`，如 `root@1.2.3.4:22`；支持 IPv6：`user@[2001:db8::1]:22`、`[2001:db8::1]`、裸 IPv6 地址；**主机别名**：`.env` 配 `PYAISSH_HOST_<名称>=user@host:port`（如 `PYAISSH_HOST_PROD=root@1.2.3.4:22`），target 写 `@名称` 即可引用（如 `pyaissh test @prod`；**键名整体大小写不敏感**：`PYAISSH_HOST_PROD` / `pssh_host_prod` / `PYAISSH_host_prod` 都能命中，Linux 与 Windows 行为一致）；**显式 `-p/--port` 优先于 target/别名内嵌端口**（与 ssh 惯例一致，写 `-p` 通常就是想纠正 target 里的端口）
+- 目标格式：`[user@]host[:port]`，如 `root@1.2.3.4:22`；支持 IPv6：`user@[2001:db8::1]:22`、`[2001:db8::1]`、裸 IPv6 地址；**主机别名**：`.env` 配 `PYAISSH_HOST_<名称>=user@host:port`（如 `PYAISSH_HOST_PROD=root@1.2.3.4:22`），target 写 `@名称` 即可引用（如 `pyaissh test @prod`；**键名整体大小写不敏感**：`PYAISSH_HOST_PROD` / `pyaissh_host_prod` / `PYAISSH_host_prod` 都能命中，Linux 与 Windows 行为一致）；**显式 `-p/--port` 优先于 target/别名内嵌端口**（与 ssh 惯例一致，写 `-p` 通常就是想纠正 target 里的端口）
 
 ## 凭据（认证优先级）
 
@@ -26,7 +26,7 @@
 ## 环境依赖
 
 - 环境有 `python3` + `paramiko`（`pip install paramiko`；Debian/Ubuntu 服务器也可 `apt install python3-paramiko`）
-- 调用方式（`<pyaissh_dir>` 即技能目录 `.reasonix/skills/pssh`）：
+- 调用方式（`<pyaissh_dir>` 即技能目录 `.reasonix/skills/pyaissh`）：
   - Linux/macOS：`python3 <pyaissh_dir>/pyaissh.py <子命令> ...`
   - Windows cmd：`<pyaissh_dir>\pyaissh.cmd <子命令> ...`；Git Bash：`<pyaissh_dir>/pyaissh <子命令> ...`
 - 若把 pyaissh 复制到了项目根目录，则按上述同目录规则调用
