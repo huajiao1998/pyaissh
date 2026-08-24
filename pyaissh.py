@@ -9,19 +9,19 @@
     大输出自动截断（保留头尾），命令有静默/总时长双重超时，SFTP 有 I/O 超时，
     任何路径都不会无限卡住，也不会撑爆调用方上下文。
 
-环境变量（也可写进脚本目录 .env；工作目录 .env 需显式 PSSH_ALLOW_CWD_ENV=1 才加载，
+环境变量（也可写进脚本目录 .env；工作目录 .env 需显式 PYAISSH_ALLOW_CWD_ENV=1 才加载，
           默认不加载以防供应链注入）：
-    PSSH_USER      默认用户名
-    PSSH_PORT      默认端口（22）
-    PSSH_KEY       私钥路径（env 形式，优先级等同 --key，高于 PSSH_PASSWORD）
-    PSSH_PASSWORD  默认密码
-    PSSH_JUMP_KEY / PSSH_JUMP_PASSWORD   跳板机私钥 / 密码（密码未配置时回退 PSSH_PASSWORD，v1.4.9）
-    PSSH_HOST_<名称>=user@host:port      主机别名，target 写 @名称 即可引用；
-        可配 PSSH_HOST_<名称>_PASSWORD / PSSH_HOST_<名称>_KEY 作为该主机专属凭据
-    PSSH_ALLOW_CWD_ENV=1                 显式允许加载工作目录 .env（默认不加载，
-        防止恶意仓库注入 PSSH_HOST_* 等把 AI 导向攻击者主机；加载时会打 WARN）
-    认证优先级：--key / PSSH_KEY > --password / PSSH_PASSWORD > 默认私钥 ~/.ssh/id_ed25519
-        （别名配置了专属 KEY/PASSWORD 时，该主机不再取全局 PSSH_KEY/PSSH_PASSWORD）
+    PYAISSH_USER      默认用户名
+    PYAISSH_PORT      默认端口（22）
+    PYAISSH_KEY       私钥路径（env 形式，优先级等同 --key，高于 PYAISSH_PASSWORD）
+    PYAISSH_PASSWORD  默认密码
+    PYAISSH_JUMP_KEY / PYAISSH_JUMP_PASSWORD   跳板机私钥 / 密码（密码未配置时回退 PYAISSH_PASSWORD，v1.4.9）
+    PYAISSH_HOST_<名称>=user@host:port      主机别名，target 写 @名称 即可引用；
+        可配 PYAISSH_HOST_<名称>_PASSWORD / PYAISSH_HOST_<名称>_KEY 作为该主机专属凭据
+    PYAISSH_ALLOW_CWD_ENV=1                 显式允许加载工作目录 .env（默认不加载，
+        防止恶意仓库注入 PYAISSH_HOST_* 等把 AI 导向攻击者主机；加载时会打 WARN）
+    认证优先级：--key / PYAISSH_KEY > --password / PYAISSH_PASSWORD > 默认私钥 ~/.ssh/id_ed25519
+        （别名配置了专属 KEY/PASSWORD 时，该主机不再取全局 PYAISSH_KEY/PYAISSH_PASSWORD）
 
 退出码：
     exec     = 远程命令退出码（超时 124；连接失败 255；远程退出码恰为 255 时本地返回 254 以免混淆）
@@ -29,7 +29,7 @@
 
 安全提示：
     1. --password / --jump-password 会出现在进程参数里（本地 ps 可见），
-       敏感场景请优先用密钥认证，或改用环境变量 PSSH_PASSWORD / .env。
+       敏感场景请优先用密钥认证，或改用环境变量 PYAISSH_PASSWORD / .env。
     2. exec 的命令原文会打印到 stderr 日志与结果 JSON，含凭据的命令（如 mysql -p'xxx'、
        curl -u user:pass）会留在记录里；建议敏感凭据用远程环境变量注入。
 
@@ -37,7 +37,7 @@
     pyaissh exec root@1.2.3.4 --cmd 'uname -a'
     pyaissh exec root@1.2.3.4 --cmd 'apt upgrade' --max-time 1200   # 长任务调大总时长上限
     pyaissh exec root@1.2.3.4 --cmd 'make' --idle-timeout 120       # 静默超时（连续无输出的窗口）
-    pyaissh exec @prod --cmd 'uname -a'                            # 主机别名（.env 配 PSSH_HOST_PROD）
+    pyaissh exec @prod --cmd 'uname -a'                            # 主机别名（.env 配 PYAISSH_HOST_PROD）
     pyaissh exec root@1.2.3.4 --pty --cmd 'tty'                    # 分配 PTY（需要 TTY 的非交互命令）
     pyaissh exec root@1.2.3.4 --pty --pty-strip-ansi --cmd 'top -b -n 1'  # PTY + 剥离 ANSI 供 AI 解析
     pyaissh exec root@1.2.3.4 --cmd-file - <<'EOF'
@@ -357,9 +357,9 @@ def load_env():
 
     供应链安全设计：**默认只加载脚本目录的 .env**（用户主动放入 pyaissh
     工具目录、自己可控的文件）。工作目录（cwd）的 .env 默认【不】加载——
-    恶意仓库可自带 .env 注入 PSSH_HOST_* / PSSH_PASSWORD 等变量，把 AI
+    恶意仓库可自带 .env 注入 PYAISSH_HOST_* / PYAISSH_PASSWORD 等变量，把 AI
     的 SSH 连接导向攻击者主机（钓鱼 SSH）。仅当显式设置
-    PSSH_ALLOW_CWD_ENV=1（环境变量或脚本目录 .env 中）时才加载 cwd .env，
+    PYAISSH_ALLOW_CWD_ENV=1（环境变量或脚本目录 .env 中）时才加载 cwd .env，
     并打 WARN 提示供应链风险；未开启但存在 cwd .env 时也打 WARN 提醒。
     """
     script_env = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -369,14 +369,14 @@ def load_env():
     cwd_env = os.path.join(os.getcwd(), ".env")
     if cwd_env == script_env or not os.path.isfile(cwd_env):
         return
-    if os.environ.get("PSSH_ALLOW_CWD_ENV") == "1":
-        log("[WARN] 正在从工作目录加载 .env（供应链风险，因 PSSH_ALLOW_CWD_ENV=1 已显式开启）: %s" % cwd_env)
+    if os.environ.get("PYAISSH_ALLOW_CWD_ENV") == "1":
+        log("[WARN] 正在从工作目录加载 .env（供应链风险，因 PYAISSH_ALLOW_CWD_ENV=1 已显式开启）: %s" % cwd_env)
         _parse_env_file(cwd_env)
     else:
         global _CWD_ENV_SKIPPED
         _CWD_ENV_SKIPPED = True
-        log("[WARN] 检测到工作目录 .env 但未加载（供应链风险：防止恶意仓库注入 PSSH_HOST_* 等"
-            "导向攻击者主机；如确需使用请设 PSSH_ALLOW_CWD_ENV=1）: %s" % cwd_env)
+        log("[WARN] 检测到工作目录 .env 但未加载（供应链风险：防止恶意仓库注入 PYAISSH_HOST_* 等"
+            "导向攻击者主机；如确需使用请设 PYAISSH_ALLOW_CWD_ENV=1）: %s" % cwd_env)
 
 
 def _fix_msys_remote_path(path):
@@ -425,10 +425,10 @@ def _fix_msys_remote_path(path):
 
 def _sftp_home(sftp):
     """取远端用户 home（SFTP 会话起始目录），缓存在会话上避免重复往返。"""
-    home = getattr(sftp, "_pssh_home", None)
+    home = getattr(sftp, "_pyaissh_home", None)
     if home is None:
         home = sftp.normalize(".")
-        sftp._pssh_home = home
+        sftp._pyaissh_home = home
     return home
 
 
@@ -933,17 +933,17 @@ def parse_target(target):
 
 
 def _alias_env(alias, suffix=""):
-    """查主机别名环境变量 PSSH_HOST_<别名><suffix>（键名整体大小写不敏感）。
+    """查主机别名环境变量 PYAISSH_HOST_<别名><suffix>（键名整体大小写不敏感）。
 
     先按原样/全大写两种键直查，再对整个键做大小写归一扫描：Linux 的
     os.environ 严格区分大小写（.env 写全小写 pssh_host_prod 也要能命中），
     Windows 本身不区分。返回 None 表示未配置。
     """
     for a in dict.fromkeys([alias, alias.upper()]):
-        v = os.environ.get("PSSH_HOST_%s%s" % (a, suffix))
+        v = os.environ.get("PYAISSH_HOST_%s%s" % (a, suffix))
         if v:
             return v
-    want = ("PSSH_HOST_%s%s" % (alias, suffix)).upper()
+    want = ("PYAISSH_HOST_%s%s" % (alias, suffix)).upper()
     for k, v in os.environ.items():
         if k.upper() == want:
             return v
@@ -954,7 +954,7 @@ def resolve_conn(args):
     """合并 target / env / 默认值，返回连接参数 dict"""
     if not args.target:
         raise SshError("未指定目标主机（target）", "bad_args")
-    # 主机别名：target 写 @名称，从 PSSH_HOST_<名称> 展开（.env 可配）
+    # 主机别名：target 写 @名称，从 PYAISSH_HOST_<名称> 展开（.env 可配）
     alias = None
     target = args.target
     if target.startswith("@"):
@@ -963,31 +963,31 @@ def resolve_conn(args):
             raise SshError("主机别名格式应为 @名称", "bad_args")
         val = _alias_env(alias)
         if not val:
-            msg = "未配置主机别名 @%s：请在 .env 写 PSSH_HOST_%s=user@host:port" % (alias, alias.upper())
+            msg = "未配置主机别名 @%s：请在 .env 写 PYAISSH_HOST_%s=user@host:port" % (alias, alias.upper())
             if _CWD_ENV_SKIPPED:
                 # 只看 stdout 的 AI 需要"为什么我写了 .env 还是找不到"的答案：
                 # 工作目录 .env 默认不加载（供应链防护），真实原因此前只在 stderr
                 msg += ("（检测到工作目录 .env 但默认不加载——防恶意仓库注入；如需启用设 "
-                        "PSSH_ALLOW_CWD_ENV=1，或把 .env 放到 pyaissh 脚本目录）")
+                        "PYAISSH_ALLOW_CWD_ENV=1，或把 .env 放到 pyaissh 脚本目录）")
             raise SshError(msg, "bad_args")
         log("[ALIAS] @%s -> %s" % (alias, val))
         target = val
     t_user, t_host, t_port = parse_target(target)
 
-    user = t_user or args.user or os.environ.get("PSSH_USER")
+    user = t_user or args.user or os.environ.get("PYAISSH_USER")
     host = t_host
     # 显式 -p 优先于 target/别名内嵌端口（与 ssh/scp 惯例一致：命令行显式参数最优先，
     # 用户写 -p 通常就是想纠正 target 里的端口）
     port = args.port if args.port is not None else t_port
     if port is None:
-        port = _safe_int(os.environ.get("PSSH_PORT"), 22, "PSSH_PORT")
+        port = _safe_int(os.environ.get("PYAISSH_PORT"), 22, "PYAISSH_PORT")
     if not port or not 1 <= port <= MAX_PORT:
         # 命令行 --port 已由 argparse 校验（1-65535）；这里只管 env 与 target
         # 内嵌端口：0/负值/越界/非数字一律回退默认 22 并打 WARN
         log("[WARN] 端口 %r 超出范围 (1-%d)，回退默认 22" % (port, MAX_PORT))
         port = 22
-    # 凭据优先级：显式参数 > 别名专属（PSSH_HOST_<名称>_KEY/_PASSWORD）> 全局 env。
-    # 别名配置了任一专属凭据时抑制全局 env：否则"别名只配密码 + 全局 PSSH_KEY"
+    # 凭据优先级：显式参数 > 别名专属（PYAISSH_HOST_<名称>_KEY/_PASSWORD）> 全局 env。
+    # 别名配置了任一专属凭据时抑制全局 env：否则"别名只配密码 + 全局 PYAISSH_KEY"
     # 会优先拿全局 key 去认证，key 不匹配时直接 auth_failed，别名密码永远轮不到；
     # 别名主机的凭据应完全由别名决定（显式命令行参数仍最高优先）
     alias_key = _alias_env(alias, "_KEY") if alias else None
@@ -996,11 +996,11 @@ def resolve_conn(args):
         key = args.key or alias_key
         password = args.password or alias_pw
     else:
-        key = args.key or alias_key or os.environ.get("PSSH_KEY")  # None 表示用默认密钥
-        password = args.password or alias_pw or os.environ.get("PSSH_PASSWORD")
+        key = args.key or alias_key or os.environ.get("PYAISSH_KEY")  # None 表示用默认密钥
+        password = args.password or alias_pw or os.environ.get("PYAISSH_PASSWORD")
 
     if not user:
-        raise SshError("未指定用户名：请在 target 写 user@host 或用 -u / PSSH_USER", "bad_args")
+        raise SshError("未指定用户名：请在 target 写 user@host 或用 -u / PYAISSH_USER", "bad_args")
     if not host:
         raise SshError("未指定主机", "bad_args")
 
@@ -1018,21 +1018,21 @@ def resolve_jump(args, target_user=None):
     """
     if not args.jump:
         if (args.jump_password or args.jump_key
-                or os.environ.get("PSSH_JUMP_PASSWORD") or os.environ.get("PSSH_JUMP_KEY")):
-            log("[WARN] 指定了跳板凭据（--jump-password/--jump-key/PSSH_JUMP_*）但未提供 --jump，已忽略")
+                or os.environ.get("PYAISSH_JUMP_PASSWORD") or os.environ.get("PYAISSH_JUMP_KEY")):
+            log("[WARN] 指定了跳板凭据（--jump-password/--jump-key/PYAISSH_JUMP_*）但未提供 --jump，已忽略")
         return None
     j_user = None
     j_alias = None
     jump_target = args.jump
     if jump_target.startswith("@"):
-        # 跳板机也支持 @别名（与 target 同一套 PSSH_HOST_* 配置）。
+        # 跳板机也支持 @别名（与 target 同一套 PYAISSH_HOST_* 配置）。
         # 不展开的话 "@bastion" 会被当字面主机名去连，报 DNS 失败极具误导性
         j_alias = jump_target[1:].strip()
         if not j_alias:
             raise SshError("跳板机别名格式应为 @名称", "bad_args")
         val = _alias_env(j_alias)
         if not val:
-            raise SshError("未配置跳板机别名 @%s：请在 .env 写 PSSH_HOST_%s=user@host:port"
+            raise SshError("未配置跳板机别名 @%s：请在 .env 写 PYAISSH_HOST_%s=user@host:port"
                            % (j_alias, j_alias.upper()), "bad_args")
         log("[ALIAS] 跳板 @%s -> %s" % (j_alias, val))
         jump_target = val
@@ -1040,13 +1040,13 @@ def resolve_jump(args, target_user=None):
     # 跳板机用户：优先 --jump 字串里的，其次复用目标用户
     # （target 可能是别名 @name，原始字符串解析不出 user，用已解析的 target_user 回退）
     if not j_user:
-        j_user = target_user or args.user or os.environ.get("PSSH_USER")
+        j_user = target_user or args.user or os.environ.get("PYAISSH_USER")
     if not j_user:
         raise SshError("跳板机未指定用户名：请在 --jump 写 user@host", "bad_args")
     if not j_host:
         raise SshError("跳板机未指定主机", "bad_args")
     j_port = j_port or 22  # parse_target 已保证 1-65535（越界直接 bad_args），这里只补未指定端口
-    # 跳板凭据优先级：显式参数 > 别名专属 > PSSH_JUMP_*（别名复用 PSSH_HOST_* 的
+    # 跳板凭据优先级：显式参数 > 别名专属 > PYAISSH_JUMP_*（别名复用 PYAISSH_HOST_* 的
     # 专属凭据键：同一台机器当 target 和当跳板通常用同一套凭据）。
     # 与 resolve_conn 同规则：别名配了专属凭据时抑制全局 env
     alias_key = _alias_env(j_alias, "_KEY") if j_alias else None
@@ -1055,18 +1055,18 @@ def resolve_jump(args, target_user=None):
         key = args.jump_key or alias_key
         password = args.jump_password or alias_pw
     else:
-        key = args.jump_key or alias_key or os.environ.get("PSSH_JUMP_KEY")  # None = 默认密钥
-        # 密码回落链（v1.4.9）：--jump-password > 别名专属 > PSSH_JUMP_PASSWORD > PSSH_PASSWORD。
+        key = args.jump_key or alias_key or os.environ.get("PYAISSH_JUMP_KEY")  # None = 默认密钥
+        # 密码回落链（v1.4.9）：--jump-password > 别名专属 > PYAISSH_JUMP_PASSWORD > PYAISSH_PASSWORD。
         # 跳板与目标共用一套密码是常见场景（同主多机），且跳板【用户名】本就回落目标用户
         # （上方 target_user 回退链）——唯独凭据不回落是设计不一致，实测会多花一次往返才从
-        # 错误提示里拿到"请用 --jump-password/PSSH_JUMP_PASSWORD"。只回落密码、不回落密钥：
-        # 错误的 PSSH_KEY 会短路原本可用的默认密钥路径（真回归），而密码错误与缺密码的
+        # 错误提示里拿到"请用 --jump-password/PYAISSH_JUMP_PASSWORD"。只回落密码、不回落密钥：
+        # 错误的 PYAISSH_KEY 会短路原本可用的默认密钥路径（真回归），而密码错误与缺密码的
         # 失败形态等价、无回归。回退发生时打 stderr WARN 保持行为可见。
-        password = args.jump_password or alias_pw or os.environ.get("PSSH_JUMP_PASSWORD")
-        if not password and os.environ.get("PSSH_PASSWORD"):
-            password = os.environ["PSSH_PASSWORD"]
-            log("[JUMP] 跳板未指定专属凭据，密码回退使用 PSSH_PASSWORD"
-                "（需要独立跳板密码时请设 PSSH_JUMP_PASSWORD 或 --jump-password）")
+        password = args.jump_password or alias_pw or os.environ.get("PYAISSH_JUMP_PASSWORD")
+        if not password and os.environ.get("PYAISSH_PASSWORD"):
+            password = os.environ["PYAISSH_PASSWORD"]
+            log("[JUMP] 跳板未指定专属凭据，密码回退使用 PYAISSH_PASSWORD"
+                "（需要独立跳板密码时请设 PYAISSH_JUMP_PASSWORD 或 --jump-password）")
     return {
         "host": j_host, "user": j_user,
         "port": j_port,
@@ -1326,19 +1326,19 @@ def _do_connect(conn, jump_client, is_jump=False):
             client.connect(**kwargs)
         except paramiko.AuthenticationException as e:
             if is_jump:
-                hint = ("（检查跳板机用户名/密码；密码建议用 PSSH_JUMP_PASSWORD 环境变量"
-                        "或 --jump-password，密钥用 --jump-key / PSSH_JUMP_KEY）")
+                hint = ("（检查跳板机用户名/密码；密码建议用 PYAISSH_JUMP_PASSWORD 环境变量"
+                        "或 --jump-password，密钥用 --jump-key / PYAISSH_JUMP_KEY）")
             else:
-                hint = ("（检查用户名/密码是否正确；密码建议用 PSSH_PASSWORD "
-                        "环境变量，密钥用 --key / PSSH_KEY）")
+                hint = ("（检查用户名/密码是否正确；密码建议用 PYAISSH_PASSWORD "
+                        "环境变量，密钥用 --key / PYAISSH_KEY）")
             raise SshError("认证失败: %s%s" % (e, hint), "auth_failed")
         except paramiko.SSHException as e:
             msg = str(e)
-            # 无凭据场景（--key/--password/PSSH_PASSWORD 都没给且无默认密钥/agent）：
+            # 无凭据场景（--key/--password/PYAISSH_PASSWORD 都没给且无默认密钥/agent）：
             # paramiko 报的原文很含糊，明确告诉 AI 缺什么
             if "no authentication methods available" in msg.lower():
-                raise SshError("未提供可用凭据: %s（请用 --password / PSSH_PASSWORD 环境变量，"
-                               "或 --key / PSSH_KEY 指定私钥）" % msg, "auth_failed")
+                raise SshError("未提供可用凭据: %s（请用 --password / PYAISSH_PASSWORD 环境变量，"
+                               "或 --key / PYAISSH_KEY 指定私钥）" % msg, "auth_failed")
             # host key 失败分两类（paramiko 5.0 实测消息）：
             #  1) known_hosts 已有记录但指纹不匹配 -> BadHostKeyException
             #  2) --strict + 新主机不在 known_hosts -> RejectPolicy 抛
@@ -1456,7 +1456,7 @@ def close_all(client):
 def _sftp_touch_activity(sftp):
     """刷新 SFTP 看门狗活动时间：任何 SFTP 操作（含 listdir/stat/mkdir/walk）
     前调用，防止高延迟链路下目录操作被看门狗误杀。"""
-    sftp._pssh_last_activity = time.time()
+    sftp._pyaissh_last_activity = time.time()
 
 
 def _make_sftp_touch(sftp):
@@ -1465,7 +1465,7 @@ def _make_sftp_touch(sftp):
     paramiko 回调签名 func(transferred, total)，用闭包把 sftp 传进去。
     """
     def _cb(transferred, total):
-        sftp._pssh_last_activity = time.time()
+        sftp._pyaissh_last_activity = time.time()
     return _cb
 
 
@@ -1480,7 +1480,7 @@ def _sftp_watchdog(sftp):
     活动时间；超时后强制 sftp.close()，让阻塞中的操作抛异常返回，
     上层转 upload_failed/download_failed/ls_failed 等错误类型。
     """
-    io_timeout = getattr(sftp, "_pssh_io_timeout", SFTP_IO_TIMEOUT)
+    io_timeout = getattr(sftp, "_pyaissh_io_timeout", SFTP_IO_TIMEOUT)
     try:
         while True:
             time.sleep(WATCHDOG_TICK)
@@ -1491,8 +1491,8 @@ def _sftp_watchdog(sftp):
                     return
             except Exception:
                 return
-            if time.time() - sftp._pssh_last_activity > io_timeout:
-                sftp._pssh_watchdog_killed = True
+            if time.time() - sftp._pyaissh_last_activity > io_timeout:
+                sftp._pyaissh_watchdog_killed = True
                 log("[WARN] SFTP %d 秒无数据传输，强制断开（服务器可能已静默断链）"
                     % io_timeout)
                 # 关底层 TCP socket：sftp.close()/channel.close() 都打断不了
@@ -1532,10 +1532,10 @@ def open_sftp(client, io_timeout=None):
             sftp.sock.settimeout(io_timeout)
         except Exception:
             pass
-    sftp._pssh_io_timeout = io_timeout
-    sftp._pssh_last_activity = time.time()
-    sftp._pssh_watchdog = threading.Thread(target=_sftp_watchdog, args=(sftp,), daemon=True)
-    sftp._pssh_watchdog.start()
+    sftp._pyaissh_io_timeout = io_timeout
+    sftp._pyaissh_last_activity = time.time()
+    sftp._pyaissh_watchdog = threading.Thread(target=_sftp_watchdog, args=(sftp,), daemon=True)
+    sftp._pyaissh_watchdog.start()
     return sftp
 
 
@@ -1666,7 +1666,7 @@ def _parallel_fetch(conn, args_, remote, local, size, k, resume=False):
             # 任一分片被看门狗杀/读超时都按超时归类（不能只看 errors[0]：
             # 首个错误可能是普通失败、后面的才是超时）
             timed_out = any(
-                getattr(workers[i][1], "_pssh_watchdog_killed", False)
+                getattr(workers[i][1], "_pyaissh_watchdog_killed", False)
                 or isinstance(e, (socket.timeout, TimeoutError))
                 for i, e in errors)
             if timed_out:
@@ -1701,7 +1701,7 @@ def _remote_size_is(sftp, rpath, size):
     except (socket.timeout, TimeoutError):
         raise  # 超时是连接问题：不能当"远端不存在"误判成需要重传（M2）
     except IOError:
-        if getattr(sftp, "_pssh_watchdog_killed", False):
+        if getattr(sftp, "_pyaissh_watchdog_killed", False):
             raise  # 看门狗强制断开：同上，交给外层报 timeout
         return False
 
@@ -1772,7 +1772,7 @@ def sftp_walk(sftp, remote_dir, warnings=None):
         except (socket.timeout, TimeoutError):
             raise  # 连接超时不是"目录不可读"：继续遍历会连环误报（M2）
         except IOError as e:
-            if getattr(sftp, "_pssh_watchdog_killed", False):
+            if getattr(sftp, "_pyaissh_watchdog_killed", False):
                 raise
             msg = "跳过无法读取的远程目录: %s (%s)" % (current, e)
             log("[WARN] " + _sanitize_log_text(msg))
@@ -1859,7 +1859,7 @@ def _sftp_put_atomic(sftp, local, remote, progress=None, resume=False):
         if progress is not None:
             progress[0] += transferred - last[0]
         last[0] = transferred
-        sftp._pssh_last_activity = time.time()
+        sftp._pyaissh_last_activity = time.time()
 
     # 续传决策（--resume）：远端 .part 大小决定走全量 / 续传 / 覆盖重传
     resume_from = 0
@@ -1928,8 +1928,8 @@ def _sftp_put_atomic(sftp, local, remote, progress=None, resume=False):
                 sftp.stat(part)
             except Exception:
                 raise rename_err
-            if not getattr(sftp, "_pssh_posix_rename_warned", False):
-                sftp._pssh_posix_rename_warned = True
+            if not getattr(sftp, "_pyaissh_posix_rename_warned", False):
+                sftp._pyaissh_posix_rename_warned = True
                 log("[WARN] 服务器不支持原子改名（posix-rename 扩展），"
                     "本次用删除+改名代替（该服务器上中断可能留下 .part 或旧文件）")
             try:
@@ -2937,7 +2937,7 @@ def cmd_upload(args):
         if _SIGTERM_RECEIVED:
             emit_error(args.json, "interrupted", _interrupt_msg(), extra=_fail_extra())
             return 130
-        if "sftp" in locals() and getattr(sftp, "_pssh_watchdog_killed", False):
+        if "sftp" in locals() and getattr(sftp, "_pyaissh_watchdog_killed", False):
             emit_error(args.json, "upload_timeout",
                        "SFTP 传输超时：%d 秒无数据（服务器静默断链，已强制断开）" % SFTP_IO_TIMEOUT,
                        extra=_fail_extra())
@@ -3023,7 +3023,7 @@ def cmd_download(args):
         except IOError as e:
             if _SIGTERM_RECEIVED:
                 raise KeyboardInterrupt("SIGTERM")  # 交给命令层 KI 分支按中断处理
-            if getattr(sftp, "_pssh_watchdog_killed", False):
+            if getattr(sftp, "_pyaissh_watchdog_killed", False):
                 raise  # 外层按看门狗分支报 download_timeout
             if e.errno == getattr(paramiko, "SFTP_NO_SUCH_FILE", 2):
                 # 确实不存在时若路径含通配符，说明真实原因是"SFTP 无 glob"而非文件缺失
@@ -3324,7 +3324,7 @@ def cmd_download(args):
         if _SIGTERM_RECEIVED:
             emit_error(args.json, "interrupted", _interrupt_msg(), extra=_fail_extra())
             return 130
-        if "sftp" in locals() and getattr(sftp, "_pssh_watchdog_killed", False):
+        if "sftp" in locals() and getattr(sftp, "_pyaissh_watchdog_killed", False):
             emit_error(args.json, "download_timeout",
                        "SFTP 传输超时：%d 秒无数据（服务器静默断链，已强制断开）" % SFTP_IO_TIMEOUT,
                        extra=_fail_extra())
@@ -3513,7 +3513,7 @@ def cmd_ls(args):
         except IOError as e:
             if _SIGTERM_RECEIVED:
                 raise KeyboardInterrupt("SIGTERM")  # 交给外层按中断处理（安全帧内）
-            if getattr(sftp, "_pssh_watchdog_killed", False):
+            if getattr(sftp, "_pyaissh_watchdog_killed", False):
                 raise  # 外层按看门狗分支报 ls_timeout
             if e.errno == getattr(paramiko, "SFTP_NO_SUCH_FILE", 2):
                 # OpenSSH 对"不存在"和"不是目录"都返回 SFTP_NO_SUCH_FILE，无法区分；
@@ -3600,7 +3600,7 @@ def cmd_ls(args):
                        extra=_conn_extra(locals().get("conn")))
             return 130
         # 看门狗强制断开（服务器静默断链）报 ls_timeout 而非 ls_failed（与 upload/download 一致）
-        if "sftp" in locals() and getattr(sftp, "_pssh_watchdog_killed", False):
+        if "sftp" in locals() and getattr(sftp, "_pyaissh_watchdog_killed", False):
             emit_error(args.json, "ls_timeout",
                        "SFTP 超时：%d 秒无数据（服务器静默断链，已强制断开）" % SFTP_IO_TIMEOUT,
                        extra=_conn_extra(locals().get("conn")))
@@ -3748,9 +3748,9 @@ def build_parser():
 跳板机 (--jump):
   pyaissh exec root@10.0.0.5 --jump root@1.2.3.4:2222 --jump-password 'xxx' --cmd 'hostname'
 
-主机别名 (.env 配 PSSH_HOST_PROD=root@1.2.3.4:22 后):
+主机别名 (.env 配 PYAISSH_HOST_PROD=root@1.2.3.4:22 后):
   pyaissh exec @prod --cmd 'uname -a'
-  # 别名专属凭据: PSSH_HOST_PROD_PASSWORD / PSSH_HOST_PROD_KEY
+  # 别名专属凭据: PYAISSH_HOST_PROD_PASSWORD / PYAISSH_HOST_PROD_KEY
 
 路径语义:
   远端路径支持 ~ 与 ~/（自动展开为绝对路径，实际路径回显在结果的 remote 字段）；
@@ -3767,8 +3767,8 @@ def build_parser():
       bytes_transferred=实际传输；ls 的 entries 含 mode/mtime(epoch 秒,UTC)/is_symlink
 特性: 传输零 token 消耗——upload/download 的文件内容从不回传 JSON，AI 只消费
       元数据（files/bytes/file_list），大文件/二进制不会烧爆 LLM 上下文
-环境变量 (.env 或系统): PSSH_USER / PSSH_PORT / PSSH_KEY / PSSH_PASSWORD /
-                        PSSH_JUMP_KEY / PSSH_JUMP_PASSWORD / PSSH_HOST_<名称>
+环境变量 (.env 或系统): PYAISSH_USER / PYAISSH_PORT / PYAISSH_KEY / PYAISSH_PASSWORD /
+                        PYAISSH_JUMP_KEY / PYAISSH_JUMP_PASSWORD / PYAISSH_HOST_<名称>
 """,
     )
     parser.add_argument("--version", action="store_true",
@@ -3786,10 +3786,10 @@ def build_parser():
 
     def add_conn(p, target_help="目标 [user@]host[:port]"):
         p.add_argument("target", help=target_help)
-        p.add_argument("-u", "--user", help="用户名 (env: PSSH_USER)")
-        p.add_argument("-p", "--port", type=_port, help="端口 (env: PSSH_PORT, 默认 22)")
-        p.add_argument("-k", "--key", help="私钥路径 (env: PSSH_KEY, 默认 ~/.ssh/id_ed25519)")
-        p.add_argument("-P", "--password", help="密码 (env: PSSH_PASSWORD)")
+        p.add_argument("-u", "--user", help="用户名 (env: PYAISSH_USER)")
+        p.add_argument("-p", "--port", type=_port, help="端口 (env: PYAISSH_PORT, 默认 22)")
+        p.add_argument("-k", "--key", help="私钥路径 (env: PYAISSH_KEY, 默认 ~/.ssh/id_ed25519)")
+        p.add_argument("-P", "--password", help="密码 (env: PYAISSH_PASSWORD)")
         p.add_argument("--timeout", type=_positive_int, default=10, help="连接超时秒数 (默认 10)")
         p.add_argument("--json", dest="json", action="store_true", default=argparse.SUPPRESS,
                        help="输出纯 JSON（默认已是 JSON，保留兼容）")

@@ -1,5 +1,5 @@
 ---
-name: pssh
+name: pyaissh
 description: 通过 pyaissh（paramiko CLI）执行远程 SSH 操作：exec/upload/download/test/ls，默认输出整行 JSON 供 AI 精确解析；支持跳板机、主机别名（@名称）、大文件并行分片下载、多级超时防挂死、断点续传；传输零 token 消耗（文件内容永不回传，AI 只消费元数据）
 ---
 
@@ -21,7 +21,7 @@ pyaissh 是基于 paramiko 的命令行 SSH 工具，专为非交互的 AI/脚�
 ## 快速开始
 
 - **本 skill 自带 `pyaissh.py`**（技能目录 `.reasonix/skills/pssh/` 下）：Linux/macOS `python3 <pyaissh_dir>/pyaissh.py <子命令> ...`；Windows cmd `<pyaissh_dir>\pyaissh.cmd ...`；Git Bash `<pyaissh_dir>/pyaissh ...`；环境需 `python3` + `paramiko`（`pip install paramiko`）
-- 目标格式 `[user@]host[:port]`（如 `root@1.2.3.4:22`）；**IPv6 必须加方括号**：`user@[2001:db8::1]:22`、`[2001:db8::1]`（裸 IPv6 直接写也行）；支持主机别名 `@名称`、`-p/--port` 优先于内嵌端口；凭据 `--password`/`--key` 或环境变量 `PSSH_PASSWORD`/`PSSH_KEY` 等（也可写**技能目录下**的 `.env`——**配置样例见同目录 `.env.example`**；工作目录 `.env` 默认不加载，完整规则见 docs/setup.md）
+- 目标格式 `[user@]host[:port]`（如 `root@1.2.3.4:22`）；**IPv6 必须加方括号**：`user@[2001:db8::1]:22`、`[2001:db8::1]`（裸 IPv6 直接写也行）；支持主机别名 `@名称`、`-p/--port` 优先于内嵌端口；凭据 `--password`/`--key` 或环境变量 `PYAISSH_PASSWORD`/`PYAISSH_KEY` 等（也可写**技能目录下**的 `.env`——**配置样例见同目录 `.env.example`**；工作目录 `.env` 默认不加载，完整规则见 docs/setup.md）
 - **完整规则**（认证优先级、别名专属凭据、`.env` 加载与供应链安全、IPv6/端口解析细节）见 **docs/setup.md**
 
 ## 输出约定（核心，完整版见 docs/contract.md）
@@ -89,17 +89,17 @@ python3 pyaissh.py upload root@1.2.3.4 --local big.bin --remote /tmp/big.bin --r
 python3 pyaissh.py exec root@10.0.0.5 --jump root@1.2.3.4:2222 --jump-password 'xxx' --cmd 'hostname'
 python3 pyaissh.py exec root@10.0.0.5 --jump @bastion --cmd 'hostname'   # 跳板也支持 @别名
 ```
-跳板未配置专属密码（`PSSH_JUMP_PASSWORD`/`--jump-password` 都没有）时自动回退用 `PSSH_PASSWORD`（v1.4.9 起，仅密码、密钥不回落）；凭据优先级、用户名回退、错误前缀、分片共享隧道细节见 **docs/jump.md**
+跳板未配置专属密码（`PYAISSH_JUMP_PASSWORD`/`--jump-password` 都没有）时自动回退用 `PYAISSH_PASSWORD`（v1.4.9 起，仅密码、密钥不回落）；凭据优先级、用户名回退、错误前缀、分片共享隧道细节见 **docs/jump.md**
 
 ## 安全规则
 
-- 凭据优先用环境变量 `PSSH_PASSWORD` / `PSSH_KEY` 或 `.env`，**不要写进命令行参数**（进程列表可见）
+- 凭据优先用环境变量 `PYAISSH_PASSWORD` / `PYAISSH_KEY` 或 `.env`，**不要写进命令行参数**（进程列表可见）
 - 命令含疑似凭据（如 `mysql -p'xxx'`、`DB_PASS=...`）时 pyaissh 会在 stderr 打 WARN——照常执行，但注意日志可能泄露敏感信息
 - **JSON 结果的 `cmd`/`stdout`/`stderr` 字段同样含凭据且不截断**：把结果转发/落盘/写入任务记录前先脱敏
 
 ## 参数默认值
 
-`ls --path` 默认 `.`、`ls --limit` 默认 2000（超出置 `truncated=true`）、`--timeout` 默认 10s、`--idle-timeout` 默认 60s（旧名 `--exec-timeout` 仍兼容）、`--max-time` 默认 `2×idle-timeout` 且至少 120、端口默认 22（`PSSH_PORT` 越界/非法回退 22 并打 WARN，命令行 `--port` 非法报错退出 2）
+`ls --path` 默认 `.`、`ls --limit` 默认 2000（超出置 `truncated=true`）、`--timeout` 默认 10s、`--idle-timeout` 默认 60s（旧名 `--exec-timeout` 仍兼容）、`--max-time` 默认 `2×idle-timeout` 且至少 120、端口默认 22（`PYAISSH_PORT` 越界/非法回退 22 并打 WARN，命令行 `--port` 非法报错退出 2）
 
 ## 已知边界（需警惕的几条，完整见 docs/edge-cases.md）
 

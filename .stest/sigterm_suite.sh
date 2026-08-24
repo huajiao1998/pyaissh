@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # SIGTERM suite runner using the in-process harness
 cd "$(dirname "$0")/.."
-export PSSH_PY="D:\工作目录\Leopold\pyssh\pssh.py"
+export PYAISSH_PY="D:\工作目录\Leopold\pyssh\pyaissh.py"
 PASS=0; FAIL=0; declare -a FAILS
 run() {
   local label="$1"; shift
   local want="$1"; shift
   local out
-  out=$(PSSH_PASSWORD='WKkO0147369' python .stest/sigterm_harness.py "$@" 2>&1)
+  out=$(PYAISSH_PASSWORD='WKkO0147369' python .stest/sigterm_harness.py "$@" 2>&1)
   local rc_harness=$(echo "$out" | grep -o 'HARNESS_RC=[0-9-]*' | cut -d= -f2)
   local secs=$(echo "$out" | grep -o 'HARNESS_SECS=[0-9.]*' | cut -d= -f2)
   if [ "$rc_harness" = "$want" ]; then

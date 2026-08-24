@@ -18,7 +18,7 @@
 |---|---|---|
 | 0 | 成功 | |
 | 1 | 传输错误 / SFTP 超时 | upload/download/ls（`upload_failed`/`download_failed`/`ls_failed`/`*_timeout`） |
-| 2 | **所有参数错误**：argparse 层（未知参数/缺参数/`--port` 非数字/0/负值/越界/超时参数非整数）、exec 缺 `--cmd`、`--cmd-file` 读取失败（`read_cmd_failed`）、缺用户名/主机、target 内嵌端口非法、别名未配置、路径不存在或含通配符（`~user` 形式也归此类） | 均报 `bad_args` 或 `read_cmd_failed`；`--port 0`/负值在**命令行**直接报错退出 2，**静默回退 22 仅发生在 `PSSH_PORT` 环境变量**（越界也回退并打 WARN） |
+| 2 | **所有参数错误**：argparse 层（未知参数/缺参数/`--port` 非数字/0/负值/越界/超时参数非整数）、exec 缺 `--cmd`、`--cmd-file` 读取失败（`read_cmd_failed`）、缺用户名/主机、target 内嵌端口非法、别名未配置、路径不存在或含通配符（`~user` 形式也归此类） | 均报 `bad_args` 或 `read_cmd_failed`；`--port 0`/负值在**命令行**直接报错退出 2，**静默回退 22 仅发生在 `PYAISSH_PORT` 环境变量**（越界也回退并打 WARN） |
 | 124 | **exec 超时**（对齐 GNU timeout 惯例） | `exec_idle_timeout`（连续无输出超 `--idle-timeout`）或 `exec_total_timeout`（总时长超 `--max-time`）；**远程进程可能仍在运行**（断开不会杀掉它），副作用命令重试前先 pgrep 确认/清理 |
 | 130 | 用户中断（Ctrl+C / SIGTERM，仅 POSIX） | 超时机制杀子进程（`subprocess.terminate()`/`timeout` 命令发 SIGTERM）同样走此路径。v1.4.0 起信号处理器**只置标志不再抛异常**（在 paramiko C 级 I/O 中抛 KI 会导致锁损坏死锁），由救援线程强断连接 + Python 轮询点检查标志，串行/并行/上传/下载/exec/test 全部可靠 130 + `interrupted` JSON + 零本地残留（v1.4.5 起 `test`/`--cmd-file -`/exec 排水阶段也覆盖，不再有信号被吞返回假成功）；`interrupted` 消息区分来源（`用户中断（SIGTERM）`/`用户中断（SIGINT）`）；**慢链路分片下载中断也秒级退出**（v1.4.3 起分片 worker 与主线程 join 均带信号检查，不再拖到 120s 看门狗）；中断路径硬退出（跳过解释器关闭阶段，退出码确定）；**Windows 的 terminate() 是硬杀不走信号**，无 JSON 无清理（调用方应靠 `--max-time` 兜底而非外部强杀） |
 | 254 | exec 成功但远程退出码恰为 255 | 255 保留给连接失败语义；JSON 的 `local_exit_code` 字段即本地实际退出码（254），`exit_code` 仍是远程真实值 255。**歧义提示**：本地退出码 254 可能是"远程真实 254"或"远程 255 的映射"——区分只看 JSON 的 `exit_code`/`local_exit_code` 双字段（纯 `$?` 消费者无法区分，契约要求决策以 JSON 为准） |

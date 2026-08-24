@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """SIGTERM/SIGINT harness: import pyaissh.py as module, call main() in-process as
 the real main thread, raise the signal after DELAY ms via signal.raise_signal.
-Usage: PSSH_PY=/path/pyaissh.py SIG=TERM python sigterm_harness.py <delay_ms> -- <pssh args...>
+Usage: PYAISSH_PY=/path/pyaissh.py SIG=TERM python sigterm_harness.py <delay_ms> -- <pyaissh args...>
 Prints HARNESS_RC=<rc> HARNESS_SECS=<wall> HARNESS_SIG=<which> to stderr."""
 import sys, os, time, signal, threading, importlib.util
 
@@ -17,7 +17,7 @@ def main():
     sys.argv = [sys.argv[0]] + sys.argv[idx+1:]
     which = os.environ.get("SIG", "TERM")
     signum = signal.SIGINT if which == "INT" else signal.SIGTERM
-    mod = load_pssh(os.environ["PSSH_PY"])
+    mod = load_pssh(os.environ["PYAISSH_PY"])
     def fire():
         time.sleep(delay_ms/1000.0)
         try:
