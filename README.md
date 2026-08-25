@@ -93,15 +93,16 @@ Credentials: `--password`/`--key` or env vars `PYAISSH_PASSWORD`/`PYAISSH_KEY` (
 
 ## 使用场景 / Real-world usage
 
-**AI 巡检 10 台机器 + 断点续传 2GB 日志**（5 行调用序列）：
+**AI 巡检 10 台机器 + 断点续传 2GB 日志**（shell 调用序列）：
 
-```python
-for host in hosts:
-    r = pyaissh.test(host)                    # 1. 连通性 + 系统信息
-    if r["ok"]:
-        pyaissh.ls(host, "/var/log")          # 2. 列目录（JSON entries）
-        out = pyaissh.exec(host, "df -h")     # 3. 执行命令（exit_success + stdout）
-pyaissh.download(host, "/var/log/big.log", "--resume")   # 4. 断点续传 2GB 日志
+```bash
+# 巡检 10 台机器
+for host in 10.0.0.{1..10}; do
+  pyaissh test root@$host                    # 1. 连通性 + 系统信息（单行 JSON）
+  pyaissh ls root@$host --path /var/log      # 2. 列目录（JSON entries）
+  pyaissh exec root@$host --cmd 'df -h'      # 3. 执行命令（exit_success + stdout）
+done
+pyaissh download root@10.0.0.1 --remote /var/log/big.log --local . --resume   # 4. 断点续传 2GB 日志
 # 5. 中断/失败重试：错误 JSON 的 retryable + file_list 精确续传，md5 复核
 ```
 
