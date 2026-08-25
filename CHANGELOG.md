@@ -118,3 +118,13 @@
 ### 修改
 - **upload 结果补 `parallel_used` 字段（契约对称性修复）**：此前 `_parallel_put` 分支虽赋值 `parallel_used`（局部变量）但未放进结果 JSON——AI 上传后无法确认实际分片档位，与下载不对称，SKILL.md/transfer.md 的"实际档位见结果 `parallel_used` 字段"指引在上传方向落空。修复：cmd_upload 函数开头初始化 `parallel_used = 1`（单连接默认，非分片路径不再 NameError），分片分支赋值保留，结果 dict 新增 `"parallel_used": parallel_used`——下载与上传结果字段完全对称。真机验证：`--parallel 4` 上传 → `parallel_used: 4`，默认单连接 → `parallel_used: 1`；回归 verify_r3 54/54。
 - **文档同步**：SKILL.md 速查第 7 条与 docs/transfer.md 改为"大文件传输慢或超时：加 --parallel 8"（覆盖上传，v1.5.8 起），并注明 `parallel_used` 字段下载与上传结果都有。
+
+## [1.5.11] - 2026-08-25
+
+### 修改
+- **`_parallel_put` 失败清理窄缝补提示（P3 卫生修复）**：并行分片上传失败且所有 worker 连接已死（如传输中网络整体断开）、主连接兜底 remove 也失败时，远端 `.part` 会残留且此前 warnings 无清理提示（串行路径有 `_PUT_RESIDUE_WARNINGS` 兜底，并行路径漏了）。修复：清理循环全失败时记入 `_PUT_RESIDUE_WARNINGS`（"并行分片上传中断，远端临时文件可能残留: <part>（清理：rm -f ...）"），兑现 SKILL.md 第 7 条"warnings 会提示清理命令"的承诺。`.part` 名带 pid 下次不撞名，纯卫生问题不影响正确性。
+- **contract.md 补 `parallel_used` 字段（契约文档权威性）**：docs/contract.md 第 9 行 upload/download 字段枚举补 `parallel_used`（v1.5.8 起，单连接=1，分片=--parallel 值，下载与上传都有）——此前 SKILL.md 指引"见结果 parallel_used 字段"在字段契约文档查不到。
+- **README 版本号占位符化**：输出示例 `"version": "1.5.8"` → `"x.y.z"`、安装提示词版本号改为"随发布更新"——硬编码版本号每次发布都过时（上轮已提过），占位符一劳永逸。
+
+### 测试
+- 编译 + 回归 verify_r3 54/54；清理窄缝为代码审查 + 逻辑验证（真机需断网场景，不可行）。

@@ -50,7 +50,7 @@ This is pyaissh's biggest edge over the MCP-SSH ecosystem: many MCP SSH servers 
 ## 输出示例 / Output example
 
 ```json
-{"ok": true, "action": "exec", "version": "1.5.8", "exit_code": 0, "exit_success": true,
+{"ok": true, "action": "exec", "version": "x.y.z", "exit_code": 0, "exit_success": true,
  "stdout": "Linux\n", "stdout_bytes": 7, "stdout_truncated": false, "warnings": []}
 ```
 
@@ -80,7 +80,7 @@ git clone https://github.com/huajiao1998/pyaissh.git        # 或 Releases 下�
    放到我的智能体技能目录（如 ~/.dsh/skills/pyaissh/ 或对应 agent 的技能路径约定）
 3. 安装依赖：pip install paramiko（已装则跳过）
 4. 验证：运行 python3 <技能目录>/pyaissh.py --version，
-   应输出单行 JSON 且含 "version": "1.5.8"（或最新版本号）
+   应输出单行 JSON 且含 "version"（版本号随发布更新，见 Releases 最新 tag）
 5. 确认 SKILL.md 的 frontmatter（name: pyaissh）能被技能加载器识别
 遇到报错先查仓库 README 的安装说明或 CHANGELOG。
 ```

@@ -120,7 +120,7 @@ except (ValueError, OSError, ImportError):
 # 时才 import。错误路径（--version/--help/bad_args/缺用户名/别名未配置）从
 # ~300ms 降到 ~30ms；极早期信号窗口也更短（handler 注册后只剩标准库 import）。
 
-VERSION = "1.5.10"
+VERSION = "1.5.11"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -1823,12 +1823,23 @@ def _parallel_put(conn, args_, local, remote, size, k):
         # 失败/中断：用活跃 worker 连接清理 .part（主连接可能已被看门狗杀；
         # keep_part 双丢防护：改名回退失败时 part 是新数据唯一副本，保留不删）
         if not getattr(e, "keep_part", False):
+            cleaned = False
             for _, sftp, *_ in workers:
                 try:
                     sftp.remove(part)
+                    cleaned = True
                     break
                 except Exception:
                     continue
+            if not cleaned:
+                # 极窄的静默残留窗口：所有 worker 连接已死（如传输中网络整体
+                # 断开）→ 远端 .part 清不掉。part 名带 pid 下次不撞名，纯卫生
+                # 问题；但 SKILL.md 第 7 条承诺"warnings 会提示清理命令"——
+                # 串行路径由 _PUT_RESIDUE_WARNINGS 兜底，并行路径这里补上
+                msg = ("并行分片上传中断，远端临时文件可能残留: %s"
+                       "（清理：rm -f '%s'）" % (part, part))
+                log("[WARN] " + msg)
+                _PUT_RESIDUE_WARNINGS.append(msg)
         raise
     finally:
         for client, sftp, start, end, _ in workers:
