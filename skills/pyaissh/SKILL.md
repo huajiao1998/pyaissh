@@ -16,7 +16,8 @@ pyaissh 是基于 paramiko 的命令行 SSH 工具，专为非交互的 AI/脚�
 5. 退出码仅粗筛，**决策一律以 `error` 字段为准**（超时退出码为 124，与连接失败 255 区分）
 6. 多主机/跳板场景：**无论失败发生在跳板机还是目标机，JSON 的 `host`/`user`/`port` 恒指向目标机**；若 message 带 `[跳板机 user@host]` 前缀，说明失败发生在**跳板机侧**；连接期 `bad_args` 无 `host`/`user` 字段（目标尚未解析出来）；**连接成功后的路径类 `bad_args` 带 `host`/`user`/`port`**
 7. **大文件传输慢或超时：加 `--parallel 8`**——下载默认 ≥8MB 自动 4 连接分片；**显式 `--parallel 8` 强制 8 连接（≥64KB 即启用并行）**，上传同参数（v1.5.8 起 `upload --parallel 1-8`，显式时 ≥64KB 分片，与 `--resume` 互斥），**实际档位见结果 `parallel_used` 字段**（下载与上传结果都有；高丢包/跨境链路单连接吞吐塌陷，多连接近似线性提速；**8 不行反试 4/2**）；**所有传输路径**（串行/目录/并行）都写进程唯一的 `.part.<pid>` 成功后原子改名（**下载的 `.part` 在本地、上传的 `.part` 在远端**）——失败/中断不留半截**最终**文件（上传中断可能残留 `.part` 临时文件，warnings 会提示清理命令）；上传先传 `.part` 再 posix-rename 原子覆盖（服务器不支持该扩展时退化为删除+改名并 WARN）
-8. **命令含特殊字符时用 `--cmd-file -` 而不是 `--cmd`**：含单引号、多行、`$()`/反引号/`${}`、管道+引号组合的命令，用 `--cmd-file - <<'EOF' ... EOF` 从 stdin 读（heredoc 绕过所有 shell 转义问题）；简单命令（`df -h`、`uname -a`）用 `--cmd '...'` 即可
+8. **`--cmd` 与 `--cmd-file -` 按调用环境选**：bash/常规 shell 下 `--cmd '...'` 完全可靠（标准引号规则，`$()`/反引号/管道/引号组合都安全，单引号包住即原样传远端）；**仅当调用环境是 Windows PowerShell 时**——`--cmd` 字符串会被 PowerShell 先解析（`$` 插值/子表达式执行、`\` 非转义），含 `$()`/反引号/多行/引号组合的复杂命令务必改用 `--cmd-file -`（heredoc/stdin 绕过 PowerShell 字符串层）；拿不准就在 PowerShell 里用 `--cmd-file -`
+9. **`file_list.path` 语义两侧不同，勿混用**：upload 的 `path` 是**本地**路径/相对路径（重试本地定位用），download 的 `path` 是**远端**相对路径（重试远端定位用）——写重试逻辑时按方向取对侧的路径
 
 ## 快速开始
 
@@ -62,7 +63,7 @@ python3 pyaissh.py test root@1.2.3.4
 ### exec — 执行远程命令
 ```bash
 python3 pyaissh.py exec root@1.2.3.4 --cmd 'df -h'
-python3 pyaissh.py exec root@1.2.3.4 --cmd-file - <<'EOF'   # 长脚本/特殊字符走 stdin
+python3 pyaissh.py exec root@1.2.3.4 --cmd-file - <<'EOF'   # 长脚本/复杂命令走 stdin（PowerShell 调用时复杂命令务必如此）
 ls -la /var/log
 EOF
 ```

@@ -128,3 +128,4 @@
 
 ### 测试
 - 编译 + 回归 verify_r3 54/54；清理窄缝为代码审查 + 逻辑验证（真机需断网场景，不可行）。
+- **（v1.5.11 文档修订）SKILL.md 速查第 8 条改为按调用环境选**：bash/常规 shell 下 `--cmd '...'` 完全可靠（标准引号规则），**仅 Windows PowerShell 调用时**复杂命令务必 `--cmd-file -`（PowerShell 会先解析 `$`/`\`）——此前"含特殊字符一律 --cmd-file -"的措辞对 Linux agent（部署主体）过度保守会误导；新增第 9 条 `file_list.path` 语义预警（upload=本地，download=远端，勿混用——transfer.md 有完整版，速查层补齐）；exec.md 示例注释同步。回归 54/54，SKILL.md 13961B。

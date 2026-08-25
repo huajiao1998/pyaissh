@@ -7,7 +7,7 @@
 
 ```bash
 python3 pyaissh.py exec root@1.2.3.4 --cmd 'df -h'
-python3 pyaissh.py exec root@1.2.3.4 --cmd-file - <<'EOF'   # 长脚本/特殊字符走 stdin
+python3 pyaissh.py exec root@1.2.3.4 --cmd-file - <<'EOF'   # 长脚本/复杂命令走 stdin（Windows PowerShell 调用时复杂命令务必如此）
 ls -la /var/log
 EOF
 python3 pyaissh.py exec root@1.2.3.4 --idle-timeout 120 --cmd 'tail -f /var/log/x.log'
