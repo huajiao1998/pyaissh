@@ -61,6 +61,7 @@
 """
 
 import argparse
+import codecs
 import errno
 import json
 import os
@@ -120,7 +121,7 @@ except (ValueError, OSError, ImportError):
 # 时才 import。错误路径（--version/--help/bad_args/缺用户名/别名未配置）从
 # ~300ms 降到 ~30ms；极早期信号窗口也更短（handler 注册后只剩标准库 import）。
 
-VERSION = "1.5.12"
+VERSION = "1.5.13"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -3629,8 +3630,8 @@ def cmd_test(args):
             while time.time() < _status_wait and not chan.exit_status_ready():
                 time.sleep(POLL_TICK)
             status_ready = chan.exit_status_ready()
-        out_s = b"".join(chunks).decode("utf-8", errors="replace").strip().splitlines()
-        err_s = b"".join(err_chunks).decode("utf-8", errors="replace").strip()
+        out_s = b"".join(chunks).decode(args.encoding, errors="replace").strip().splitlines()
+        err_s = b"".join(err_chunks).decode(args.encoding, errors="replace").strip()
         warnings = []
         if not status_ready:
             # M4: 超时/EOF 未收到退出状态 -> 明确提示探测未完成（不再静默 ok=true）
@@ -3753,6 +3754,10 @@ def cmd_ls(args):
             mtime = int(e.st_mtime)  # epoch 秒（UTC）：AI 跨机比较时间无时区歧义
             # 目录的 st_size 是目录项/inode 尺寸而非内容大小：置 null 防误读
             fsize = None if is_dir else e.st_size
+            # 文件名编码说明：paramiko 按 UTF-8+replace 解码 SFTP 文件名（原始字节
+            # 不可还原）——GBK 等非 UTF-8 文件名会以 U+FFFD 显示（实测确认，
+            # v1.5.13 曾试 --encoding 还原，paramiko 层信息已丢，回滚）；文件名
+            # 建议保持 UTF-8，或经 exec `ls -b`/base64 自行取原始字节
             name = e.filename + ("/" if is_dir else "")  # 目录名带 / 后缀，AI 拼路径时先去尾
             # entries schema 恒定（不随 --long 变化）：--long 只额外打印文本清单行
             items.append({"name": name, "mode": mode, "size": fsize,
@@ -3892,6 +3897,18 @@ def _positive_int(value):
     if v < 1:
         raise argparse.ArgumentTypeError("必须为正整数（>= 1）")
     return v
+
+
+def _encoding_type(value):
+    """argparse type：编码名校验（codecs.lookup，拼错立刻 bad_args/2，不连远端）。
+    裸 str 会把错误拖到解码期 LookupError，被通用 except 误归 exec_failed 误导
+    AI 查网络——解析期拦截才是"参数写错"的语义。"""
+    try:
+        codecs.lookup(value)
+    except LookupError:
+        raise argparse.ArgumentTypeError(
+            "未知编码 %r（如 utf-8 / gbk / shift_jis / latin-1）" % (value,))
+    return value
 
 
 def _port(value):
@@ -4036,9 +4053,9 @@ def build_parser():
     p.add_argument("--spill-dir", dest="spill_dir",
                    help="输出截断时把完整输出落盘的目录（默认系统临时目录；保留的文件路径见结果 "
                         "stdout_spill_file / stderr_spill_file 字段）")
-    p.add_argument("--encoding", dest="encoding", default="utf-8",
+    p.add_argument("--encoding", dest="encoding", type=_encoding_type, default="utf-8",
                    help="远端 stdout/stderr 的解码编码（默认 utf-8；GBK/Shift-JIS 等系统日志用 "
-                        "--encoding gbk / shift_jis；非法字节以 U+FFFD 替换，不中断）")
+                        "--encoding gbk / shift_jis；非法字节以 U+FFFD 替换，不中断；拼错立即报错不连远端）")
     p.add_argument("--pty", action="store_true",
                    help="分配 PTY 伪终端运行：适用于需要 TTY 的非交互命令"
                         "(watch、top -b、sudo -n、检测 isatty 的脚本)；"
@@ -4103,6 +4120,8 @@ def build_parser():
     p = sub.add_parser("test", help="测试连接",
                        description="测试 SSH 连接，返回连接状态和服务器信息。")
     add_conn(p)
+    p.add_argument("--encoding", dest="encoding", type=_encoding_type, default="utf-8",
+                   help="服务器信息输出的解码编码（默认 utf-8；GBK 系统 os-release 等用 --encoding gbk）")
     p.set_defaults(func=cmd_test)
 
     # ls

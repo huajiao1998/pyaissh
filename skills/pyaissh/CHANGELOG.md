@@ -138,3 +138,18 @@
 
 ### 文档
 - **"stdout 恒单行 JSON"声明加例外**：SKILL.md 速查第 1 条、README（中文头条 + 能力表）补"（`--help` 纯文本除外）"——防止盲目 `json.loads(stdout)` 的 AI 代理在 `--help` 上 break（contract.md 原已标注例外，头条声明层补齐）。
+
+## [1.5.13] - 2026-08-25
+
+### 新增
+- **`--encoding` 解析期校验（拼错立即 bad_args/2，不连远端）**：新增 `_encoding_type`（codecs.lookup 校验）接入 exec/test——此前 `--encoding utf-9`（拼错）能过 argparse、连上远端后才在解码期 LookupError，被通用 except 误归 exec_failed/255 误导 AI 查网络；现在拼错立刻 `bad_args` + `retryable:false` + 自纠提示（"未知编码 'utf-9'（如 utf-8 / gbk / shift_jis / latin-1）"）。真机验证：exec/test 的 `--encoding utf-9` → bad_args。
+- **`test` 支持 `--encoding`**：服务器信息输出（hostname/os-release 等）解码编码可指定（默认 utf-8）——与 exec 一致，GBK 系统 os-release 不再乱码。
+
+### 边界（诚实记录）
+- **ls 的 GBK 文件名暂不支持（paramiko 层限制）**：曾实现 ls `--encoding`（surrogateescape 还原原始字节再按指定编码解码），实测发现 paramiko 5.0 已按 **UTF-8+replace** 解码 SFTP 文件名（`e.filename` 中是 U+FFFD，原始字节不可还原）——`--encoding gbk` 得到"锟斤拷"（U+FFFD 再解码的乱码），功能无效，**回滚**并在代码注释记录边界。非 UTF-8 文件名建议保持 UTF-8，或经 exec `ls -b`/base64 自行取原始字节。
+
+### 修复
+- **SKILL.md 标题"速查（先读这 8 条）"→ 9 条**：v1.5.11 加第 9 条时标题漏改（小笔误）。
+
+### 测试
+- 真机：exec `--encoding gbk` → "你好"（回归有效）、test `--encoding utf-9` → bad_args、回归 verify_r3 54/54、双份 md5 一致。
