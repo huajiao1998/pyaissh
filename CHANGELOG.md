@@ -129,3 +129,12 @@
 ### 测试
 - 编译 + 回归 verify_r3 54/54；清理窄缝为代码审查 + 逻辑验证（真机需断网场景，不可行）。
 - **（v1.5.11 文档修订）SKILL.md 速查第 8 条改为按调用环境选**：bash/常规 shell 下 `--cmd '...'` 完全可靠（标准引号规则），**仅 Windows PowerShell 调用时**复杂命令务必 `--cmd-file -`（PowerShell 会先解析 `$`/`\`）——此前"含特殊字符一律 --cmd-file -"的措辞对 Linux agent（部署主体）过度保守会误导；新增第 9 条 `file_list.path` 语义预警（upload=本地，download=远端，勿混用——transfer.md 有完整版，速查层补齐）；exec.md 示例注释同步。回归 54/54，SKILL.md 13961B。
+
+## [1.5.12] - 2026-08-25
+
+### 新增
+- **`exec --encoding`（非 UTF-8 远端输出逃生口）**：远端 stdout/stderr 解码编码可指定（默认 utf-8，如 `--encoding gbk` / `shift_jis`；非法字节仍以 U+FFFD 替换不中断）。GBK/Shift-JIS 系统日志此前一律按 UTF-8 解码成乱码（AI 误判"执行失败"），现在按系统编码可正确读出。真机验证：远端 GBK 字节 `\xc4\xe3\xba\xc3` 默认 utf-8 → `���`，`--encoding gbk` → `你好`。成功与错误路径解码（`_partial_extra`）都生效。
+- **超时错误 JSON 新增 `remote_may_be_running`（124 幽灵进程机器可读化）**：`exec_idle_timeout`/`exec_total_timeout`/`exec_timeout` 错误 JSON 恒带 `"remote_may_be_running": true`——AI 重试循环直接读该字段决定是否先 pgrep 确认（不再依赖记住文字提示），避免在额外负载下盲目起第二个重试实例。真机验证：`sleep 5 --idle-timeout 1` → 超时 JSON 含该字段。
+
+### 文档
+- **"stdout 恒单行 JSON"声明加例外**：SKILL.md 速查第 1 条、README（中文头条 + 能力表）补"（`--help` 纯文本除外）"——防止盲目 `json.loads(stdout)` 的 AI 代理在 `--help` 上 break（contract.md 原已标注例外，头条声明层补齐）。

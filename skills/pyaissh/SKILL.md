@@ -9,7 +9,7 @@ pyaissh 是基于 paramiko 的命令行 SSH 工具，专为非交互的 AI/脚�
 
 ## 速查（先读这 8 条）
 
-1. **默认输出就是整行 JSON**（无需任何 flag），直接 `json.loads` stdout；`--text` 切可读模式（仅供人类）；`--json` 为兼容旧用法的空操作
+1. **默认输出就是整行 JSON**（无需任何 flag），直接 `json.loads` stdout（**`--help` 纯文本除外**——需要用法时先跑 `--help` 读文本，其余一律 JSON）；`--text` 切可读模式（仅供人类）；`--json` 为兼容旧用法的空操作
 2. 成功看 `ok`；命令成败看 `exit_success`；失败看 `error` + `message`（+可能的 `host`/`user`）
 3. 连接任何主机前先 `test`，失败按错误类型处理，别盲目重试
 4. 高频错误一句话动作：`auth_failed` 换凭据 / `connection_timeout` 查网络 / `exec_idle_timeout`/`exec_total_timeout` 按消息调大对应超时（**超时后远程进程可能仍在运行**，副作用命令先 pgrep 确认再重试）/ `connection_lost` 不信任部分结果重跑 / `jump_failed` 查跳板转发限制 / `bad_args` 查参数

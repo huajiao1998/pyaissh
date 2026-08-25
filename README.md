@@ -9,7 +9,7 @@
 > ③ **传文件留半截**——中断后目标文件损坏，`--skip-existing` 还按大小误判
 > ④ **传输内容烧爆 LLM 上下文**——大文件内容塞回给 AI，token 直接爆炸
 
-pyaissh 把 SSH 变成 **AI 可精确消费的结构化工具**：stdout 恒为单行 JSON，三重超时防挂死，`.part` 原子传输 + 断点续传，文件内容零回传。
+pyaissh 把 SSH 变成 **AI 可精确消费的结构化工具**：stdout 恒为单行 JSON（`--help` 纯文本除外），三重超时防挂死，`.part` 原子传输 + 断点续传，文件内容零回传。
 
 Raw `ssh` has four pain points when used by AI agents: **unparseable output**, **infinite hangs**, **half-written files on interrupt**, and **file contents blowing up the LLM context**. pyaissh turns SSH into a **structured tool AI can consume precisely**: single-line JSON stdout, triple timeout protection, atomic + resumable transfers, and zero file content in the context.
 
@@ -26,7 +26,7 @@ pyaissh ls root@1.2.3.4 --path /etc --long
 
 | 能力 | 说明 | Capability |
 |---|---|---|
-| 🧭 结构化契约 | stdout 恒单行 JSON，直接 `json.loads`；24 类错误类型 + `retryable` 机器可读重试建议 | Structured contract: single-line JSON + typed errors with machine-readable retry hints |
+| 🧭 结构化契约 | stdout 恒单行 JSON（`--help` 纯文本除外），直接 `json.loads`；24 类错误类型 + `retryable` 机器可读重试建议 | Structured contract: single-line JSON (except `--help`) + typed errors with machine-readable retry hints |
 | 🛡 防挂死 | 三重超时（静默/总时长/看门狗）——AI 调它永远不会卡死 | Triple timeout protection — never hangs |
 | 🔄 可靠传输 | `.part` 原子写 + `--resume` 断点续传 + **并行分片下载/上传**（`--parallel 1-8`）+ `file_list` 断点重试 | Atomic transfer + resumable upload/download + **parallel-sharded upload & download** + retryable file lists |
 | 🔋 零 token 传输 | 文件内容从不回传 JSON——AI 只消费元数据，大文件不烧上下文 | Zero-token transfer: file content never enters the LLM context |

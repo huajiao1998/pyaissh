@@ -120,7 +120,7 @@ except (ValueError, OSError, ImportError):
 # 时才 import。错误路径（--version/--help/bad_args/缺用户名/别名未配置）从
 # ~300ms 降到 ~30ms；极早期信号窗口也更短（handler 注册后只剩标准库 import）。
 
-VERSION = "1.5.11"
+VERSION = "1.5.12"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -2357,8 +2357,8 @@ def cmd_exec(args):
             "port": conn["port"],
             "cmd": cmd_echo,  # 与成功路径对称：错误时也能看到命令原文（含凭据需脱敏；超限截断）
             "cmd_truncated": cmd_cut,  # cmd 回显是否被截断（--cmd-file 大脚本）
-            "stdout": _clean_pty_text(out_cut.decode("utf-8", errors="replace"), args),
-            "stderr": _clean_pty_text(err_cut.decode("utf-8", errors="replace"), args),
+            "stdout": _clean_pty_text(out_cut.decode(args.encoding, errors="replace"), args),
+            "stderr": _clean_pty_text(err_cut.decode(args.encoding, errors="replace"), args),
             # 与成功路径语义一致：原始字节数（total_counter 在 exec_command
             # 之后定义；exec_command 本身抛错时回退用缓冲长度）
             "stdout_bytes": total_counter[0],
@@ -2747,8 +2747,8 @@ def cmd_exec(args):
         if err_trunc:
             warnings.append("stderr 已截断：省略 %d/%d 字节（--max-output 调整）"
                             % (err_omitted, len(err_raw)))
-        out_s = _clean_pty_text(out_cut.decode("utf-8", errors="replace"), args)
-        err_s = _clean_pty_text(err_cut.decode("utf-8", errors="replace"), args)
+        out_s = _clean_pty_text(out_cut.decode(args.encoding, errors="replace"), args)
+        err_s = _clean_pty_text(err_cut.decode(args.encoding, errors="replace"), args)
         duration = int((time.time() - start) * 1000)
 
         if exit_code == 255:
@@ -2847,10 +2847,17 @@ def cmd_exec(args):
             error_type = "exec_timeout"
         else:
             error_type = "exec_failed"
+        # 超时类机器可读标记：远程进程可能仍在运行（124 幽灵进程）——AI 重试
+        # 循环直接读该字段决定是否先 pgrep 确认，不必依赖记住文字提示
+        if error_type in ("exec_idle_timeout", "exec_total_timeout", "exec_timeout"):
+            timeout_extra = dict(_partial_extra())
+            timeout_extra["remote_may_be_running"] = True
+        else:
+            timeout_extra = _partial_extra()
         hint = _shell_escape_hint(args.cmd)
         if hint:
             msg += hint
-        emit_error(args.json, error_type, msg, extra=_partial_extra())
+        emit_error(args.json, error_type, msg, extra=timeout_extra)
         return 124 if error_type != "exec_failed" else 255
     finally:
         # spill 兜底：成功路径已置 _spill_handled；异常/中断路径在此删除，不留垃圾
@@ -4029,6 +4036,9 @@ def build_parser():
     p.add_argument("--spill-dir", dest="spill_dir",
                    help="输出截断时把完整输出落盘的目录（默认系统临时目录；保留的文件路径见结果 "
                         "stdout_spill_file / stderr_spill_file 字段）")
+    p.add_argument("--encoding", dest="encoding", default="utf-8",
+                   help="远端 stdout/stderr 的解码编码（默认 utf-8；GBK/Shift-JIS 等系统日志用 "
+                        "--encoding gbk / shift_jis；非法字节以 U+FFFD 替换，不中断）")
     p.add_argument("--pty", action="store_true",
                    help="分配 PTY 伪终端运行：适用于需要 TTY 的非交互命令"
                         "(watch、top -b、sudo -n、检测 isatty 的脚本)；"
