@@ -112,3 +112,9 @@
 
 ### 测试
 - v60_verify 11 例：T1 分片对照（md5 双一致 + 提速数据）+ T2 hint 五场景 + T3 cmd 字段回显两模式。回归 verify_r3 54/54。
+
+## [1.5.10] - 2026-08-25
+
+### 修改
+- **upload 结果补 `parallel_used` 字段（契约对称性修复）**：此前 `_parallel_put` 分支虽赋值 `parallel_used`（局部变量）但未放进结果 JSON——AI 上传后无法确认实际分片档位，与下载不对称，SKILL.md/transfer.md 的"实际档位见结果 `parallel_used` 字段"指引在上传方向落空。修复：cmd_upload 函数开头初始化 `parallel_used = 1`（单连接默认，非分片路径不再 NameError），分片分支赋值保留，结果 dict 新增 `"parallel_used": parallel_used`——下载与上传结果字段完全对称。真机验证：`--parallel 4` 上传 → `parallel_used: 4`，默认单连接 → `parallel_used: 1`；回归 verify_r3 54/54。
+- **文档同步**：SKILL.md 速查第 7 条与 docs/transfer.md 改为"大文件传输慢或超时：加 --parallel 8"（覆盖上传，v1.5.8 起），并注明 `parallel_used` 字段下载与上传结果都有。

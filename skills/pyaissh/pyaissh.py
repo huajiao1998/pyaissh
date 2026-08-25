@@ -120,7 +120,7 @@ except (ValueError, OSError, ImportError):
 # 时才 import。错误路径（--version/--help/bad_args/缺用户名/别名未配置）从
 # ~300ms 降到 ~30ms；极早期信号窗口也更短（handler 注册后只剩标准库 import）。
 
-VERSION = "1.5.9"
+VERSION = "1.5.10"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -2873,6 +2873,7 @@ def cmd_upload(args):
     file_list = None       # None=尚未开始；空列表=刚开始就失败（同样有断点价值）
     walk_warnings = []
     bytes_uploaded = [0]  # put 回调累计已传字节：中断/失败时 JSON 报真实进度
+    parallel_used = 1     # 本次实际并行连接数（结果回显，AI 无需猜测档位；对称下载）
     if args.dry_run and args.skip_existing:
         # dry-run 零远端 I/O，无法预演 skip 判定；stderr 与结果 warnings 双通道说明
         msg = "dry-run 不做远端 I/O，--skip-existing 未预演（实跑时才判定）"
@@ -3086,6 +3087,7 @@ def cmd_upload(args):
             "skipped": files_skipped,
             "bytes": total_bytes,           # 清单总大小（含 skipped）
             "bytes_transferred": bytes_transferred,  # 实际传输字节（skip 全跳过时为 0）
+            "parallel_used": parallel_used,  # 实际分片连接数：单连接=1，分片=--parallel 值（AI 确认档位，对称下载）
             "file_list": file_list,
             "dry_run": bool(args.dry_run),
             "warnings": list(walk_warnings) + list(_PUT_RESIDUE_WARNINGS),
