@@ -120,7 +120,7 @@ except (ValueError, OSError, ImportError):
 # 时才 import。错误路径（--version/--help/bad_args/缺用户名/别名未配置）从
 # ~300ms 降到 ~30ms；极早期信号窗口也更短（handler 注册后只剩标准库 import）。
 
-VERSION = "1.5.8"
+VERSION = "1.5.9"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -2742,6 +2742,13 @@ def cmd_exec(args):
 
         if exit_code == 255:
             warnings.append("远程退出码为 255，本地返回 254（255 保留给连接失败语义）")
+        if exit_code != 0:
+            # 命令退出码非零 = 最常见的"命令失败"（工具 ok:true 但命令失败）。
+            # 含 shell 特殊字符时提示转义（PowerShell 吃 \$ 的坑：远端收到
+            # 被改写的命令，行为诡异且退出码非零——用户最需要 hint 的场景）
+            hint = _shell_escape_hint(args.cmd)
+            if hint:
+                warnings.append("命令退出码非零且含特殊字符。%s" % hint)
         stdout_truncated = bool(out_trunc or drop_counter[0])
         stderr_truncated = bool(err_trunc or err_drop_counter[0])
         cmd_echo, cmd_cut, cmd_n = _truncate_cmd(cmd)
@@ -3920,7 +3927,7 @@ def build_parser():
   ls -la /var/log
   EOF
   pyaissh upload root@1.2.3.4 --local ./dist --remote /opt/app/dist --skip-existing
-  pyaissh upload root@1.2.3.4 --local big.bin --remote /tmp/big.bin --parallel 8  # 慢链路大文件上传分片提速（v1.5.8）
+  pyaissh upload root@1.2.3.4 --local big.bin --remote /tmp/big.bin --parallel 8  # 高丢包/长 RTT 链路分片上传（收益随链路而定；v1.5.8）
   pyaissh download root@1.2.3.4 --remote /var/log/x.log --local ./x.log
   pyaissh download root@1.2.3.4 --remote big.tar.gz --local . --parallel 8   # --local . 可用（scp 语义）
   pyaissh test root@1.2.3.4

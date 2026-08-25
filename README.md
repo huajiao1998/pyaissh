@@ -16,7 +16,7 @@ Raw `ssh` has four pain points when used by AI agents: **unparseable output**, *
 ```bash
 pyaissh exec root@1.2.3.4 --cmd 'uname -a'
 pyaissh upload root@1.2.3.4 --local ./dist --remote /opt/app/dist
-pyaissh upload root@1.2.3.4 --local big.bin --remote /tmp/big.bin --parallel 8   # 慢链路大文件上传分片提速
+pyaissh upload root@1.2.3.4 --local big.bin --remote /tmp/big.bin --parallel 8   # 高丢包/长 RTT 链路分片上传（收益随链路而定）
 pyaissh download root@1.2.3.4 --remote big.tar.gz --local . --parallel 8
 pyaissh test root@1.2.3.4
 pyaissh ls root@1.2.3.4 --path /etc --long
