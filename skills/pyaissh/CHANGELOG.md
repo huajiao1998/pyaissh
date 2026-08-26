@@ -153,3 +153,4 @@
 
 ### 测试
 - 真机：exec `--encoding gbk` → "你好"（回归有效）、test `--encoding utf-9` → bad_args、回归 verify_r3 54/54、双份 md5 一致。
+- **（v1.5.13 文档修订 + Linux 双平台验证）**：① SKILL.md 快速开始调用方式收敛为主路径 `python3 <pyaissh_dir>/pyaissh.py ...`（Windows cmd / Git Bash 折叠到 docs/setup.md）——Linux 智能体看主路径零犹豫；② 审查建议"file_list.path 预警"为 v1.5.11 第 9 条既有内容（无需重复）；③ 审查建议"--cmd 只用于 df -h、其余一律 --cmd-file"**不采纳**——与 v1.5.11"按调用环境选"决定相反（会使 Linux agent 过度保守，bash 下 --cmd 完全可靠）；④ **首次 Linux 平台回归**：服务器（Debian 13, Python 3.13.5, paramiko 5.0.0）跑 verify_r3 54/54 + SIG_UNIT + `test root@localhost` 全过——此前测试全程 Windows 开发机执行，双平台验证补齐。以后发布流程含 Linux 回归步骤。

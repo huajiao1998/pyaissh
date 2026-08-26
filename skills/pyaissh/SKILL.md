@@ -21,7 +21,7 @@ pyaissh 是基于 paramiko 的命令行 SSH 工具，专为非交互的 AI/脚�
 
 ## 快速开始
 
-- **本 skill 自带 `pyaissh.py`**（技能目录 `skills/pyaissh/` 下）：Linux/macOS `python3 <pyaissh_dir>/pyaissh.py <子命令> ...`；Windows cmd `<pyaissh_dir>\pyaissh.cmd ...`；Git Bash `<pyaissh_dir>/pyaissh ...`；环境需 `python3` + `paramiko`（`pip install paramiko`）
+- **本 skill 自带 `pyaissh.py`**（技能目录 `skills/pyaissh/` 下）：调用主路径 `python3 <pyaissh_dir>/pyaissh.py <子命令> ...`（Windows cmd / Git Bash 的额外调用方式见 docs/setup.md）；环境需 `python3` + `paramiko`（`pip install paramiko`）
 - 目标格式 `[user@]host[:port]`（如 `root@1.2.3.4:22`）；**IPv6 必须加方括号**：`user@[2001:db8::1]:22`、`[2001:db8::1]`（裸 IPv6 直接写也行）；支持主机别名 `@名称`、`-p/--port` 优先于内嵌端口；凭据 `--password`/`--key` 或环境变量 `PYAISSH_PASSWORD`/`PYAISSH_KEY` 等（也可写**技能目录下**的 `.env`——**配置样例见同目录 `.env.example`**；工作目录 `.env` 默认不加载，完整规则见 docs/setup.md）；**凭据安全实践：不要把 token/密码写进 `--cmd` 或脚本内容**——`cmd` 字段会原样回显命令（含凭据需脱敏），且会触发凭据 WARN；凭据走 `--password`/`--key` 参数、`PYAISSH_*` 环境变量、`.env`、或让脚本从文件读取（`cat /path/secret`），绝不内联进命令
 - **完整规则**（认证优先级、别名专属凭据、`.env` 加载与供应链安全、IPv6/端口解析细节）见 **docs/setup.md**
 
