@@ -121,7 +121,7 @@ except (ValueError, OSError, ImportError):
 # 时才 import。错误路径（--version/--help/bad_args/缺用户名/别名未配置）从
 # ~300ms 降到 ~30ms；极早期信号窗口也更短（handler 注册后只剩标准库 import）。
 
-VERSION = "1.5.13"
+VERSION = "1.5.14"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -420,6 +420,21 @@ def _fix_msys_remote_path(path):
                 return recovered
     except Exception:
         pass
+
+    # 模式 3：MSYS ~ 展开转换 C:/Users/<user>/xxx -> ~/xxx
+    # Git Bash 把 ~ 展开为 /c/Users/<user> 再经 pathconv 变 C:/Users/<user>：
+    # --remote 的 ~ 语义是"远端用户 home"，应由 _normalize_remote_path 在远端
+    # 展开；此处还原成 ~/xxx，避免在远端创建 /C:/Users/<user>/ 垃圾目录树。
+    # 仅当 <user> 匹配本地 Windows 用户名（MSYS home 的典型形态），
+    # 远端 Windows 服务器上的 C:/Users/<其他名>/... 不受影响。
+    local_user = os.environ.get("USERNAME") or os.environ.get("USER")
+    if local_user:
+        home_prefix = "C:/Users/%s" % local_user
+        if path.startswith(home_prefix + "/"):
+            rest = path[len(home_prefix):]
+            recovered = "~" + rest
+            log("[WARN] MSYS ~ 转换检测: %s → %s (建议给 ~ 加引号或设 MSYS_NO_PATHCONV=1)" % (path, recovered))
+            return recovered
 
     return path
 

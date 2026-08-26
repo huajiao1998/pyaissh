@@ -25,3 +25,5 @@ Thumbs.db
 .freebuff/
 .stest/
 reasonix.toml
+
+ft_local_tmp/
