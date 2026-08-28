@@ -3,7 +3,7 @@
 > 这是 pyaissh skill 的**子文档**（位于技能目录 `docs/` 子目录下，按需读取、不随 SKILL.md 自动注入）：契约（stdout 单行 JSON / 退出码 / error 类型）以 SKILL.md 为准，本文汇集各类边界行为与注意事项。
 > **何时读**：PTY/ANSI、host key（AutoAddPolicy/--strict）、连接被服务端拒绝、信号中断行为、Windows/Git Bash 下载与路径、内存/输出边界等异常或特殊场景排查时。
 
-- **`--pty`（基础版）**：exec 加 `--pty` 可分配 PTY 伪终端，支持需要 TTY 的**非交互**命令（`tty`、`watch`、`top -b -n 1`、`sudo -n`、检测 isatty 的脚本）。注意：PTY 模式下 stderr 合并进 stdout（无独立 stderr）；输出带 `\r\n` 会被自动清洗为 `\n`；`--pty-strip-ansi` 可剥离 ANSI 颜色/光标序列供 AI 干净解析；结果 JSON 带 `pty: true` 标志。**全屏交互程序（vi/vim、sudo 密码输入）仍不可用**——AI 编辑远程文件请用 download/upload 或 sed 结构化替换；sudo 密码输入**无法用 stdin 管道**（pyaissh 执行后立即关闭 stdin，`sudo -S` 不适用），需用 `sudo -n`（免密）或把密码写进远程环境变量
+- **`--pty`（基础版）**：exec 加 `--pty` 可分配 PTY 伪终端，支持需要 TTY 的**非交互**命令（`tty`、`watch`、`top -b -n 1`、`sudo -n`、检测 isatty 的脚本）。注意：PTY 模式下 stderr 合并进 stdout（无独立 stderr）；输出带 `\r\n` 会被自动清洗为 `\n`；`--pty-strip-ansi` 可剥离 ANSI 颜色/光标序列供 AI 干净解析；结果 JSON 带 `pty: true` 标志。**全屏交互程序（vi/vim、sudo 密码输入）仍不可用**——AI 编辑远程文件请用 download/upload 或 sed 结构化替换；**sudo 提权请用 `--sudo`**（v1.5.15 起：`sudo -S` 经 SSH stdin 注入密码，密码不进命令文本/cmd 字段/日志，见 docs/exec.md）——`--sudo` 与 `--pty` 互斥，免密环境 `--sudo` 无密码时自动 `sudo -n` 探测
 - **非 PTY 输出的 ANSI 风险**：远程命令带色输出（`grep --color`、`ls --color`、安装脚本）在非 PTY 模式下会**原样**进 JSON 的 `stdout` 字段（仅 `--pty` 时才剥离）——做正则/字符串匹配解析前先自行剥离 ANSI，或对这类命令加 `--pty-strip-ansi`
 - **远端路径 `~` 已支持自动展开**（v1.3 起，`~` / `~/x` 转为绝对路径并回显在结果里；`~user` 形式不支持）；**通配符始终不支持**（SFTP 无 glob，报错会明确提示先 ls）
 - exec 输出默认 `--max-output` 256KB 截断（可调大，见 exec.md）；内存缓冲有上界（约等于 `--max-output`，头尾各半滚动保留），不会因大输出无限吃内存；超大输出（建议 >50MB）仍应分批或改走文件

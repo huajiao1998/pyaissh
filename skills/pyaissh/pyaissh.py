@@ -121,7 +121,7 @@ except (ValueError, OSError, ImportError):
 # 时才 import。错误路径（--version/--help/bad_args/缺用户名/别名未配置）从
 # ~300ms 降到 ~30ms；极早期信号窗口也更短（handler 注册后只剩标准库 import）。
 
-VERSION = "1.5.14"
+VERSION = "1.5.15"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -2324,6 +2324,31 @@ def cmd_exec(args):
                    % (args.max_time, args.exec_timeout))
         return 2
 
+    # --sudo 提权组装：
+    #  - 复合命令（含 &&/||/;/管道/重定向/$()/反引号/换行）→ bash -c 包裹整链提权
+    #    （sudo 只提权首命令，第二段会回到原用户——实测回归项"&& 第二段 uid=0"）
+    #  - 简单命令（无 shell 元字符）→ 直连 sudo：保留 sudoers NOPASSWD 按命令
+    #    路径匹配（如 NOPASSWD: /usr/bin/apt 对 `sudo apt update` 生效；bash -c
+    #    包裹会让 sudo 看到 /usr/bin/bash 而匹配不上免密规则）
+    #  - -p ''：压掉 "[sudo] password for ..." 提示符（成功路径 stderr 干净）
+    #  - 密码只经 SSH stdin 注入：命令文本/cmd 字段/日志/远端磁盘均无密码
+    #  - orig_cmd 保留组装前原文：凭据启发式检测用原命令（组装后的 sudo -S -p ''
+    #    前缀命中 _SENSITIVE_CMD_RE 的 -p 模式 -> 100% 误报"疑似凭据"，A 修复）
+    orig_cmd = cmd
+    sudo_pw = (args.sudo_password if args.sudo_password
+               else os.environ.get("PYAISSH_SUDO_PASSWORD")) if args.sudo else None
+    if args.sudo:
+        if args.pty:
+            emit_error(args.json, "bad_args",
+                       "--sudo 与 --pty 互斥（sudo -S 走 stdin 管道而非 pty）")
+            return 2
+        if re.search(r"[\$`\n;|&><]|\(|\)", cmd):
+            qcmd = cmd.replace("'", "'\\''")
+            cmd = ("sudo -S -p '' bash -c '%s'" % qcmd) if sudo_pw \
+                else ("sudo -n bash -c '%s'" % qcmd)
+        else:
+            cmd = ("sudo -S -p '' %s" % cmd) if sudo_pw else ("sudo -n %s" % cmd)
+
     try:
         conn = resolve_conn(args)
         client = connect(conn, resolve_jump(args, conn["user"]))
@@ -2405,7 +2430,7 @@ def cmd_exec(args):
     spill_out_path = spill_err_path = None
     _spill_handled = False
     try:
-        w = warn_sensitive_cmd(cmd, enabled=not getattr(args, "no_credential_warn", False))
+        w = warn_sensitive_cmd(orig_cmd, enabled=not getattr(args, "no_credential_warn", False))
         if w:
             warnings.append(w)
         if args.pty_strip_ansi and not args.pty:
@@ -2416,8 +2441,12 @@ def cmd_exec(args):
         stdin, stdout, stderr = client.exec_command(cmd, timeout=args.exec_timeout, get_pty=args.pty)
         # 立即关闭 stdin：paramiko 默认不关，远程命令若读 stdin（如 cat）会一直
         # 等输入直到静默超时误判挂死。关闭后远程立即收到 EOF。
-        # （基础版 --pty 仅面向非交互命令，不涉及 sudo 密码等 stdin 交互）
+        # --sudo 有密码时：先经 stdin 注入密码（sudo -S 从 stdin 读），再关闭
+        #（密码只进 SSH 管道，不进 cmd 字段/日志/远端磁盘；sudo -p '' 压提示符）
         try:
+            if sudo_pw:
+                stdin.write(sudo_pw + "\n")
+                stdin.flush()
             stdin.close()
         except Exception:
             pass
@@ -2772,10 +2801,42 @@ def cmd_exec(args):
         if exit_code != 0:
             # 命令退出码非零 = 最常见的"命令失败"（工具 ok:true 但命令失败）。
             # 含 shell 特殊字符时提示转义（PowerShell 吃 \$ 的坑：远端收到
-            # 被改写的命令，行为诡异且退出码非零——用户最需要 hint 的场景）
-            hint = _shell_escape_hint(args.cmd)
-            if hint:
-                warnings.append("命令退出码非零且含特殊字符。%s" % hint)
+            # 被改写的命令，行为诡异且退出码非零——用户最需要 hint 的场景）。
+            # --sudo 场景抑制转义 hint（E 修复）：命令由工具组装（sudo -S -p ''
+            # / bash -c 包裹），用户输入的转义问题已由组装解决，此时 hint 只会
+            # 把 AI 从"sudo 密码错/权限错"的真实原因引向"改用 --cmd-file"
+            if not getattr(args, "sudo", False):
+                hint = _shell_escape_hint(args.cmd)
+                if hint:
+                    warnings.append("命令退出码非零且含特殊字符。%s" % hint)
+            # sudo 专用提示（--sudo 场景）：
+            #  - 无密码（-n 探测）且 stderr 是 sudo 报错特征 -> 提示配密码
+            #  - 有密码（-S 路径）且 stderr 是 sudo 密码错误特征 -> 提示改密码
+            #    （最常发生的"密码错"此前无提示，只有误导性转义 hint——E 修复）
+            if args.sudo:
+                if not sudo_pw and re.search(
+                        r"sudo:[^\n]*(password (is )?required|no password was provided|password required)",
+                        err_s, re.IGNORECASE):
+                    # -n 路径（无密码探测）提示：与 -S 路径同构——只认带
+                    # "sudo:" 前缀的报错行（实测 sudo -n 报错恒带前缀：
+                    # "sudo: a password is required"）。命令自身 stderr 恰好
+                    # 打出 "a password is required"（无前缀）不触发（对称统一）
+                    warnings.append("sudo -n 免密探测失败（sudo 需要密码）：用 --sudo-password "
+                                    "或 PYAISSH_SUDO_PASSWORD 环境变量提供密码后重试，"
+                                    "或由管理员配置 sudoers NOPASSWD")
+                elif sudo_pw and re.search(
+                        r"sudo:[^\n]*(incorrect password|no password was provided|password required|authentication failure)",
+                        err_s, re.IGNORECASE):
+                    # -S 路径密码错提示。门控必须收窄到 sudo 专属报错（带
+                    # "sudo:" 前缀）：sudo 与命令的 stderr 同一 channel 无法
+                    # 区分来源，宽泛子串（incorrect password / Sorry, try
+                    # again / password mismatch）会被"命令自己往 stderr 打
+                    # 这些词后失败"的场景误报（R7/R8，与 C 门控同类的坑）。
+                    # sudo 密码错的典型 stderr："sudo: no password was
+                    # provided" / "sudo: 1 incorrect password attempt"
+                    warnings.append("sudo 密码错误（stderr 提示 incorrect password）："
+                                    "检查 --sudo-password / PYAISSH_SUDO_PASSWORD 是否与"
+                                    "登录密码一致后重试")
         stdout_truncated = bool(out_trunc or drop_counter[0])
         stderr_truncated = bool(err_trunc or err_drop_counter[0])
         cmd_echo, cmd_cut, cmd_n = _truncate_cmd(cmd)
@@ -2870,9 +2931,12 @@ def cmd_exec(args):
             timeout_extra["remote_may_be_running"] = True
         else:
             timeout_extra = _partial_extra()
-        hint = _shell_escape_hint(args.cmd)
-        if hint:
-            msg += hint
+        # 转义 hint 同样抑制于 --sudo 场景（命令由工具组装，hint 会误导真实
+        # 原因定位；与成功路径的抑制保持一致——E 修复）
+        if not getattr(args, "sudo", False):
+            hint = _shell_escape_hint(args.cmd)
+            if hint:
+                msg += hint
         emit_error(args.json, error_type, msg, extra=timeout_extra)
         return 124 if error_type != "exec_failed" else 255
     finally:
@@ -4065,6 +4129,14 @@ def build_parser():
                    help="stdout/stderr 单流最大保留字节，超出保留头尾各一半 (默认 256KB)")
     p.add_argument("--no-credential-warn", dest="no_credential_warn", action="store_true",
                    help="关闭\"命令含疑似凭据\"的 WARN 提示（启发式误报时用；仍建议敏感凭据走环境变量注入）")
+    p.add_argument("--sudo", action="store_true",
+                   help="以 sudo 提权执行（普通用户登录时提权用）。有密码（--sudo-password 或 "
+                        "PYAISSH_SUDO_PASSWORD）时组装 sudo -S -p '' bash -c '<cmd>' 并经 SSH "
+                        "stdin 注入密码（命令文本不含密码）；无密码时 sudo -n bash -c '<cmd>'"
+                        "（免密探测，需密码立即失败不挂）；复合命令（&&/||/;）整链提权；与 --pty 互斥")
+    p.add_argument("--sudo-password", dest="sudo_password", default=None,
+                   help="sudo 密码（优先于 PYAISSH_SUDO_PASSWORD 环境变量；空串视为未设置→sudo -n "
+                        "免密探测；密码只经 SSH stdin 注入，不进命令文本/cmd 字段/日志/远端磁盘）")
     p.add_argument("--spill-dir", dest="spill_dir",
                    help="输出截断时把完整输出落盘的目录（默认系统临时目录；保留的文件路径见结果 "
                         "stdout_spill_file / stderr_spill_file 字段）")
