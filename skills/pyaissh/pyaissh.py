@@ -121,7 +121,7 @@ except (ValueError, OSError, ImportError):
 # 时才 import。错误路径（--version/--help/bad_args/缺用户名/别名未配置）从
 # ~300ms 降到 ~30ms；极早期信号窗口也更短（handler 注册后只剩标准库 import）。
 
-VERSION = "1.5.15"
+VERSION = "1.5.16"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -605,6 +605,49 @@ def emit(result, header=None, sections=None, use_json=False):
             if content:
                 print(content, flush=True)
     print("---END.%s---" % _TEXT_NONCE, flush=True)
+
+
+def _emit_fields(result, field_spec):
+    """--field 消费端字段提取（成功路径）：打印顶层字段值，不打印 JSON。
+
+    - 无 - 前缀字段 -> 打进程 stdout（单字段裸值；多字段每行一个值）
+    - - 前缀字段（如 -stderr）-> 打进程 stderr（调用方 2>&1 或单独流可见，
+      不被 stdout 展示脚本吞掉——实测教训：AI 只读 stdout 字段丢了 stderr 报错）
+    - dict/list 值 JSON 序列化（如 ls 的 entries、upload 的 file_list）
+    - 值本身多行（如 stdout 内容）原样保留
+    - 字段不存在（拼错）-> stderr 提示字段名（不静默空行误导）
+    错误路径不走这里（emit_error 保持完整 JSON，AI 需要 retryable/message）。"""
+    for spec in field_spec.split(","):
+        spec = spec.strip()
+        if not spec:
+            continue
+        to_stderr = spec.startswith("-")
+        name = spec[1:] if to_stderr else spec
+        if name not in result:
+            print("[pyaissh: 字段不存在: %s（可用字段见默认 JSON 输出的键名）]" % name,
+                  file=sys.stderr, flush=True)
+            continue
+        value = result[name]
+        if isinstance(value, (dict, list)):
+            text = json.dumps(value, ensure_ascii=False)
+        elif value is None:
+            text = ""
+        else:
+            text = str(value)
+        if to_stderr:
+            print(text, file=sys.stderr, flush=True)
+        else:
+            print(text, flush=True)
+
+
+def _emit_result(args, result, header=None, sections=None):
+    """统一结果输出：--field 消费端模式打印字段；否则标准 emit（JSON / --text）。"""
+    field = getattr(args, "field", None)
+    if field:
+        _emit_fields(result, field)
+    else:
+        emit(result, header=header, sections=sections,
+             use_json=getattr(args, "json", True))
 
 
 def emit_error(use_json, error_type, message, extra=None):
@@ -2882,7 +2925,7 @@ def cmd_exec(args):
         header = "[%s]  exit_code=%d  duration=%dms" % (
             "OK" if exit_code == 0 else "EXIT %d" % exit_code, exit_code, duration)
         sections = [("STDOUT", out_s), ("STDERR", err_s)]
-        emit(result, header=header, sections=sections, use_json=args.json)
+        _emit_result(args, result, header=header, sections=sections)
         if exit_code == 255:
             # 255 保留给"连接失败"，远程真实退出码 255 时本地改返 254 以免调用方混淆
             log("[WARN] 远程退出码为 255，本地返回 254（255 保留给连接失败语义）")
@@ -3196,7 +3239,7 @@ def cmd_upload(args):
             ", 跳过 %d" % files_skipped if files_skipped else "",
             " (dry-run)" if args.dry_run else "")
         sections = [("RESULT", json.dumps(result, ensure_ascii=False))]
-        emit(result, header=header, sections=sections, use_json=args.json)
+        _emit_result(args, result, header=header, sections=sections)
         return 0
     except KeyboardInterrupt as e:
         # 中断也带清单（transferred 标记精确到文件）：AI 判断重试策略
@@ -3575,7 +3618,7 @@ def cmd_download(args):
             ", 跳过 %d" % files_skipped if files_skipped else "",
             " (dry-run)" if args.dry_run else "")
         sections = [("RESULT", json.dumps(result, ensure_ascii=False))]
-        emit(result, header=header, sections=sections, use_json=args.json)
+        _emit_result(args, result, header=header, sections=sections)
         return 0
     except KeyboardInterrupt as e:
         emit_error(args.json, "interrupted", _interrupt_msg(),
@@ -3745,7 +3788,7 @@ def cmd_test(args):
         }
         header = "[OK]  连接成功 %dms  %s@%s" % (duration, conn["user"], hostname or conn["host"])
         sections = [("INFO", json.dumps(result, ensure_ascii=False, indent=2))]
-        emit(result, header=header, sections=sections, use_json=args.json)
+        _emit_result(args, result, header=header, sections=sections)
         return 0
     except Exception as e:
         if _SIGTERM_RECEIVED:
@@ -3869,7 +3912,7 @@ def cmd_ls(args):
         }
         header = "[OK]  %d 项, %dms" % (len(items), duration)
         sections = [("LS", content)]
-        emit(result, header=header, sections=sections, use_json=args.json)
+        _emit_result(args, result, header=header, sections=sections)
         return 0
     except (socket.timeout, TimeoutError):
         if _SIGTERM_RECEIVED:
@@ -4099,6 +4142,10 @@ def build_parser():
                        help="输出纯 JSON（默认已是 JSON，保留兼容）")
         p.add_argument("--text", dest="json", action="store_false", default=argparse.SUPPRESS,
                        help="可读文本模式（默认 JSON）")
+        p.add_argument("--field", dest="field", default=argparse.SUPPRESS,
+                       help="消费端字段提取（打印值，不打印 JSON）：--field stdout 打印裸值；"
+                            "逗号分隔多字段每行一个；- 前缀字段打到 stderr（如 --field stdout,-stderr，"
+                            "stderr 内容不被 stdout 展示吞掉）；与 --text 互斥；错误路径仍输出完整 JSON")
         p.add_argument("--strict", action="store_true", help="严格校验 host key (默认 auto-add)")
         # 跳板机参数
         p.add_argument("--jump", metavar="[user@]host[:port]",
@@ -4337,6 +4384,13 @@ def main():
             emit_error(args.json if args is not None else True, "bad_args",
                        "未指定子命令（可选: exec / upload / download / test / ls）")
             parser.print_help(sys.stderr)
+            return 2
+        # --field 与 --text 互斥（--text 要可读包裹、--field 要裸字段值；
+        # --json 是兼容 no-op 不冲突）
+        if getattr(args, "field", None) and not getattr(args, "json", True):
+            emit_error(True, "bad_args",
+                       "--field 与 --text 互斥（--field 是消费端字段提取，"
+                       "--text 是可读模式；二选一）")
             return 2
         # 错误 JSON 的 action 字段：取当前子命令名（供 emit_error 统一填充）
         _CURRENT_ACTION = handler.__name__[4:] \

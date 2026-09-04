@@ -19,3 +19,15 @@
 - 不加 flag 默认 JSON（见上）；`--text` 可读模式：exec 用 `---STDOUT.<nonce>---` / `---STDERR.<nonce>---`，test 用 `---INFO.<nonce>---`，upload/download 用 `---RESULT.<nonce>---`，ls 用 `---LS.<nonce>---`；错误用 `---ERROR.<nonce>---` + 一行 JSON；都以 `---END.<nonce>---` 结尾
 - **标记带每次运行随机的 nonce 后缀**（远程输出无法预测，伪造不出有效标记）
 - **可读模式仅供人类速览，AI 直接用默认 JSON**（可读模式 exec 无 warnings，header 仅 exit_code/duration；非零退出码 header 显示 `[EXIT n]` 而非 `[OK]`）
+
+## `--field` 消费端字段提取（v1.5.16，免 json.loads 样板）
+
+- **场景**：只要结果里某字段的裸值（高频：`stdout`），不用手写 `| python -c "import json,sys; print(json.load(sys.stdin)['stdout'])"`
+- **单字段**：`--field stdout` → 打印 stdout 内容（裸值，多行原样）；exit_code 等标量转字符串
+- **多字段**：`--field exit_code,exit_success` → 每行一个值（按序）
+- **`-` 前缀 = 打到进程 stderr**：`--field stdout,-stderr` → stdout 内容打进程 stdout、stderr 字段打进程 stderr——**报错不被 stdout 展示脚本吞掉**（实测教训：AI 只读 stdout 字段丢了 stderr 报错；2>&1 或单独流都能拿到）
+- dict/list 值 JSON 序列化（`ls --field entries`、upload 的 `file_list`）
+- **字段不存在**（拼错）→ stderr 提示字段名（不静默空行误导）
+- 与 `--text` 互斥（bad_args，退出码 2）；`--json` 兼容 no-op 不冲突
+- **仅作用于成功路径**：工具错误（emit_error：连接失败/bad_args 等）仍输出**完整 JSON**（AI 需要 `retryable`/`message`）；命令非零退出是"成功路径的结果"（ok:true + exit_success:false），此时 --field 提取的是结果字段（`--field stdout,-stderr` 能拿到报错）
+- **默认契约零变化**：不用 `--field` 时 stdout 恒单行 JSON

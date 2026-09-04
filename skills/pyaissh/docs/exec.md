@@ -25,6 +25,18 @@ python3 pyaissh.py exec root@1.2.3.4 --pty --pty-strip-ansi --cmd 'watch -n 1 da
 - **exec 错误 JSON 恒带 `stdout`/`stderr`/`output_incomplete`**（可能为空串；错误路径 `output_incomplete` **恒为 true**——命令被中断输出必然不完整，区别于成功路径的超限裁剪 `output_truncated`）：空串 = 命令没跑起来或零输出，非空 = 执行到一半中断，据此决定重试策略
 - `duration_ms` **含连接耗时**（跳板机/慢网络下偏大），评估命令本身耗时请减去连接时间；错误 JSON 同样带 `duration_ms`（已运行时长）
 - **`cmd` 字段与截断**：结果 JSON 的 `cmd` 回显命令原文（含凭据需脱敏，转发前处理）；超 `CMD_ECHO_LIMIT`（8KB）时截断——`cmd` 保留头尾 + 中间省略标记、`cmd_truncated: true`、warnings 提示（完整命令见原始调用，`--cmd-file` 时为本地文件可重读）。截断只影响回显，不影响执行与凭据检测
+- **写远程脚本文件的推荐姿势**：要把脚本内容写到远端文件（如 `nm_switch.sh`、`listen.conf`）再执行时，**用 `--cmd-file -` 从 stdin 喂**（heredoc 零引号顾虑），而不是 `--cmd 'cat > x << "EOF"...'`——后者引号定界符走钢丝，`$`/反引号容易被本地 shell 先展开（实测教训）。推荐：
+```bash
+pyaissh exec root@1.2.3.4 --cmd-file - <<'EOF'
+cat > /tmp/nm_switch.sh <<'REMOTE'
+#!/bin/bash
+# $ 与反引号在这里安全（'REMOTE' 引住定界符，内容零展开）
+echo "HOME=$HOME"
+REMOTE
+bash /tmp/nm_switch.sh
+EOF
+```
+  （外层 heredoc 喂给 pyaissh 的命令脚本本身也用引住的定界符；命令含 `$`/反引号时 `--cmd-file -` 在 bash/Git Bash 下同样是首选，不只 PowerShell）
 - **Git Bash 路径**：`--cmd-file` / `--spill-dir` 与 `--local` 同款 MSYS 转换——经 `./pyaissh` 包装器（禁路径转换）时，Unix 风格路径（`/tmp/x.sh`）自动转 Windows 真实路径，不会落错位置或报 Errno 2；Linux 直接运行时原样透传
 - **`--sudo` 提权（普通用户登录时）**：`--sudo --cmd "apt update"` 自动 `sudo -S -p ''` 提权。密码来源：`--sudo-password`（空串视为未设置）> `PYAISSH_SUDO_PASSWORD` env；密码只经 SSH stdin 注入（写完即 close），**命令文本/cmd 字段/日志/远端磁盘均无密码**，`-p ''` 压掉提示符（成功路径 stderr 不含 `password for`）。**组装规则**：简单命令（无 shell 元字符）直连 `sudo -S -p '' <cmd>`——sudoers NOPASSWD 按命令匹配仍生效（`NOPASSWD: /usr/bin/apt` 对 `sudo apt update` 有效）；复合命令（`&&`/`||`/`;`/管道/重定向/`$()`/反引号/换行）→ `sudo -S -p '' bash -c '<单引号转义>'` 整链提权（`&&` 第二段同样 root）。**无密码时自动 `sudo -n` 免密探测**：免密命令直接跑；需密码立即失败不挂，且 stderr 命中 sudo 报错特征（如 `a password is required`）时 warnings 附密码配置提示；**有密码但密码错**（stderr 命中 sudo 专属报错如 `sudo: 1 incorrect password attempt`）时 warnings 提示检查密码——两种提示都只认 sudo 自己的报错（带 `sudo:` 前缀），命令自身 stderr 里的 "Sorry, try again"/"password" 等词不会误触发。`--sudo` 与 `--pty` 互斥（bad_args 退出 2）。`--cmd` 与 `--cmd-file` 两条路径统一处理。**注意**：sudo 无法执行 shell 内建命令（`--sudo --cmd 'exit 3'` 会得到误导性的 "a password is required"，因为 exit 不是可执行文件）——内建命令请外套 `bash -c`（`--sudo --cmd "bash -c 'exit 3'"`）
 - 远程退出码直接透传（255 例外：远程恰为 255 时本地返 254，见 SKILL.md 退出码表）

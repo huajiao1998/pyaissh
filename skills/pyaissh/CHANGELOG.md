@@ -179,3 +179,10 @@
 - **（v1.5.15 测试修复，配置入口与文档同步）**：① `.env.example` 补 `PYAISSH_SUDO_PASSWORD`（凭据配置第一入口此前漏了该变量——SKILL.md/exec.md 都写了，走 .env 路径的用户不知道存在，与 v1.5.11 "contract.md 缺 parallel_used" 同类问题）；② docs/setup.md 凭据段补 sudo 提权密码说明；③ docs/exec.md 的 -n 门控描述从"stderr 含 password"更新为"stderr 命中 sudo 报错特征（如 a password is required）"（二次收窄后文档滞后一轮，教 AI 依赖已收紧的判据）。
 - **（v1.5.15 文档瘦身）**：SKILL.md 14882B → **12697B**（接近 15KB 上限，密集/低频内容下放子文档）：退出码表精简为一行粗筛（完整版 errors.md 已有）、子命令示例压缩（--parallel/--resume/--encoding 等低频细节指向对应 docs）、删除"参数默认值"段（`--help` 与文档导航覆盖）、安全规则与快速开始去重、已知边界保留 3 条核心（pty 交互/sudo、host key、pkill 自杀伤）其余指向 edge-cases.md。结构与速查 10 条完整保留。
 - **（v1.5.15 测试修复，-n 门控与 -S 对称统一）**：`-n` 路径（无密码探测）提示正则补 `sudo:` 前缀要求，与 `-S` 路径同构——统一规则"sudo 提示只认 `sudo:` 前缀的报错行"（实测 sudo -n 报错恒带前缀，无漏报；命令自身 stderr 打出 "a password is required" 等不再误触发）。维护收益：两个门控行为一致，不再有"一处收窄一处宽"的隐蔽不对称（R7/R8 误报的根源模式）。单元 9 例 + 套件 12/12（T6/T7 的 -n 真机失败仍触发）。
+
+## [1.5.16] - 2026-09-05
+
+### 新增
+- **`--field` 消费端字段提取（免 json.loads 样板）**：真实使用反馈——AI 会话中手写 `| python -c "import json,sys; print(json.load(sys.stdin)['stdout'])"` 样板 15+ 次，且曾因展示脚本只打印 stdout 字段把 stderr 报错吞掉。`--field` 直接打印结果字段裸值：`--field stdout` 打印 stdout 内容；**`-` 前缀字段打到进程 stderr**（`--field stdout,-stderr`——stderr 内容经进程 stderr 返回，不被 stdout 展示吞掉）；多字段逗号分隔每行一个；dict/list 值 JSON 序列化（ls entries 等）；字段不存在打 stderr 提示（拼错可发现）；与 `--text` 互斥（bad_args）；**仅作用于成功路径**——工具错误仍输出完整 JSON（AI 需要 retryable/message）；命令非零退出是成功路径结果（--field 提取结果字段，`-stderr` 能拿到报错）；**不用 --field 时 stdout 恒 JSON 契约零变化**。实现：`add_conn` 统一注册（5 个目标类子命令通用）→ `_emit_result` 封装（有 field 走 `_emit_fields`，否则原 emit）→ 5 处成功路径 emit 改调 `_emit_result`。真机验证 10 例全过（裸值/分流/失败 stderr 可见/工具错误完整 JSON/多字段/字段不存在提示/ls entries/互斥/默认契约不变）。回归 verify_r3 54/54。
+### 文档
+- docs/exec.md 补"**写远程脚本文件的推荐姿势**"：脚本写远端文件用 `--cmd-file -` heredoc（引住定界符零展开），不要 `--cmd 'cat > x << "EOF"'` 引号走钢丝（实测教训：`$`/反引号被本地 shell 展开）；含 `$` 的远程脚本 bash/Git Bash 下 `--cmd-file -` 同样是首选（不改速查第 8 条推荐，尊重 v1.5.11 决定，仅补场景指引）。SKILL.md 输出约定段 + docs/contract.md 补 `--field` 说明。
