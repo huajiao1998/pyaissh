@@ -186,3 +186,8 @@
 - **`--field` 消费端字段提取（免 json.loads 样板）**：真实使用反馈——AI 会话中手写 `| python -c "import json,sys; print(json.load(sys.stdin)['stdout'])"` 样板 15+ 次，且曾因展示脚本只打印 stdout 字段把 stderr 报错吞掉。`--field` 直接打印结果字段裸值：`--field stdout` 打印 stdout 内容；**`-` 前缀字段打到进程 stderr**（`--field stdout,-stderr`——stderr 内容经进程 stderr 返回，不被 stdout 展示吞掉）；多字段逗号分隔每行一个；dict/list 值 JSON 序列化（ls entries 等）；字段不存在打 stderr 提示（拼错可发现）；与 `--text` 互斥（bad_args）；**仅作用于成功路径**——工具错误仍输出完整 JSON（AI 需要 retryable/message）；命令非零退出是成功路径结果（--field 提取结果字段，`-stderr` 能拿到报错）；**不用 --field 时 stdout 恒 JSON 契约零变化**。实现：`add_conn` 统一注册（5 个目标类子命令通用）→ `_emit_result` 封装（有 field 走 `_emit_fields`，否则原 emit）→ 5 处成功路径 emit 改调 `_emit_result`。真机验证 10 例全过（裸值/分流/失败 stderr 可见/工具错误完整 JSON/多字段/字段不存在提示/ls entries/互斥/默认契约不变）。回归 verify_r3 54/54。
 ### 文档
 - docs/exec.md 补"**写远程脚本文件的推荐姿势**"：脚本写远端文件用 `--cmd-file -` heredoc（引住定界符零展开），不要 `--cmd 'cat > x << "EOF"'` 引号走钢丝（实测教训：`$`/反引号被本地 shell 展开）；含 `$` 的远程脚本 bash/Git Bash 下 `--cmd-file -` 同样是首选（不改速查第 8 条推荐，尊重 v1.5.11 决定，仅补场景指引）。SKILL.md 输出约定段 + docs/contract.md 补 `--field` 说明。
+
+## [1.5.17] - 2026-09-06
+
+### 修复
+- **凭据 WARN 误报：`--no-pager` 命中"-p + 密码"形态（给开发 AI 的数据）**：`git log --no-pager` / `systemctl --no-pager` / `apt-get --no-pager` 等**高频合法命令**被误报"疑似凭据"——`no-pager` 中间的 `-pager`（`-p` 前是 `o` 非 `-`）绕过 v1.5.0 的 `(?<!-)` 防线（只挡双横线开头选项），命中紧贴形态。修复：**统一防线 `(?<![A-Za-z0-9-])`**——`-p` 作为密码选项时前字符必为空白/行首/引号，绝不可能是字母/数字/连字符，复合词中间的 `-p`（`--no-pager`、`a-px`）全部排除；三处形态（紧贴 `_P_SENS_P_ATTACH` / 引号 `_P_SENS_P_QUOTED` / 空格 `_P_SENS_P_SPACE`）统一改为引用 `_P_LOOKBEHIND_P`（一处定义防未来漂移）。验证：补充矩阵 41 例（15 真凭据全命中 + 26 不应命中含 --no-pager 全家 8 例）全过；原 L4 矩阵（verify_r3）54/54 无破坏；真机 `git log --no-pager` 零告警。

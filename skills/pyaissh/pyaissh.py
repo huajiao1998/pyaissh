@@ -121,7 +121,7 @@ except (ValueError, OSError, ImportError):
 # 时才 import。错误路径（--version/--help/bad_args/缺用户名/别名未配置）从
 # ~300ms 降到 ~30ms；极早期信号窗口也更短（handler 注册后只剩标准库 import）。
 
-VERSION = "1.5.16"
+VERSION = "1.5.17"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -250,13 +250,18 @@ _P_SENS_PASSWORD = r"passw[o0]?rd\s*[=:]\s*\S+|--password(?:\s+|=)\S+"
 _P_SENS_USER = r"--user\s+\S+:\S+"          # curl --user admin:pw 长形式
 _P_SENS_URL = r"\b[a-z][a-z0-9+.-]*://[^\s/@]+:[^\s/@]+@"   # https://user:pass@host/
 _P_SENS_ENV = r"\b\w*(?:PASS(?:WORD|WD|CODE)?|PWD)\s*[=:]\s*\S+"   # DB_PASS=x / DB_PASS: x / MYSQL_PWD=
-_P_SENS_P_QUOTED = r"-p['\"](?!\d+['\"])[^'\"]+['\"]"   # -p'secret'（排除 -p'22' 纯数字端口/ID）
+# 统一防线 (?<![A-Za-z0-9-])：-p 作为密码选项时前字符必为空白/行首/引号，
+# 绝不可能是字母/数字/连字符——连字符复合词中间的 -p（--no-pager、a-px）与
+# 词内 -p 全部排除（1.5.16 修：原 (?<!-) 只挡双横线开头，挡不住 no-pager 的 -p）
+_P_LOOKBEHIND_P = r"(?<![A-Za-z0-9-])-p"
+_P_SENS_P_QUOTED = _P_LOOKBEHIND_P + r"['\"](?!\d+['\"])[^'\"]+['\"]"   # -p'secret'（排除 -p'22' 纯数字端口/ID）
 # -psecret 紧贴形态（-p 后必须非空白，空格形态交给 _P_SENS_P_SPACE）：
 # 前缀 lookbehind 排除常见非密码工具（scp/rsync/curl/make/install/find/perl/echo/unzip/gcc/xargs/awk）
 _P_SENS_P_ATTACH = (
     r"(?<!scp )(?<!rsync )(?<!curl )(?<!make )(?<!install )"
     r"(?<!find )(?<!perl )(?<!echo )(?<!unzip )(?<!gcc )(?<!xargs )(?<!awk )"
-    r"(?<!-)-p(?!['\"]?\d+(?:['\"]|\b))(?!\s)"
+    + _P_LOOKBEHIND_P
+    + r"(?!['\"]?\d+(?:['\"]|\b))(?!\s)"
     r"(?!rin|rune|thread|pe\b|roxy|ort|ath|ass|lain)\S+"
 )
 # -p secret（空格分隔）：lookbehind 排除常见非密码工具（cp/mkdir/ls/tar/scp/rsync/curl/
@@ -268,7 +273,8 @@ _P_SENS_P_SPACE = (
     r"(?<!make )(?<!make  )(?<!install )(?<!install  )"
     r"(?<!unzip )(?<!unzip  )(?<!pytest )(?<!pytest  )(?<!awk )(?<!awk  )"
     r"(?<!xargs )(?<!xargs  )(?<!wget )(?<!wget  )"
-    r"-p\s+(?!\d+\b)(?!--)(?!-)(?!proxy\b|roxy\b|port\b|path\b|pass\b|plain\b|"
+    + _P_LOOKBEHIND_P
+    + r"\s+(?!\d+\b)(?!--)(?!-)(?!proxy\b|roxy\b|port\b|path\b|pass\b|plain\b|"
     r"log\b|diff\b|show\b|status\b|add\b|commit\b|clone\b|pull\b|push\b|remote\b|"
     r"branch\b|checkout\b|merge\b|tag\b|stash\b|init\b|config\b|fetch\b|rebase\b|"
     r"reset\b|rm\b|mv\b|help\b|version\b|verbose\b|git\b|docker\b|nmap\b|"
@@ -293,6 +299,8 @@ _SENSITIVE_CMD_RE = re.compile(
 #   https://user:pass@host/ / DB_PASS=abc / MYSQL_PWD=abc  URL/环境变量
 # 不应命中（工具 flag/端口/路径，历史误报点）：
 #   --profile x / --parallel 4 / --progress        双横线长选项（1.5.0 修）
+#   --no-pager / --no-color / --dry-run           复合长选项词中 -p（1.5.16 修：
+#     (?<![A-Za-z0-9-]) 统一防线——-p 密码选项前必空白/行首，词中/复合词 -p 全挡）
 #   -p 22 / -p'22' / -p123456 / ssh -p 22 root@h   纯数字端口/ID
 #   mkdir -p a/b / tar -p x / cp -p a b / gcc -pthread  工具 -p
 #   rsync -p /x / wget -p https://... / pytest -p x     路径/参数
