@@ -15,7 +15,7 @@
   3) unit_artifacts    制品结构（域边界横幅 11 + 域 docstring 代码地图 + VERSION 一致）
   4) live_sudo         --sudo 提权 12 例（真机）
   5) live_exec_field   exec 12 + --field 7 例（真机）
-  6) live_transfer     传输往返 3 例（真机）
+  6) live_transfer     传输往返 6 例（真机：默认/--parallel/--resume）
 
 本文件代码地图（改测试先看这里；维护记录见 tests/CHANGELOG.md）：
   [框架]      _module()  被测模块加载（PYAISSH_PY / 缺省根）
@@ -535,7 +535,7 @@ SUITES = [
     ("unit_artifacts", "制品结构 6 例（域横幅/代码地图/VERSION）", suite_unit_artifacts),
     ("live_sudo", "--sudo 提权 12 例（真机）", suite_live_sudo),
     ("live_exec_field", "exec 12 + --field 7 例（真机）", suite_live_exec_field),
-    ("live_transfer", "传输往返 3 例（真机）", suite_live_transfer),
+    ("live_transfer", "传输往返 6 例（真机：默认/--parallel/--resume）", suite_live_transfer),
 ]
 
 
