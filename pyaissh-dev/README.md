@@ -39,11 +39,23 @@
 - `build_single.py check`：金标对比（built vs 指定单文件）+ 编译
 - `MANIFEST_domains.txt`：域文件顺序（显式，非 import 拓扑；顺序尊重顶层执行语义——00 含极早期信号、04 含 console/emit 模块级执行点）
 
-## 测试映射
+## 测试（统一入口 tests/run_tests.py）
 
-| 测试 | 位置 | 覆盖 |
-|---|---|---|
-| verify_r3 | 主仓库 stest_tmp（gitignore）| L4 凭据矩阵/parse_target/编码/stdin 等 54 例 |
-| v515_sudo_verify | 同上 | --sudo 12 例真机 |
-| v516_field_verify | 同上 | --field 10 例真机 |
-| v2_compare(_a) | 同上 | 重构前后行为对比（双机）|
+测试体系已重建为**单文件 + 版本管理 + 脱敏**（凭据零硬编码，live 走 `PYAISSH_TEST_*` env）。
+维护规矩：改测试先追加 `tests/CHANGELOG.md`。
+
+```bash
+python tests/run_tests.py                 # 交互菜单选集；--all/--unit/--sudo/--exec/--transfer/--artifacts
+```
+
+| 测试集 | 例数 | 覆盖 | 位置 |
+|---|---|---|---|
+| unit_regression | 54 | 凭据矩阵/parse_target/编码/stdin | tests/run_tests.py |
+| unit_credential | 41 | 凭据启发式误报/漏报 | 同上 |
+| unit_artifacts | 6 | 制品结构（域横幅/代码地图/VERSION 一致）| 同上 |
+| live_sudo | 12 | --sudo 真机（需 tester 用户 env）| 同上 |
+| live_exec_field | 19 | exec 行为 + --field 真机 | 同上 |
+| live_transfer | 3 | 传输往返真机 | 同上 |
+
+测 dev built 产物：`PYAISSH_PY=<pyaissh.built.py> python tests/run_tests.py --unit`；
+live 测任意产物：`PYAISSH_BIN=<pyaissh.py> python tests/run_tests.py --exec`。
