@@ -2,6 +2,10 @@
 
 **给 AI 用的结构化 SSH 工具 — A structured SSH tool built for AI agents**
 
+当前版本：**v2.0.0**（行为与 v1.5.19 完全一致的代码结构重构——源码 12 域模块化开发 + 构建合成单文件分发，见 CHANGELOG）
+
+**Current version: v2.0.0** — behavior-identical restructuring of v1.5.19 (12-domain modular dev source, single-file build for distribution; see CHANGELOG).
+
 裸 `ssh` 给 AI 用有四个坑：
 
 > ① **输出不可解析**——人类文本要正则猜，AI 解析又慢又错
@@ -15,6 +19,8 @@ Raw `ssh` has four pain points when used by AI agents: **unparseable output**, *
 
 ```bash
 pyaissh exec root@1.2.3.4 --cmd 'uname -a'
+pyaissh exec user@1.2.3.4 --sudo --cmd 'apt-get update'    # 普通用户登录 + sudo 提权
+pyaissh exec root@1.2.3.4 --cmd 'echo hi' --field stdout   # 只要 stdout（裸值，进程 stderr 无噪音）
 pyaissh upload root@1.2.3.4 --local ./dist --remote /opt/app/dist
 pyaissh upload root@1.2.3.4 --local big.bin --remote /tmp/big.bin --parallel 8   # 高丢包/长 RTT 链路分片上传（收益随链路而定）
 pyaissh download root@1.2.3.4 --remote big.tar.gz --local . --parallel 8
@@ -26,10 +32,13 @@ pyaissh ls root@1.2.3.4 --path /etc --long
 
 | 能力 | 说明 | Capability |
 |---|---|---|
-| 🧭 结构化契约 | stdout 恒单行 JSON（`--help` 纯文本除外），直接 `json.loads`；24 类错误类型 + `retryable` 机器可读重试建议 | Structured contract: single-line JSON (except `--help`) + typed errors with machine-readable retry hints |
+| 🧭 结构化契约 | stdout 恒单行 JSON（`--help` 纯文本除外），直接 `json.loads`；20+ 类型化错误 + `retryable` 机器可读重试建议（完整表见 `skills/pyaissh/docs/errors.md`）| Structured contract: single-line JSON (except `--help`) + typed errors with machine-readable retry hints |
+| 🔍 `--field` 字段提取 | `--field stdout,-stderr` 直接消费单字段（裸值到 stdout/stderr，多字段每行一个）——省去 `json.loads` 样板；工具错误仍完整 JSON | Field extraction: consume one field at a time without JSON boilerplate; tool errors still return full JSON |
+| ⚙️ `--sudo` 提权 | 普通用户登录 + `--sudo` 提权执行（`--sudo-password` / `PYAISSH_SUDO_PASSWORD`；无密码自动免密探测），命令整链提权 | Sudo elevation for normal-user logins (password via flag/env; NOPASSWD auto-detected) |
 | 🛡 防挂死 | 三重超时（静默/总时长/看门狗）——AI 调它永远不会卡死 | Triple timeout protection — never hangs |
 | 🔄 可靠传输 | `.part` 原子写 + `--resume` 断点续传 + **并行分片下载/上传**（`--parallel 1-8`）+ `file_list` 断点重试 | Atomic transfer + resumable upload/download + **parallel-sharded upload & download** + retryable file lists |
 | 🔋 零 token 传输 | 文件内容从不回传 JSON——AI 只消费元数据，大文件不烧上下文 | Zero-token transfer: file content never enters the LLM context |
+| 🔤 `--encoding` | exec/test 输出按指定字符集解码（如 GBK）——处理非 UTF-8 服务器 | Specify output decoding charset (e.g. GBK) for non-UTF-8 servers |
 | ⚡ 快速启动 | paramiko 惰性 import——错误路径启动 296ms → 110ms | Lazy import: error paths start 2.7× faster |
 | 🔗 网络能力 | 跳板机（共享隧道）、主机别名（@名称）、IPv6 | Jump hosts, host aliases, IPv6 |
 | 🖥 跨平台 | Windows / Linux / macOS（含 Git Bash 路径转换） | Cross-platform incl. Git Bash path handling |
@@ -124,9 +133,9 @@ Full skill docs: `skills/pyaissh/SKILL.md` + `skills/pyaissh/docs/`. Changelog: 
 
 ## 工程可信度 / Engineering rigor
 
-每个版本都经**真实服务器**验证（真机执行 + md5 校验 + 中断/超时/信号测试），验证记录见 `CHANGELOG.md`（如 v1.5.6 retryable 11 例、v1.5.8 上传分片 50MB md5 一致）。
+每个版本都经**真实服务器**验证（真机执行 + md5 校验 + 中断/超时/信号测试）；v2.0.0 重构经**双机行为一致性对比**（33 用例 JSON 逐字段一致）。验证记录见 `CHANGELOG.md`。
 
-Every release is verified against **real servers** (real execution + md5 checks + interrupt/timeout/signal tests); verification records are in `CHANGELOG.md`.
+Every release is verified against **real servers** (real execution + md5 checks + interrupt/timeout/signal tests); the v2.0.0 restructuring passed **two-machine behavior-identity comparison** (33 cases, field-by-field JSON match). Verification records are in `CHANGELOG.md`.
 
 ## License
 
