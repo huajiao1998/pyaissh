@@ -2,13 +2,15 @@
 
 全部测试集内联在 **`tests/run_tests.py`** 一个文件里，运行时选择要跑的集。
 脱敏：文件内**零硬编码**（无服务器 IP/密码/token）——live 凭据走环境变量。
+维护记录/变更史：`tests/CHANGELOG.md`（修了哪些问题、加了哪些集都在那）。
 
 ## 运行
 
 ```bash
-python tests/run_tests.py                # 交互菜单（数字选 1-5 / 0 全部）
+python tests/run_tests.py                # 交互菜单（数字选 1-6 / 0 全部）
 python tests/run_tests.py --all          # 全量：unit 先、live 后
 python tests/run_tests.py --unit         # 仅单元（无网络，任何机器可跑）
+python tests/run_tests.py --artifacts    # 仅制品结构集
 python tests/run_tests.py --sudo         # 仅 sudo 集
 python tests/run_tests.py --exec         # 仅 exec+field 集
 python tests/run_tests.py --transfer     # 仅传输集
@@ -21,9 +23,10 @@ python tests/run_tests.py --list         # 列出测试集
 |---|---|---|---|
 | 1 | unit_regression | 54 | 凭据矩阵（L4）/ parse_target（N10）/ 编码机制（M1）/ 契约单元 |
 | 2 | unit_credential | 41 | 凭据启发式：真凭据命中 + 工具 flag 不误报 |
-| 3 | live_sudo | 12 | --sudo 提权/整链/NOPASSWD/失败提示/互斥（真机）|
-| 4 | live_exec_field | 19 | exec 行为 + --field 消费端（真机）|
-| 5 | live_transfer | 3 | 传输往返字节一致 + --parallel（真机）|
+| 3 | unit_artifacts | 6 | 制品结构：域边界横幅 11 + docstring 代码地图 + VERSION 一致 |
+| 4 | live_sudo | 12 | --sudo 提权/整链/NOPASSWD/失败提示/互斥（真机）|
+| 5 | live_exec_field | 19 | exec 行为 + --field 消费端（真机）|
+| 6 | live_transfer | 3 | 传输往返字节一致 + --parallel（真机）|
 
 ## live 凭据（脱敏，不入库）
 

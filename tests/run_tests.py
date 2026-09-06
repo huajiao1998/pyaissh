@@ -5,16 +5,30 @@
   python tests/run_tests.py               交互菜单（数字选集）
   python tests/run_tests.py --all         全量：unit 先、live 后
   python tests/run_tests.py --unit        仅单元（无网络）
+  python tests/run_tests.py --artifacts   仅制品结构集（域横幅/代码地图）
   python tests/run_tests.py --sudo --exec --transfer  指定 live 集
   python tests/run_tests.py --list        列出测试集
 
 测试集：
   1) unit_regression   回归 54 例   （凭据矩阵/parse_target/编码/stdin）
   2) unit_credential   凭据启发式 41 例
-  3) live_sudo         --sudo 提权 12 例（真机）
-  4) live_exec_field   exec 12 + --field 7 例（真机）
-  5) live_transfer     传输往返 3 例（真机）
+  3) unit_artifacts    制品结构（域边界横幅 11 + 域 docstring 代码地图 + VERSION 一致）
+  4) live_sudo         --sudo 提权 12 例（真机）
+  5) live_exec_field   exec 12 + --field 7 例（真机）
+  6) live_transfer     传输往返 3 例（真机）
 
+本文件代码地图（改测试先看这里；维护记录见 tests/CHANGELOG.md）：
+  [框架]      _module()  被测模块加载（PYAISSH_PY / 缺省根）
+              _bin()     live 被测二进制（PYAISSH_BIN / 缺省根）
+              _Suite     断言运行器（check/计数/result）
+              _live_run/_live_sub/_last_json/_live_host/_missing_env
+  [unit 集]   suite_unit_regression  回归 54 例（verify_r3 迁入）
+              suite_unit_credential  凭据启发式 41 例
+              suite_unit_artifacts   制品结构：域横幅/代码地图/VERSION
+  [live 集]   suite_live_sudo        --sudo 12 例（真机）
+              suite_live_exec_field  exec+field 19 例（真机）
+              suite_live_transfer    传输 3 例（真机）
+  [CLI]       SUITES/_run_suite/_interactive/main
 脱敏：live 凭据一律 env（PYAISSH_TEST_*），本文件零硬编码。
 被测目标：env PYAISSH_PY（unit importlib）/ PYAISSH_BIN（live 子进程）；缺省仓库根。
 """
@@ -271,7 +285,48 @@ def suite_unit_credential(s):
 
 
 # ============================================================
-# 测试集 3：live --sudo 提权 12 例
+# 测试集 3：unit 制品结构（构建产物可读性——域边界横幅 / 域 docstring
+#           代码地图 / VERSION 一致性；防构建器退化）
+# ============================================================
+
+def suite_unit_artifacts(s):
+    m = _module()
+    src_path = getattr(m, "__file__", None)
+    if not src_path or not os.path.exists(src_path):
+        s.check("可读被测源码文件", False, "module.__file__ 不可用: %r" % src_path)
+        return
+    text = open(src_path, encoding="utf-8", errors="replace").read()
+    lines = text.splitlines()
+
+    # 域边界横幅：11 个（域 01..11，00=文件头无横幅）+ 有序 + 带标题
+    banners = re.findall(r"# =+ \[域 (\d+)/12\]", text)
+    s.check("域横幅 11 个", len(banners) == 11, "got %d: %r" % (len(banners), banners))
+    s.check("域横幅序 01..11", banners == ["%02d" % i for i in range(1, 12)],
+            "got %r" % banners)
+    titled = re.findall(r"# =+ \[域 \d+/12\]\s+([^=]+?)\s+=+", text)
+    s.check("横幅标题非空", len(titled) == 11 and all(t.strip() for t in titled),
+            "got %d 标题" % len(titled))
+
+    # 域 docstring 代码地图：每个横幅后紧跟本域 docstring（""" 开头）
+    ok_doc = 0
+    for i, ln in enumerate(lines):
+        if re.match(r"# =+ \[域 \d+/12\]", ln):
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            if nxt.lstrip().startswith('"""'):
+                ok_doc += 1
+    s.check("横幅后跟域 docstring", ok_doc == 11, "got %d/11" % ok_doc)
+    # 代码地图 docstring 分区总数（文件头 docstring + 11 域 docstring ≥ 12）
+    heads = sum(1 for ln in lines if ln.lstrip().startswith('"""'))
+    s.check("docstring 分区 ≥12", heads >= 12, "got %d" % heads)
+
+    # VERSION：源码文本与模块一致（防单文件漂移）
+    vm = re.search(r'VERSION = "([^"]+)"', text)
+    s.check("VERSION 一致", bool(vm) and vm.group(1) == m.VERSION,
+            "src=%r module=%r" % (vm.group(1) if vm else None, m.VERSION))
+
+
+# ============================================================
+# 测试集 4：live --sudo 提权 12 例
 # ============================================================
 
 _REQ_SUDO = ["PYAISSH_TEST_HOST", "PYAISSH_TEST_SUDO_USER", "PYAISSH_TEST_SUDO_PASSWORD",
@@ -439,6 +494,7 @@ def suite_live_transfer(s):
 SUITES = [
     ("unit_regression", "回归 54 例（凭据矩阵/parse_target/编码/stdin）", suite_unit_regression),
     ("unit_credential", "凭据启发式 41 例", suite_unit_credential),
+    ("unit_artifacts", "制品结构 6 例（域横幅/代码地图/VERSION）", suite_unit_artifacts),
     ("live_sudo", "--sudo 提权 12 例（真机）", suite_live_sudo),
     ("live_exec_field", "exec 12 + --field 7 例（真机）", suite_live_exec_field),
     ("live_transfer", "传输往返 3 例（真机）", suite_live_transfer),
@@ -483,6 +539,7 @@ def main():
     ap = argparse.ArgumentParser(description="pyaissh 统一测试（单文件）")
     ap.add_argument("--all", action="store_true", help="全量")
     ap.add_argument("--unit", action="store_true", help="仅单元集")
+    ap.add_argument("--artifacts", action="store_true", help="仅制品结构集")
     ap.add_argument("--sudo", action="store_true")
     ap.add_argument("--exec", action="store_true")
     ap.add_argument("--transfer", action="store_true")
@@ -496,15 +553,17 @@ def main():
     if a.all:
         order = list(range(len(SUITES)))
     elif a.unit:
-        order = [0, 1]
+        order = [0, 1, 2]
+    elif a.artifacts:
+        order = [2]
     elif a.sudo or a.exec or a.transfer:
         order = []
         if a.sudo:
-            order.append(2)
-        if a.exec:
             order.append(3)
-        if a.transfer:
+        if a.exec:
             order.append(4)
+        if a.transfer:
+            order.append(5)
     else:
         order = _interactive()
         if order is None:
