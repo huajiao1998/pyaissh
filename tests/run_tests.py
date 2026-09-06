@@ -462,11 +462,15 @@ def suite_live_transfer(s):
     tgt = _live_host()
     local = os.path.join(_REPO, "tests", "_tmp_xfer.bin")
     dl = os.path.join(_REPO, "tests", "_tmp_xfer_dl.bin")
+    part = dl + ".part"
     with open(local, "wb") as f:
         f.write(os.urandom(300000))
+    # T1 默认上传往返
     rc, j, _ = _live_run(["upload", tgt, "--local", local, "--remote", "/tmp/_t_xfer.bin"],
                          timeout=300)
-    s.check("upload 300KB", j and j.get("ok") is True and j.get("bytes_transferred") == 300000)
+    s.check("upload 300KB", j and j.get("ok") is True
+            and j.get("bytes_transferred") == 300000)
+    # T2 默认下载字节一致
     if os.path.exists(dl):
         os.remove(dl)
     rc, j, _ = _live_run(["download", tgt, "--remote", "/tmp/_t_xfer.bin", "--local", dl],
@@ -474,6 +478,7 @@ def suite_live_transfer(s):
     ok_dl = j and j.get("ok") is True and os.path.exists(dl) \
         and open(dl, "rb").read() == open(local, "rb").read()
     s.check("download 往返字节一致", ok_dl)
+    # T3 download --parallel 4（并行分片往返 + parallel_used 回显）
     if os.path.exists(dl):
         os.remove(dl)
     rc, j, _ = _live_run(["download", tgt, "--remote", "/tmp/_t_xfer.bin", "--local", dl,
@@ -481,10 +486,43 @@ def suite_live_transfer(s):
     ok_par = j and j.get("ok") is True and j.get("parallel_used") == 4 \
         and os.path.exists(dl) and open(dl, "rb").read() == open(local, "rb").read()
     s.check("download --parallel 4", ok_par)
-    _live_run(["exec", tgt, "--cmd", "rm -f /tmp/_t_xfer.bin"])
-    os.remove(local)
+    # T4 upload --parallel 4（并行上传往返：bytes + parallel_used + 远端大小一致）
+    rc, j, _ = _live_run(["upload", tgt, "--local", local, "--remote", "/tmp/_t_xfer_par.bin",
+                          "--parallel", "4"], timeout=300)
+    ok_up = j and j.get("ok") is True and j.get("bytes_transferred") == 300000 \
+        and j.get("parallel_used") == 4
+    if ok_up:
+        rc, j2, _ = _live_run(["exec", tgt, "--cmd",
+                               "stat -c %s /tmp/_t_xfer_par.bin 2>/dev/null || wc -c < /tmp/_t_xfer_par.bin"])
+        ok_up = j2 and j2.get("exit_success") and "300000" in j2.get("stdout", "")
+    s.check("upload --parallel 4", ok_up)
+    # T5 download --resume 断点续传往返：伪造 local.part(前 40%) → 应从断点续传完成
+    #    （resume 模式续传点固定名 local+".part"，见 _sftp_get_resume 语义）
+    src_bytes = open(local, "rb").read()
+    head = src_bytes[:len(src_bytes) * 2 // 5]
+    if os.path.exists(part):
+        os.remove(part)
+    with open(part, "wb") as f:
+        f.write(head)
     if os.path.exists(dl):
         os.remove(dl)
+    rc, j, pstderr = _live_run(["download", tgt, "--remote", "/tmp/_t_xfer.bin",
+                                "--local", dl, "--resume"], timeout=300)
+    ok_res = j and j.get("ok") is True and os.path.exists(dl) \
+        and open(dl, "rb").read() == src_bytes
+    s.check("download --resume 往返字节一致", ok_res)
+    if ok_res:
+        # 续传证据：stderr 出现 [RESUME] 续传日志（JSON bytes_transferred = 文件全量
+        # 非增量，语义见 cmd_download；续传事实以日志佐证）
+        s.check("download --resume 续传日志", "RESUME" in pstderr
+                or "从断点继续" in pstderr or "续传" in pstderr,
+                "stderr 无续传标记: %r" % pstderr[:160])
+    # 远端 + 本地清理
+    _live_run(["exec", tgt, "--cmd", "rm -f /tmp/_t_xfer.bin /tmp/_t_xfer_par.bin"])
+    os.remove(local)
+    for p in (dl, part):
+        if os.path.exists(p):
+            os.remove(p)
 
 
 # ============================================================

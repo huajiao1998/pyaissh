@@ -29,7 +29,7 @@ python tests/run_tests.py --list         # 列出测试集
 | 3 | unit_artifacts | 6 | 制品结构：域边界横幅 11 + docstring 代码地图 + VERSION 一致 |
 | 4 | live_sudo | 12 | --sudo 提权/整链/NOPASSWD/失败提示/互斥（真机）|
 | 5 | live_exec_field | 19 | exec 行为 + --field 消费端（真机）|
-| 6 | live_transfer | 3 | 传输往返字节一致 + --parallel（真机）|
+| 6 | live_transfer | 6 | 传输往返：默认/`--parallel 4` 上下行 + `--resume` 断点续传 |
 
 ## live 凭据（脱敏，不入库）
 

@@ -3,6 +3,16 @@
 > 记录：修了哪些问题、加了哪些测试集、后续计划。**只追加不覆盖**，日期先核实。
 > 测试集清单总览见 README.md；新增集流程见文末。
 
+## [2026-09-06] live_transfer 补 --parallel 上传与 --resume 续传用例（3 → 6 例）
+
+### 新增
+- **T4 upload --parallel 4**：并行上传往返——bytes_transferred + parallel_used==4 + 远端大小核对（exec stat/wc）
+- **T5 download --resume 断点续传往返**：伪造本地续传点 `<dl>.part`（前 40%，resume 模式固定名 `local+".part"` 见 `_sftp_get_resume`）→ 下载完成且字节一致
+- **T6 download --resume 续传日志**：stderr 出现 [RESUME]/续传标记佐证真实续传（JSON `bytes_transferred` = 文件全量非增量，不能用它断言——已记录此语义坑）
+
+### 修的问题
+- 初版用 `bytes_transferred < 全量` 断言增量续传 → FAIL：该字段语义是文件总字节。改为 stderr 续传日志佐证（注释记录原因，防后人再踩）
+
 ## [2026-09-06] 单文件化 + 制品结构集 + 本记录文件
 
 ### 新增
