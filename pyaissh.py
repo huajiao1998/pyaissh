@@ -121,7 +121,17 @@ except (ValueError, OSError, ImportError):
 # 时才 import。错误路径（--version/--help/bad_args/缺用户名/别名未配置）从
 # ~300ms 降到 ~30ms；极早期信号窗口也更短（handler 注册后只剩标准库 import）。
 
-VERSION = "1.5.19"
+
+# ================= [域 01/12] 全局常量与可变状态容器 ================= 
+"""全局常量与可变状态容器（域 01）。
+
+- 超时/轮询/缓冲上限常量（MAX_TIME_CAP / PARALLEL_MIN_SIZE / SFTP_IO_TIMEOUT ...）
+- _RETRYABLE_ERRORS：错误类型 -> 是否可重试（emit_error 用它给 retryable 字段）
+- 模块级可变容器：_ACTIVE_TRANSPORTS（活动连接）、_PUT_RESIDUE_WARNINGS（.part 残留警告）
+被 00_head（信号区）、各 cmd_*（超时/常量）引用；拼接后与本包其余域同模块共享命名空间。
+"""
+
+VERSION = "2.0.0"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -235,6 +245,17 @@ _RETRYABLE_ERRORS = {
     "exec_idle_timeout", "exec_total_timeout", "exec_timeout",
 }
 
+
+# ================= [域 02/12] 凭据启发式正则 ================= 
+"""凭据启发式正则（域 02）——"疑似凭据"WARN 的判定源。
+
+- 模式全家 _P_SENS_*（password=/--password/-p'xxx'/-psecret/-p secret/URL 凭据/env 凭据/mysql/curl）
+- 统一防线 _P_LOOKBEHIND_P（(?<![A-Za-z0-9-])-p：词中 -p 全排除，1.5.17 修 --no-pager）
+- _SENSITIVE_CMD_RE 组合入口 + 验收注释矩阵（改模式必过矩阵）
+- _ANSI_RE / _RE_WIN_ILLEGAL
+被 05_util.warn_sensitive_cmd 调用（凭据 WARN 落在 log/结果）。
+"""
+
 # --- 正则模式（模块级编译一次；片段化让每个分支可独立注释/测试） ---
 _RE_IPV4 = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
 _RE_IPV6_SEG = re.compile(r"[0-9a-fA-F]{1,4}")
@@ -310,6 +331,16 @@ _SENSITIVE_CMD_RE = re.compile(
 
 _ANSI_RE = re.compile(r"\x1b\][^\x07]*\x07|\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][0-9A-Za-z]|\x1b.")
 
+
+
+# ================= [域 03/12] 配置与路径层 ================= 
+"""配置与路径层（域 03）。
+
+- .env 解析/加载（load_env：技能目录 .env 自动加载、工作目录需 PYAISSH_ALLOW_CWD_ENV=1）
+- MSYS/Git Bash 路径修复：_fix_msys_local_path / _fix_msys_remote_path（含 ~ 展开逆转）
+- 远端路径规范化：_normalize_remote_path（~ 展开 / 去尾斜杠 / glob 拒绝）
+被 06_conn（解析）、各 cmd_*（--local/--remote/--cmd-file 路径）调用。
+"""
 
 def _safe_int(value, default, name="端口"):
     """安全把字符串/数字转成 int，失败返回 default 并不抛异常。"""
@@ -530,6 +561,18 @@ _MSYS_PRIVATE_GLOB = set(map(chr, range(0xF000, 0xF8FF)))  # PUA 区（MSYS 常�
 # 输出系统：日志 -> stderr，结果 -> stdout
 # =========================================================================
 
+
+# ================= [域 04/12] 控制台与输出层 ================= 
+"""控制台与输出层（域 04）。
+
+- _setup_console_utf8()：Windows 控制台 UTF-8（模块级调用 + main 幂等）
+- _QUIET / log()：进度日志（stderr；--field 静音模式只放 [WARN] 信号，1.5.19）
+- 结果输出：emit（JSON/--text）、_emit_result（--field 分流）、_emit_fields（字段提取+
+  stderr 盲区提示）、emit_error（错误完整 JSON）
+- 异常基类 SshError / ExecIdleTimeout / ExecTotalTimeout
+被所有 cmd_*（输出/报错）调用；log/emit 的语义契约见 SKILL.md 输出约定。
+"""
+
 def _setup_console_utf8():
     """Windows 下解决中文乱码。
 
@@ -727,6 +770,17 @@ def _interrupt_msg():
 # =========================================================================
 # 辅助函数
 # =========================================================================
+
+
+# ================= [域 05/12] 通用工具与字符串/缓冲处理 ================= 
+"""通用工具与字符串/缓冲处理（域 05）。
+
+- 截断：_truncate_output（保留头尾+省略标记）/ _utf8_boundary_cut / _truncate_cmd
+- _shell_escape_hint（转义建议，--sudo 场景抑制）、warn_sensitive_cmd（调用 02 正则）
+- _clean_pty_text / _strip_ansi（ANSI 清理）、_sanitize_log_text
+- spill 落盘 _spill_writers/_close_spill（截断时完整输出留文件）
+被 exec 会话（08）与输出层（04）调用。
+"""
 
 class SshError(Exception):
     """pyaissh 内部错误（携带 error_type 用于结构化输出）"""
@@ -968,6 +1022,16 @@ def _close_spill(fh, path, keep):
         except OSError:
             pass
 
+
+
+# ================= [域 06/12] 连接层：目标解析 -> 认证 -> 建连 ================= 
+"""连接层（域 06）：目标解析 -> 认证 -> 建连。
+
+- parse_target（[user@]host[:port]/IPv6/别名 @名称）、_alias_env
+- resolve_conn / resolve_jump（凭据优先级：参数 > env > 默认私钥；跳板回落）
+- _do_connect（paramiko 惰性 import + host key AutoAddPolicy 缓存）、connect / close_all
+被 cmd_* 的连接段（编排 cmd_* 调 resolve_conn/connect）调用。
+"""
 
 def parse_target(target):
     """解析 [user@]host[:port] -> (user, host, port)，未指定部分返回 None。
@@ -1570,6 +1634,18 @@ def _make_sftp_touch(sftp):
         sftp._pyaissh_last_activity = time.time()
     return _cb
 
+
+
+# ================= [域 07/12] SFTP 传输层：上传/下载的底层原语 ================= 
+"""SFTP 传输层（域 07）：上传/下载的底层原语。
+
+- open_sftp（惰性 + 看门狗）、_sftp_watchdog（30s 静默保活）
+- 并行分片：_parallel_fetch / _parallel_put（多连接，高丢包链路提速）
+- 原子性：_sftp_atomic_rename（posix-rename 或退化）、_sftp_put_atomic、.part 机制
+- 断点：_sftp_get_resume / _remote_size_is、sftp_makedirs / sftp_walk
+- _win_safe_rel_path（Windows 文件名安全化）、_transfer_extra（失败进度上下文）
+被 cmd_upload/cmd_download（09）调用。
+"""
 
 def _sftp_watchdog(sftp):
     """SFTP 看门狗线程：超过 io_timeout 无数据传输则强制断开。
@@ -2354,7 +2430,25 @@ def _win_safe_rel_path(rel, used, warnings):
     return safe_rel
 
 
-def cmd_exec(args):
+
+# ================= [域 08/12] exec 子命令实现 ================= 
+"""exec 子命令实现（域 08）——cmd_exec 编排 + 三段函数。
+
+- cmd_exec：编排（前置 -> 连接 -> 会话）
+- _prepare_exec_command：组装段（命令加载/校验/sudo 组装，哨兵返回）
+- _connect_exec：连接段（连接+跳板，错误映射+信号归位）
+- _exec_session：执行会话（凭据检测 -> exec_command+stdin 注入 -> 并发读线程 ->
+  drain/排水 -> 结果组装/异常映射；内嵌闭包 _partial_extra/_read/_drain_rest）
+超时/截断/spill/--field 语义见 SKILL.md 与 docs/exec.md。
+"""
+
+def _prepare_exec_command(args):
+    """exec 前置（无连接副作用）：加载/校验命令 + --sudo 组装。
+
+    返回 (cmd, warnings, sudo_pw) 成功；
+    失败返回 (None, (error_type, message, warnings))——错误输出由 cmd_exec 处理。
+    等价搬移自 cmd_exec 原头部（校验快速失败 + sudo 组装），行为零变化。
+    """
     start = time.time()  # 计时含连接耗时：duration_ms 在跳板/慢网络下偏大
 
     warnings = []  # 汇总警告（函数体最前初始化：成功/异常路径都能取到）
@@ -2385,16 +2479,13 @@ def cmd_exec(args):
         except KeyboardInterrupt:
             raise  # 中断走 main 的 interrupted/130
         except Exception as e:
-            emit_error(args.json, "read_cmd_failed", str(e))
-            return 2  # 本地参数/文件问题，与 bad_args 同级；1 会与"远程退出码 1"混淆
+            return None, ("read_cmd_failed", str(e), warnings)  # 本地参数/文件问题，由 cmd_exec 输出
     if not cmd or not cmd.strip():
-        emit_error(args.json, "bad_args", "未指定命令（--cmd 或 --cmd-file）")
-        return 2
+        return None, ("bad_args", "未指定命令（--cmd 或 --cmd-file）", warnings)
     if args.max_time is not None and args.max_time < args.exec_timeout:
-        emit_error(args.json, "bad_args",
-                   "--max-time (%d) 不能小于 --idle-timeout (%d)（总时长上限必须覆盖静默窗口）"
-                   % (args.max_time, args.exec_timeout))
-        return 2
+        return None, ("bad_args",
+                      "--max-time (%d) 不能小于 --idle-timeout (%d)（总时长上限必须覆盖静默窗口）"
+                      % (args.max_time, args.exec_timeout), warnings)
 
     # --sudo 提权组装：
     #  - 复合命令（含 &&/||/;/管道/重定向/$()/反引号/换行）→ bash -c 包裹整链提权
@@ -2411,9 +2502,8 @@ def cmd_exec(args):
                else os.environ.get("PYAISSH_SUDO_PASSWORD")) if args.sudo else None
     if args.sudo:
         if args.pty:
-            emit_error(args.json, "bad_args",
-                       "--sudo 与 --pty 互斥（sudo -S 走 stdin 管道而非 pty）")
-            return 2
+            return None, ("bad_args",
+                          "--sudo 与 --pty 互斥（sudo -S 走 stdin 管道而非 pty）", warnings)
         if re.search(r"[\$`\n;|&><]|\(|\)", cmd):
             qcmd = cmd.replace("'", "'\\''")
             cmd = ("sudo -S -p '' bash -c '%s'" % qcmd) if sudo_pw \
@@ -2421,26 +2511,45 @@ def cmd_exec(args):
         else:
             cmd = ("sudo -S -p '' %s" % cmd) if sudo_pw else ("sudo -n %s" % cmd)
 
+    return cmd, warnings, sudo_pw, orig_cmd
+
+
+
+def _connect_exec(args):
+    """连接目标（含跳板解析）；成功返回 (conn, client, None)；失败已 emit，返回 (None, None, 退出码)。
+
+    与原 cmd_exec 连接 try 逐语句等价（SshError 带信号归位 / bad_args 特判 / 兜底 connection_failed）。
+    """
     try:
         conn = resolve_conn(args)
         client = connect(conn, resolve_jump(args, conn["user"]))
+        return conn, client, None
     except SshError as e:
         if _SIGTERM_RECEIVED:
             # 连接期收到信号（transport 未注册，响应线程救了也来不及救）：按标志归位中断
             emit_error(args.json, "interrupted", _interrupt_msg(),
                        extra=_conn_extra(locals().get("conn")))
-            return 130
+            return None, None, 130
         emit_error(args.json, e.error_type, str(e), extra=_conn_extra(locals().get("conn")))
-        return 2 if e.error_type == "bad_args" else 255
+        return None, None, 2 if e.error_type == "bad_args" else 255
     except Exception as e:
         if _SIGTERM_RECEIVED:
             # 信号响应线程关闭 socket 解除连接阻塞：按中断而非连接失败归类
             emit_error(args.json, "interrupted", _interrupt_msg(),
                        extra=_conn_extra(locals().get("conn")))
-            return 130
+            return None, None, 130
         emit_error(args.json, "connection_failed", str(e), extra=_conn_extra(locals().get("conn")))
-        return 255
+        return None, None, 255
 
+
+
+def _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client):
+    """执行会话：凭据检测 -> exec_command(+stdin 注入) -> 并发读线程 -> drain/排水 -> 结果组装。
+
+    原 cmd_exec 连接后主体整体搬入（语句顺序零改动）；闭包子例程
+    _partial_extra / _read / _drain_rest 随迁（引用本函数局部 = 原闭包语义）。
+    返回本地退出码；异常已 emit（130/255/124）。finally 兜底 spill + close_all。
+    """
     def _partial_extra():
         """错误时组装已读到的部分输出/警告，供 AI 判断命令卡在哪一步。
 
@@ -3018,6 +3127,35 @@ def cmd_exec(args):
             _close_spill(spill_err_fh, spill_err_path, keep=False)
         close_all(client)
 
+
+def cmd_exec(args):
+    """exec 编排：前置校验组装 -> 连接 -> 执行会话（三段各自独立函数）。"""
+    start = time.time()  # 计时含连接耗时：duration_ms 在跳板/慢网络下偏大
+
+    prepared = _prepare_exec_command(args)
+    if prepared[0] is None:
+        _, (etype, emsg, pwarnings) = prepared
+        extra = {"warnings": pwarnings} if pwarnings else None
+        emit_error(args.json, etype, emsg, extra=extra)
+        return 2  # 本地参数/校验问题，与 bad_args 同级
+    cmd, warnings, sudo_pw, orig_cmd = prepared
+
+    conn, client, conn_ec = _connect_exec(args)
+    if conn_ec is not None:
+        return conn_ec
+
+    return _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client)
+
+
+
+# ================= [域 09/12] upload/download 子命令实现 ================= 
+"""upload/download 子命令实现（域 09）。
+
+- cmd_upload：校验 -> 预置失败上下文 -> 连接 -> sftp 主流程（单文件/递归/并行/
+  --resume/--dry-run/--skip-existing）-> 结果（file_list/bytes/parallel_used）
+- cmd_download：对称；断点重试/符号链接/路径安全化
+底层原语在 07_sftp_transfer.py；失败上下文 _transfer_extra 见 07。
+"""
 
 def cmd_upload(args):
     start = time.time()  # 计时含连接耗时
@@ -3699,6 +3837,14 @@ def cmd_download(args):
         close_all(client)
 
 
+
+# ================= [域 10/12] test/ls 子命令实现 ================= 
+"""test/ls 子命令实现（域 10）。
+
+- cmd_test：连通/认证探测（hostname/os/kernel/arch；stdout EOF 后等 exit-status 宽限）
+- cmd_ls：SFTP 列表（entries[] name/mode/size/is_dir/is_symlink/mtime；~ 展开；无 glob）
+"""
+
 def cmd_test(args):
     start = time.time()  # 计时含连接耗时
     try:
@@ -3983,6 +4129,17 @@ def cmd_ls(args):
 # =========================================================================
 # 参数解析
 # =========================================================================
+
+
+# ================= [域 11/12] CLI 装配与入口 ================= 
+"""CLI 装配与入口（域 11）。
+
+- PsshArgumentParser（--help 纯文本、子命令缺省结构化 bad_args）
+- build_parser + add_conn（target/凭据/跳板参数，子命令共用注册）
+- 参数类型校验（_port/_max_time/_exec_timeout/_positive_int/_encoding_type）
+- 信号：_setup_signal_handlers（极早期注册语义在 00）、_signal_responder（救援线程）
+- main()：解析 -> --field/--text 互斥 -> 子命令分发；极早期窗口标志在 00_head
+"""
 
 class PsshArgumentParser(argparse.ArgumentParser):
     """参数错误时也在 stdout 输出一行结构化 JSON（AI 可解析）。
