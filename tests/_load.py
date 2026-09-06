@@ -1,20 +1,14 @@
 # -*- coding: utf-8 -*-
-"""测试公共加载器（脱敏：不硬编码任何机器/凭据路径）。
-
-被测目标解析：
-  1. env PYAISSH_PY=<path>：importlib 从指定文件加载（测 dev built 等任意版本）
-  2. 否则：从本仓库根目录 import pyaissh（python tests/unit/xxx.py 直接跑）
-"""
+"""测试公共被测加载器（脱敏）：PYAISSH_PY 覆盖 / 缺省仓库根 pyaissh.py。"""
 import importlib.util
 import os
 import sys
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 仓库根
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _MODULE = None
 
 
 def pyaissh():
-    """返回被测模块（惰性加载，带缓存）。"""
     global _MODULE
     if _MODULE is not None:
         return _MODULE
