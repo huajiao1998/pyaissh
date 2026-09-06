@@ -1,0 +1,15 @@
+# 可再生中间产物（build_single.py split/join 随时重建）
+parts/
+pyaissh.built.py
+__pycache__/
+*.pyc
+
+# 敏感/凭据（绝不入仓）
+*.token
+.gh_token
+*_token*
+.env
+*.pem
+*.key
+cred*.txt
+pass*

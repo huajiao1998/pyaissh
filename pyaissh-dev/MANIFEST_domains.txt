@@ -1,0 +1,22 @@
+# pyaissh 域级 MANIFEST（第二版）：构建顺序 = 域文件顺序（显式，非 import 拓扑）
+#
+# 每个域文件 = 原单文件的连续大段（搬移期内容零改动，顺序保持原文件顺序）。
+# 顺序尊重顶层执行语义（护栏 2）：
+#   00 含极早期信号标志/注册（任何慢操作前）+ docstring + stdlib import
+#   04 含 _setup_console_utf8() 与 _QUIET 的模块级执行点
+#   01-11 常量/正则/函数定义按原顺序（模块级赋值依赖顺序）
+#
+# 域文件在 pyaissh-dev/domains/ 下：<序号>_<域名>.py
+# 每行: <序号>_<域名>.py | <起始锚正则>（Python re；锚唯一；域尾=下一域锚/EOF）
+00_head.py        | ^# ===== 极早期信号窗口（v1.4.8）=====
+01_globals.py     | ^VERSION = "1\.5\.19"
+02_cred_regex.py  | ^# --- 正则模式（模块级编译一次
+03_env_paths.py   | ^def _safe_int
+04_console_out.py | ^def _setup_console_utf8
+05_util.py        | ^class SshError
+06_conn.py        | ^def parse_target
+07_sftp_transfer.py | ^def _sftp_watchdog
+08_cmd_exec.py    | ^def cmd_exec\(args\)
+09_cmd_transfer.py | ^def cmd_upload\(args\)
+10_cmd_test_ls.py | ^def cmd_test\(args\)
+11_cli_main.py    | ^class PsshArgumentParser
