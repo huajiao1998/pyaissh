@@ -11,11 +11,11 @@
 
 测试集：
   1) unit_regression   回归 54 例   （凭据矩阵/parse_target/编码/stdin）
-  2) unit_credential   凭据启发式 41 例
+  2) unit_credential   凭据启发式 47 例（含 \$(cat 豁免）
   3) unit_artifacts    制品结构（域边界横幅 11 + 域 docstring 代码地图 + VERSION 一致）
   4) live_sudo         --sudo 提权 12 例（真机）
-  5) live_exec_field   exec 12 + --field 7 例（真机）
-  6) live_transfer     传输往返 6 例（真机：默认/--parallel/--resume）
+  5) live_exec_field   exec+field 22 例（真机）
+  6) live_transfer     传输往返 7 例（真机：默认/--parallel/--resume/--exclude）
 
 本文件代码地图（改测试先看这里；维护记录见 tests/CHANGELOG.md）：
   [框架]      _module()  被测模块加载（PYAISSH_PY / 缺省根）
@@ -23,7 +23,7 @@
               _Suite     断言运行器（check/计数/result）
               _live_run/_live_sub/_last_json/_live_host/_missing_env
   [unit 集]   suite_unit_regression  回归 54 例（verify_r3 迁入）
-              suite_unit_credential  凭据启发式 41 例
+              suite_unit_credential  凭据启发式 47 例（含 \$(cat 豁免）
               suite_unit_artifacts   制品结构：域横幅/代码地图/VERSION
   [live 集]   suite_live_sudo        --sudo 12 例（真机）
               suite_live_exec_field  exec+field 19 例（真机）
@@ -261,9 +261,17 @@ def suite_unit_regression(s):
     s.check("VERSION 合法且 >= 1.5",
             re.match(r"^\d+\.\d+\.\d+$", m.VERSION) is not None and m.VERSION >= "1.5.0")
 
+    # v2.1 --exclude 匹配单元（_excluded_by：模式命中文件名或相对路径即排除）
+    s.check("exclude 命中目录名", m._excluded_by("a/b/node_modules", "node_modules",
+                                                 ["node_modules", ".git"]))
+    s.check("exclude 命中相对路径", m._excluded_by("dist/app.js.map", "app.js.map", ["*.map"]))
+    s.check("exclude 目录剪枝靠名字命中", m._excluded_by("static/.git", ".git", [".git"]))
+    s.check("exclude 不误伤", not m._excluded_by("src/main.py", "main.py",
+                                                 ["node_modules", ".git", "*.map"]))
+
 
 # ============================================================
-# 测试集 2：unit 凭据启发式 41 例
+# 测试集 2：unit 凭据启发式 47 例（含 \$(cat 豁免）
 # ============================================================
 
 def suite_unit_credential(s):
@@ -278,6 +286,10 @@ def suite_unit_credential(s):
              "wget -p https://x", "pytest -p x", "echo -pabc", "git push", "--port 22",
              "systemctl --no-pager status ssh", "ls --no-pager", "--no-pager=true",
              "apt-get --no-pager list", "--no-plugins"]
+    # v2.1：从文件读值 $(cat f) / $(<f) 豁免（值不进命令行文本，无明文泄漏，WARN 只剩噪音）
+    nohit += ["PW=$(cat /root/.abbs-webui-password)", "DB_PASS=$(cat /srv/x)",
+              "export PASS=$(cat /tmp/p)", "mysql -u root -p $(cat /etc/mysql/pw)",
+              "PW=$(< ~/.secret)", "my_pw=$(cat ~/.pw)"]
     for c in hit:
         s.check("应命中 %r" % c[:30], bool(m.warn_sensitive_cmd(c, enabled=True)))
     for c in nohit:
@@ -450,6 +462,22 @@ def suite_live_exec_field(s):
     p = _live_sub(["exec", tgt, "--cmd", "echo x", "--field", "no_such_field"])
     s.check("field 字段不存在提示", "字段不存在" in p.stderr)
 
+    # v2.1 #1：命令失败 + stderr 未提取 -> stderr 通道直接给截断尾巴（不多跑一轮）
+    p = _live_sub(["exec", tgt, "--cmd", "sh -c 'echo v; echo boom_direct >&2; exit 1'",
+                   "--field", "stdout"])
+    s.check("field 失败给 stderr 尾巴", "boom_direct" in p.stderr
+            and p.stdout.strip() == "v")
+    # v2.1 #1：命令成功但 stderr 非空 -> 保持提示（不塞内容，内容非报错）
+    p = _live_sub(["exec", tgt, "--cmd", "sh -c 'echo v; echo warn_line >&2'",
+                   "--field", "stdout"])
+    s.check("field 成功 stderr 仅提示", "结果含非空 stderr" in p.stderr
+            and "warn_line" not in p.stderr)
+
+    # v2.1 #5：--progress 心跳（长任务静默时 stderr 打[PROGRESS]，AI 知进程活着）
+    p = _live_sub(["exec", tgt, "--cmd", "sleep 3", "--progress", "1"], timeout=60)
+    s.check("--progress 心跳", "[PROGRESS] 仍在运行" in p.stderr
+            and p.returncode == 0)
+
 
 # ============================================================
 # 测试集 5：live 传输往返
@@ -517,8 +545,38 @@ def suite_live_transfer(s):
         s.check("download --resume 续传日志", "RESUME" in pstderr
                 or "从断点继续" in pstderr or "续传" in pstderr,
                 "stderr 无续传标记: %r" % pstderr[:160])
+    # T6 upload --exclude 目录排除（v2.1）：本地树含 node_modules/.git → 不上传
+    deploy_dir = os.path.join(_REPO, "tests", "_tmp_deploy")
+    os.makedirs(os.path.join(deploy_dir, "node_modules", "esbuild"), exist_ok=True)
+    os.makedirs(os.path.join(deploy_dir, ".git"), exist_ok=True)
+    os.makedirs(os.path.join(deploy_dir, "src"), exist_ok=True)
+    with open(os.path.join(deploy_dir, "app.js"), "wb") as f:
+        f.write(os.urandom(60000))
+    with open(os.path.join(deploy_dir, "node_modules", "esbuild", "bin.exe"), "wb") as f:
+        f.write(os.urandom(110000))
+    with open(os.path.join(deploy_dir, ".git", "config"), "wb") as f:
+        f.write(b"[core] test = 1\n")
+    with open(os.path.join(deploy_dir, "src", "main.py"), "wb") as f:
+        f.write(b"print('hi')\n")
+    expect_bytes = (os.path.getsize(os.path.join(deploy_dir, "app.js"))
+                    + os.path.getsize(os.path.join(deploy_dir, "src", "main.py")))
+    rc, j, pstderr = _live_run(["upload", tgt, "--local", deploy_dir,
+                                "--remote", "/tmp/_t_deploy",
+                                "--exclude", "node_modules,.git"], timeout=300)
+    # 上传只含 app.js + src/main.py；node_modules(110000B)/.git 被排除
+    ok_ex = j and j.get("ok") is True and j.get("bytes_transferred") == expect_bytes
+    if ok_ex:
+        rc, j2, _ = _live_run(["exec", tgt, "--cmd",
+                               "test ! -d /tmp/_t_deploy/node_modules && "
+                               "test ! -d /tmp/_t_deploy/.git && "
+                               "test -f /tmp/_t_deploy/app.js && echo EXCL_OK"])
+        ok_ex = j2 and "EXCL_OK" in j2.get("stdout", "")
+    s.check("upload --exclude 排除生效", ok_ex)
+    import shutil
+    shutil.rmtree(deploy_dir, ignore_errors=True)
     # 远端 + 本地清理
-    _live_run(["exec", tgt, "--cmd", "rm -f /tmp/_t_xfer.bin /tmp/_t_xfer_par.bin"])
+    _live_run(["exec", tgt, "--cmd",
+               "rm -rf /tmp/_t_xfer.bin /tmp/_t_xfer_par.bin /tmp/_t_deploy"])
     os.remove(local)
     for p in (dl, part):
         if os.path.exists(p):
@@ -530,12 +588,12 @@ def suite_live_transfer(s):
 # ============================================================
 
 SUITES = [
-    ("unit_regression", "回归 54 例（凭据矩阵/parse_target/编码/stdin）", suite_unit_regression),
-    ("unit_credential", "凭据启发式 41 例", suite_unit_credential),
+    ("unit_regression", "回归 58 例（凭据矩阵/parse_target/编码/stdin/--exclude 匹配）", suite_unit_regression),
+    ("unit_credential", "凭据启发式 47 例（含 \$(cat 豁免）", suite_unit_credential),
     ("unit_artifacts", "制品结构 6 例（域横幅/代码地图/VERSION）", suite_unit_artifacts),
     ("live_sudo", "--sudo 提权 12 例（真机）", suite_live_sudo),
-    ("live_exec_field", "exec 12 + --field 7 例（真机）", suite_live_exec_field),
-    ("live_transfer", "传输往返 6 例（真机：默认/--parallel/--resume）", suite_live_transfer),
+    ("live_exec_field", "exec+field 22 例（真机）", suite_live_exec_field),
+    ("live_transfer", "传输往返 7 例（真机：默认/--parallel/--resume/--exclude）", suite_live_transfer),
 ]
 
 

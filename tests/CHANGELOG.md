@@ -64,3 +64,15 @@
 2. 在 `SUITES` 注册一行 `(name, 描述, 函数)`；若加 CLI 直选标志，同步加 argparse 参数 + main 的 order 分支
 3. 本文件**末尾追加**一条记录（修了什么/加了什么）；README 的测试集清单同步
 4. `python tests/run_tests.py --all` 全绿后随改动提交
+
+## [2026-09-07] v2.1.0 五大修复的测试覆盖
+
+### 新增用例
+- unit_regression +4：--exclude 匹配单元（目录名/相对路径/剪枝靠名字/不误伤）
+- unit_credential +6：`$(cat f)` / `$(<f)` 从文件读值豁免（无明文泄漏不误报）
+- live_exec_field +3：field 失败给 stderr 尾巴（命令失败直接给内容不多跑一轮）/
+  field 成功 stderr 仅提示不塞内容 / --progress 心跳
+- live_transfer +1：upload --exclude 真机（本地树含 node_modules/.git → 远端无 + 字节只算非排除）
+### 修的问题
+- 初版 exclude 用例误用 fnmatch `**` 跨目录语义（fnmatch 不跨 /）→ 改为"目录剪枝靠名字命中"断言
+- 例数同步：unit 58+47+6 / live 12+22+7（README/run_tests 描述）
