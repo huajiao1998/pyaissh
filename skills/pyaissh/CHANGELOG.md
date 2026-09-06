@@ -207,3 +207,14 @@
 - **`--field` 模式静音进度日志，stderr 只剩信号（使用 AI 设计洞察）**：v1.5.18 的 stderr 盲区提示存在**结构死结**——提示有效性依赖"消费者不屏蔽 stderr"，而消费者屏蔽（`2>/dev/null`）的动机恰是 stderr 上的进度噪音（`[SSH]`/`[OK]`/`[EXEC]` 对 --field 消费者零价值）：消费者用 `--field stdout 2>/dev/null` 时把提示和真实报错一起静音，盲区提示对"最有需要的那批调用"失效。修复：**不是教育用户别屏蔽，而是让屏蔽动机消失**——`--field` 模式下 log() 静音（模块级 `_QUIET`，main 解析出 `args.field` 后置位），`[WARN]` 级保留（凭据警告等信号），进度行丢弃。效果：`--field` 的 stderr 只可能出现 `[WARN]` + `_emit_fields` 提示（字段缺失/stderr 非空盲区）——全是信号，无噪音；错误路径不受影响（emit_error 走 stdout 完整 JSON，诊断本来就在 JSON 里）；非 `--field` 模式进度日志照旧。真机验证：`--field stdout` 成功 → stderr 空；stderr 非空 → stderr 只剩盲区提示；含凭据命令 → WARN 保留；非 field → `[SSH]`/`[OK]` 照旧。field 套件 10/10 + 回归 54/54。
 ### 文档
 - contract.md `--field` 章节 + SKILL.md 输出约定同步："`--field` 模式 stderr 无进度日志、仅含信号（WARN/提示）——**不要再 `2>/dev/null`**"。
+
+## [2.0.0] - 2026-09-06
+
+### 重构（行为零变化——v1.5.19 的代码结构重组，非功能变更）
+- **背景**：pyaissh.py 单文件 4460 行、cmd_exec 682 行巨函数、5 子命令连接样板重复——维护性到临界。方案经架构审查采纳四条护栏（①可变全局禁 from-import ②构建顺序用显式 MANIFEST ③先证构建器再搬 ④确定性构建+双形态测试）+ 用户决策"开发态多文件、发布态合成单文件"。
+- **开发态 = 12 域文件**（`pyaissh-dev/domains/`，独立 git 可回滚）：`00_head`(文件头/极早期信号/VERSION) `01_globals`(常量/错误分类/可变全局) `02_cred_regex`(凭据启发式) `03_env_paths`(.env/MSYS 路径) `04_console_out`(log/emit 系) `05_util`(截断/hint/spill) `06_conn`(连接) `07_sftp_transfer`(传输原语) `08_cmd_exec` `09_cmd_transfer` `10_cmd_test_ls` `11_cli_main`(parser/main)——每个域文件带模块 docstring 代码地图（内容/关键符号/被谁引用）。
+- **cmd_exec 彻底分段**：682 行 → 编排 `cmd_exec`(16 行) + `_prepare_exec_command`(组装/哨兵化) + `_connect_exec`(连接) + `_exec_session`(执行会话，内嵌闭包 `_partial_extra`/`_read`/`_drain_rest`)。语句零改动机械等价搬移。
+- **构建器**（`pyaissh-dev/build_single.py`）：域 MANIFEST 显式顺序（护栏 2）+ 往返逐字节一致 + 确定性（护栏 4）。发布物 = join 单文件（分发形态不变）。
+- **验证（重构前后行为一致性）**：金标往返逐字节一致 → 搬移期 12 域 join = 原文件；改码期 A 机 15/15 + B2 机 18/18 用例 JSON 逐字段一致（exec 各形态/pty/超时/截断/sudo/cmd-file/传输往返）+ 回归 54/54 + sudo 12/12 + field 10/10。
+- **代码地图**：每个域文件带模块 docstring（内容/关键符号/被谁引用）；`pyaissh-dev/` 独立 git 全程可回滚。
+- **构建器自动生成域边界横幅**：join 时在每个域拼接处插入 `# ===== [域 NN/12] <标题> =====`（标题从域 docstring 首行自动提取）——成品单文件与 12 域文档视觉对应，使用 AI 滚到任意位置知道在哪个域；纯注释、行为零变化、确定性构建。曾评估"函数行号索引"（文件尾跳转表）后**回退**：使用 AI 改文件后行号漂移会成为错误导航（横幅/docstring 是内容标记不依赖行号，稳定可用）。
