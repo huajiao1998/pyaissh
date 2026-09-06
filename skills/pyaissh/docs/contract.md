@@ -28,6 +28,7 @@
 - **`-` 前缀 = 打到进程 stderr**：`--field stdout,-stderr` → stdout 内容打进程 stdout、stderr 字段打进程 stderr——**报错不被 stdout 展示脚本吞掉**（实测教训：AI 只读 stdout 字段丢了 stderr 报错；2>&1 或单独流都能拿到）
 - dict/list 值 JSON 序列化（`ls --field entries`、upload 的 `file_list`）
 - **字段不存在**（拼错）→ stderr 提示字段名（不静默空行误导）
+- **`--field` 模式 stderr 仅含信号，无进度日志**（v1.5.19）：进度行（`[SSH]`/`[OK]`/`[EXEC]`）在 `--field` 下被静音——消费者只要字段裸值，进度是噪音（消费者被噪音烦到 `2>/dev/null` 会把 stderr 盲区提示一起静音，死结；静音噪音后屏蔽动机消失）。`--field` 下 stderr 只可能出现：`[WARN]` 级警告（凭据等）+ `_emit_fields` 的字段缺失/`stderr 非空`提示——**不要再 `2>/dev/null`，stderr 上的都是信号**。非 `--field` 模式进度日志照旧
 - 与 `--text` 互斥（bad_args，退出码 2）；`--json` 兼容 no-op 不冲突
 - **仅作用于成功路径**：工具错误（emit_error：连接失败/bad_args 等）仍输出**完整 JSON**（AI 需要 `retryable`/`message`）；命令非零退出是"成功路径的结果"（ok:true + exit_success:false），此时 --field 提取的是结果字段（`--field stdout,-stderr` 能拿到报错）
 - **默认契约零变化**：不用 `--field` 时 stdout 恒单行 JSON

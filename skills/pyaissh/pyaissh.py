@@ -121,7 +121,7 @@ except (ValueError, OSError, ImportError):
 # 时才 import。错误路径（--version/--help/bad_args/缺用户名/别名未配置）从
 # ~300ms 降到 ~30ms；极早期信号窗口也更短（handler 注册后只剩标准库 import）。
 
-VERSION = "1.5.18"
+VERSION = "1.5.19"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -591,8 +591,18 @@ def _setup_console_utf8():
 _setup_console_utf8()
 
 
+# --field 消费端模式的进度日志静音开关：--field 消费者只要字段裸值 + 信号，
+# [SSH]/[OK]/[EXEC] 进度行是噪音（v1.5.19：消费者被噪音烦到 2>/dev/null，
+# 把 stderr 盲区提示一起静音——死结；静音噪音后 stderr 只剩信号，屏蔽动机消失）。
+# 置位点：main() 解析出 args.field 后（见 main）。
+_QUIET = False
+
+
 def log(msg):
-    """进度日志，打到 stderr（两种模式都打），不污染 stdout"""
+    """进度日志，打到 stderr（两种模式都打），不污染 stdout。
+    --field 静音模式下只保留 [WARN] 级信号（凭据警告等），丢进度行。"""
+    if _QUIET and not msg.startswith("[WARN]"):
+        return
     print(msg, file=sys.stderr, flush=True)
 
 
@@ -4411,6 +4421,10 @@ def main():
                        "--field 与 --text 互斥（--field 是消费端字段提取，"
                        "--text 是可读模式；二选一）")
             return 2
+        # --field 消费端模式：静音进度日志（stderr 只留 WARN 与盲区提示等信号）
+        if getattr(args, "field", None):
+            global _QUIET
+            _QUIET = True
         # 错误 JSON 的 action 字段：取当前子命令名（供 emit_error 统一填充）
         _CURRENT_ACTION = handler.__name__[4:] \
             if handler.__name__.startswith("cmd_") else handler.__name__

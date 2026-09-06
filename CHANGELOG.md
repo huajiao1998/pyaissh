@@ -200,3 +200,10 @@
 - **C. exec.md 新增"长任务配方"小节**：apt 安装/332M 传输/镜像拉取等 2-10 分钟零输出操作**必然撞 idle-timeout（默认 60s）**——三次踩雷后形成的稳定模式：①先估时长调大 `--idle-timeout`（上限 1200s）+ 同步调大 `--max-time`；②传输类靠并行分片 + `.part` 原子性（中断安全）+ `--resume`/重跑 + 轮询远端大小对账；③循环类命令自己加**心跳输出**（周期 `echo` 让 idle-timeout 不触发）；④超 20min 上限 → 后台化 `nohup ... &` + 轮询日志；⑤中断后先 pgrep/tail 确认（`remote_may_be_running` 字段）再决定续传/重跑。
 ### 测试
 - field 套件 10/10 + sudo 12/12 + verify_r3 54/54（含 A 代码改动的回归）。
+
+## [1.5.19] - 2026-09-06
+
+### 修复（--field 模式 stderr 信号/噪音死结）
+- **`--field` 模式静音进度日志，stderr 只剩信号（使用 AI 设计洞察）**：v1.5.18 的 stderr 盲区提示存在**结构死结**——提示有效性依赖"消费者不屏蔽 stderr"，而消费者屏蔽（`2>/dev/null`）的动机恰是 stderr 上的进度噪音（`[SSH]`/`[OK]`/`[EXEC]` 对 --field 消费者零价值）：消费者用 `--field stdout 2>/dev/null` 时把提示和真实报错一起静音，盲区提示对"最有需要的那批调用"失效。修复：**不是教育用户别屏蔽，而是让屏蔽动机消失**——`--field` 模式下 log() 静音（模块级 `_QUIET`，main 解析出 `args.field` 后置位），`[WARN]` 级保留（凭据警告等信号），进度行丢弃。效果：`--field` 的 stderr 只可能出现 `[WARN]` + `_emit_fields` 提示（字段缺失/stderr 非空盲区）——全是信号，无噪音；错误路径不受影响（emit_error 走 stdout 完整 JSON，诊断本来就在 JSON 里）；非 `--field` 模式进度日志照旧。真机验证：`--field stdout` 成功 → stderr 空；stderr 非空 → stderr 只剩盲区提示；含凭据命令 → WARN 保留；非 field → `[SSH]`/`[OK]` 照旧。field 套件 10/10 + 回归 54/54。
+### 文档
+- contract.md `--field` 章节 + SKILL.md 输出约定同步："`--field` 模式 stderr 无进度日志、仅含信号（WARN/提示）——**不要再 `2>/dev/null`**"。

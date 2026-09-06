@@ -30,7 +30,7 @@ pyaissh 是基于 paramiko 的命令行 SSH 工具，专为非交互的 AI/脚�
 
 - **stdout 才是可解析结果**；进度日志全部在 stderr，不要拿 stderr 当结果
 - **默认即 JSON**：整行 JSON 直接 `json.loads`；`--text` 切可读模式（标记带随机 nonce，仅供人类速览，**AI 一律用默认 JSON**）
-- **`--field` 消费端免样板**（v1.5.16）：**标准示例 `--field stdout,-stderr`**——stdout 内容打 stdout、stderr 内容打进程 stderr（**stderr 报错不被吞**——三次实测教训：AI 只读 stdout 丢过认证失败等真实原因）；只要某个字段裸值时用它代替手写 `json.loads`；`-` 前缀=打 stderr 通道，多字段逗号分隔每行一个；与 `--text` 互斥；**错误路径仍输出完整 JSON**；不用 `--field` 时契约零变化
+- **`--field` 消费端免样板**（v1.5.16）：**标准示例 `--field stdout,-stderr`**——stdout 内容打 stdout、stderr 内容打进程 stderr（**stderr 报错不被吞**——三次实测教训：AI 只读 stdout 丢过认证失败等真实原因）；只要某个字段裸值时用它代替手写 `json.loads`；`-` 前缀=打 stderr 通道，多字段逗号分隔每行一个；与 `--text` 互斥；**错误路径仍输出完整 JSON**；**`--field` 模式 stderr 无进度日志、仅含信号（WARN/提示）——不要 `2>/dev/null`**；不用 `--field` 时契约零变化
 - **`ok` 与 `exit_success` 区分**：`ok=true` 只表示工具操作成功（连接+执行完成）；**远程命令成败看 `exit_success`**（例：`exit 3` → `ok=true, exit_code=3, exit_success=false`）
 - 错误 JSON：`ok:false` + `error` + `message` + **`retryable`**（bool，机器可读的重试建议：true=重试可能成功且安全，false=改输入或放弃；exec 超时类 true 仅表示值得一试，重试前读 message 确认远程进程，或**直接读 `remote_may_be_running` 字段**（超时类恒有，true=进程可能仍在跑，副作用命令先 pgrep 再重试），见 **docs/errors.md**）；参数写错输出 `bad_args` JSON（退出码 2）；`--help` 是纯文本输出（非 JSON），`--version` 输出一行 JSON
 - **`warnings` 恒为参考信息，不代表操作失败**（疑似凭据等安全类提示不阻断执行，命令照常运行；需要行动的如 `.part` 残留会附清理命令）
