@@ -121,7 +121,7 @@ except (ValueError, OSError, ImportError):
 # 时才 import。错误路径（--version/--help/bad_args/缺用户名/别名未配置）从
 # ~300ms 降到 ~30ms；极早期信号窗口也更短（handler 注册后只剩标准库 import）。
 
-VERSION = "1.5.17"
+VERSION = "1.5.18"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -624,7 +624,12 @@ def _emit_fields(result, field_spec):
     - dict/list 值 JSON 序列化（如 ls 的 entries、upload 的 file_list）
     - 值本身多行（如 stdout 内容）原样保留
     - 字段不存在（拼错）-> stderr 提示字段名（不静默空行误导）
+    - 结果 stderr 字段非空且本次未提取 stderr（未给 stderr/-stderr）-> 自动在
+      进程 stderr 打提示（A 升级：--field stdout 吞 stderr 教训第三次应验——
+      传输失败真实原因在 stderr 里被吞，多烧一轮排查；提示走进程 stderr 不
+      污染 stdout 裸值，只读 stdout 的消费者也能察觉有 stderr 值得看）
     错误路径不走这里（emit_error 保持完整 JSON，AI 需要 retryable/message）。"""
+    names = [s.strip().lstrip("-") for s in field_spec.split(",") if s.strip()]
     for spec in field_spec.split(","):
         spec = spec.strip()
         if not spec:
@@ -646,6 +651,12 @@ def _emit_fields(result, field_spec):
             print(text, file=sys.stderr, flush=True)
         else:
             print(text, flush=True)
+    # A 升级：stderr 盲区兜底提示（结果有非空 stderr 且本次没提取它）
+    err_val = result.get("stderr")
+    if err_val is not None and str(err_val).strip() and "stderr" not in names:
+        print("[pyaissh: 结果含非空 stderr（%d 字节）——本次 --field 未提取 stderr，"
+              "真实报错可能在其中；用 -stderr 字段（--field stdout,-stderr）查看]"
+              % len(str(err_val)), file=sys.stderr, flush=True)
 
 
 def _emit_result(args, result, header=None, sections=None):

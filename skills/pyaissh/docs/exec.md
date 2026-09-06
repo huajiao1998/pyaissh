@@ -38,5 +38,16 @@ EOF
 ```
   （外层 heredoc 喂给 pyaissh 的命令脚本本身也用引住的定界符；命令含 `$`/反引号时 `--cmd-file -` 在 bash/Git Bash 下同样是首选，不只 PowerShell）
 - **Git Bash 路径**：`--cmd-file` / `--spill-dir` 与 `--local` 同款 MSYS 转换——经 `./pyaissh` 包装器（禁路径转换）时，Unix 风格路径（`/tmp/x.sh`）自动转 Windows 真实路径，不会落错位置或报 Errno 2；Linux 直接运行时原样透传
+
+### 长任务配方（apt 安装 / 大传输 / 镜像拉取 / 编译等 2-10 分钟零输出操作）
+
+真实教训：这类长静默操作**必然撞 `--idle-timeout`（默认 60s）**——apt 安装、332M 传输、镜像拉取都是 2-10 分钟零输出。稳定模式（三次踩 idle-timeout 后形成）：
+
+1. **先预估时长，调大 `--idle-timeout`**：`--idle-timeout 600`（上限 1200s=20min；`--max-time` 默认 2×idle-timeout 且至少 120，**记得同步调大覆盖总时长**，如 `--max-time 1200`）。零输出但继续等：持续有输出就无限续、无输出超 idle-timeout 判挂死——长任务先估总时长给足两个参数
+2. **传输类（upload/download 大文件）**：默认 ≥8MB 自动 4 连接并行分片（也可显式 `--parallel 8` 提速）；真超时中断是安全的——写 `.part.<pid>` 原子改名不留半截最终文件，重跑 `--resume` 续传或整传重跑即可（幂等）；**轮询远端确认**：中断后用 `ls`/`test` 查远端文件大小/存在性再决定续传还是重跑（`file_list`/`bytes_transferred` 字段对账）
+3. **循环/长命令类**：给命令**自己加心跳输出**——`while ...; do ...; echo "heartbeat $(date +%s)"; done`（循环内周期 echo，让 idle-timeout 不触发）；纯等待类（`sleep 300`）直接给足 `--idle-timeout` 即可
+4. **不可预估/超 20min 上限**：拆段执行（分批 apt/分片传输）或**后台化 + 轮询**——`--cmd "nohup <长命令> >/tmp/task.log 2>&1 & echo started"` 立即返回，之后周期 `exec --cmd "tail -3 /tmp/task.log"` 轮询日志（配 `--idle-timeout` 小的短命令查进度），完成标志出现在日志后取最终结果
+5. **中断后**：先 pgrep/tail 确认远端实际状态（超时类 JSON 带 `remote_may_be_running:true` = 进程可能仍在跑，别盲目重跑副作用命令），再决定续传/重跑/清理
+
 - **`--sudo` 提权（普通用户登录时）**：`--sudo --cmd "apt update"` 自动 `sudo -S -p ''` 提权。密码来源：`--sudo-password`（空串视为未设置）> `PYAISSH_SUDO_PASSWORD` env；密码只经 SSH stdin 注入（写完即 close），**命令文本/cmd 字段/日志/远端磁盘均无密码**，`-p ''` 压掉提示符（成功路径 stderr 不含 `password for`）。**组装规则**：简单命令（无 shell 元字符）直连 `sudo -S -p '' <cmd>`——sudoers NOPASSWD 按命令匹配仍生效（`NOPASSWD: /usr/bin/apt` 对 `sudo apt update` 有效）；复合命令（`&&`/`||`/`;`/管道/重定向/`$()`/反引号/换行）→ `sudo -S -p '' bash -c '<单引号转义>'` 整链提权（`&&` 第二段同样 root）。**无密码时自动 `sudo -n` 免密探测**：免密命令直接跑；需密码立即失败不挂，且 stderr 命中 sudo 报错特征（如 `a password is required`）时 warnings 附密码配置提示；**有密码但密码错**（stderr 命中 sudo 专属报错如 `sudo: 1 incorrect password attempt`）时 warnings 提示检查密码——两种提示都只认 sudo 自己的报错（带 `sudo:` 前缀），命令自身 stderr 里的 "Sorry, try again"/"password" 等词不会误触发。`--sudo` 与 `--pty` 互斥（bad_args 退出 2）。`--cmd` 与 `--cmd-file` 两条路径统一处理。**注意**：sudo 无法执行 shell 内建命令（`--sudo --cmd 'exit 3'` 会得到误导性的 "a password is required"，因为 exit 不是可执行文件）——内建命令请外套 `bash -c`（`--sudo --cmd "bash -c 'exit 3'"`）
 - 远程退出码直接透传（255 例外：远程恰为 255 时本地返 254，见 SKILL.md 退出码表）

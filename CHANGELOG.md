@@ -191,3 +191,12 @@
 
 ### 修复
 - **凭据 WARN 误报：`--no-pager` 命中"-p + 密码"形态（给开发 AI 的数据）**：`git log --no-pager` / `systemctl --no-pager` / `apt-get --no-pager` 等**高频合法命令**被误报"疑似凭据"——`no-pager` 中间的 `-pager`（`-p` 前是 `o` 非 `-`）绕过 v1.5.0 的 `(?<!-)` 防线（只挡双横线开头选项），命中紧贴形态。修复：**统一防线 `(?<![A-Za-z0-9-])`**——`-p` 作为密码选项时前字符必为空白/行首/引号，绝不可能是字母/数字/连字符，复合词中间的 `-p`（`--no-pager`、`a-px`）全部排除；三处形态（紧贴 `_P_SENS_P_ATTACH` / 引号 `_P_SENS_P_QUOTED` / 空格 `_P_SENS_P_SPACE`）统一改为引用 `_P_LOOKBEHIND_P`（一处定义防未来漂移）。验证：补充矩阵 41 例（15 真凭据全命中 + 26 不应命中含 --no-pager 全家 8 例）全过；原 L4 矩阵（verify_r3）54/54 无破坏；真机 `git log --no-pager` 零告警。
+
+## [1.5.18] - 2026-09-06
+
+### 修复/新增（真实长程任务反馈——40+ 调用跨 5 机含 332M 传输后沉淀）
+- **A. `--field` stderr 盲区自动提示（根治，第三次教训代价最大）**：使用 AI 用 `--field stdout` 漏掉 `-stderr`，传输失败（188→145）的真实原因（服务商镜像禁用公钥认证 → `Permission denied (password)`）在 stderr 里被吞，多烧一轮排查。修复：`--field` 模式下若结果 `stderr` 非空且本次未提取 stderr，**自动在进程 stderr 打提示**（`[pyaissh: 结果含非空 stderr（N 字节）——用 -stderr 字段查看]`）——提示走进程 stderr 不污染 stdout 裸值，只读 stdout 的消费者也能察觉有 stderr 值得看；已请求 stderr/-stderr 则不重复提示。SKILL.md 标准示例改为 `--field stdout,-stderr`（不再把单字段当示例）。真机验证：`--field stdout` + stderr 非空 → 提示出现；`--field stdout,-stderr` → 无提示 + stderr 内容可见。
+- **B. pkill 自杀伤条目补强（新形态）**：括号转义 `pkill -f '[d]ocker compose'` 只保护 pkill 自己那行——**同复合命令后面的 setsid 行合法包含字面量 `docker compose` 时 pkill 匹配整段 bash -c cmdline 照样炸会话**（863ms connection_lost，第二次踩雷）。edge-cases.md/SKILL.md 补：模式不得出现在自己命令行任何位置（含同脚本其他命令）；无法避免用**变量拼接**（`DC='docker'; pkill -f 'docker compose'; $DC compose up`——pkill 时无字面量，之后 `$DC` 展开）或**拆两次独立调用**。
+- **C. exec.md 新增"长任务配方"小节**：apt 安装/332M 传输/镜像拉取等 2-10 分钟零输出操作**必然撞 idle-timeout（默认 60s）**——三次踩雷后形成的稳定模式：①先估时长调大 `--idle-timeout`（上限 1200s）+ 同步调大 `--max-time`；②传输类靠并行分片 + `.part` 原子性（中断安全）+ `--resume`/重跑 + 轮询远端大小对账；③循环类命令自己加**心跳输出**（周期 `echo` 让 idle-timeout 不触发）；④超 20min 上限 → 后台化 `nohup ... &` + 轮询日志；⑤中断后先 pgrep/tail 确认（`remote_may_be_running` 字段）再决定续传/重跑。
+### 测试
+- field 套件 10/10 + sudo 12/12 + verify_r3 54/54（含 A 代码改动的回归）。

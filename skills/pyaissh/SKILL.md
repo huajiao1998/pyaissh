@@ -30,7 +30,7 @@ pyaissh 是基于 paramiko 的命令行 SSH 工具，专为非交互的 AI/脚�
 
 - **stdout 才是可解析结果**；进度日志全部在 stderr，不要拿 stderr 当结果
 - **默认即 JSON**：整行 JSON 直接 `json.loads`；`--text` 切可读模式（标记带随机 nonce，仅供人类速览，**AI 一律用默认 JSON**）
-- **`--field` 消费端免样板**（v1.5.16）：只要结果某个字段的裸值，不用手写 `json.loads`——`--field stdout` 打印 stdout 内容；`--field stdout,-stderr` 把 stderr 字段打到进程 stderr（**报错不被 stdout 展示吞掉**——实测教训：AI 只读 stdout 字段丢了 stderr 报错）；多字段逗号分隔每行一个；`-` 前缀=打 stderr 通道；与 `--text` 互斥；**错误路径仍输出完整 JSON**；不用 `--field` 时契约零变化
+- **`--field` 消费端免样板**（v1.5.16）：**标准示例 `--field stdout,-stderr`**——stdout 内容打 stdout、stderr 内容打进程 stderr（**stderr 报错不被吞**——三次实测教训：AI 只读 stdout 丢过认证失败等真实原因）；只要某个字段裸值时用它代替手写 `json.loads`；`-` 前缀=打 stderr 通道，多字段逗号分隔每行一个；与 `--text` 互斥；**错误路径仍输出完整 JSON**；不用 `--field` 时契约零变化
 - **`ok` 与 `exit_success` 区分**：`ok=true` 只表示工具操作成功（连接+执行完成）；**远程命令成败看 `exit_success`**（例：`exit 3` → `ok=true, exit_code=3, exit_success=false`）
 - 错误 JSON：`ok:false` + `error` + `message` + **`retryable`**（bool，机器可读的重试建议：true=重试可能成功且安全，false=改输入或放弃；exec 超时类 true 仅表示值得一试，重试前读 message 确认远程进程，或**直接读 `remote_may_be_running` 字段**（超时类恒有，true=进程可能仍在跑，副作用命令先 pgrep 再重试），见 **docs/errors.md**）；参数写错输出 `bad_args` JSON（退出码 2）；`--help` 是纯文本输出（非 JSON），`--version` 输出一行 JSON
 - **`warnings` 恒为参考信息，不代表操作失败**（疑似凭据等安全类提示不阻断执行，命令照常运行；需要行动的如 `.part` 残留会附清理命令）
@@ -90,7 +90,7 @@ python3 pyaissh.py exec root@10.0.0.5 --jump root@1.2.3.4:2222 --cmd 'hostname'
 
 - **`--pty` 下全屏交互程序（vi/vim、sudo 密码输入）不可用**；**sudo 提权用 `--sudo`**（v1.5.15 起：`sudo -S` 经 SSH stdin 注入密码，命令文本/cmd 字段无密码；见速查第 10 条与 docs/exec.md）；免密环境也可 `sudo -n` 探测
 - **默认 AutoAddPolicy 隐式接受新 host key**（首次连接新主机 stderr 打 `[WARN] 新主机 host key 已隐式接受`）；敏感环境加 `--strict`
-- **远程命令自杀伤**：`pkill -f "dsh web"` 这类按自身 cmdline 模式匹配的杀进程命令，会把自己（承载 SSH 会话的 bash）一起杀掉 → `connection_lost`。用 `pkill -f '[d]sh web'` 括号转义规避
+- **远程命令自杀伤**：`pkill -f "dsh web"` 这类按自身 cmdline 模式匹配的杀进程命令，会把自己（承载 SSH 会话的 bash）一起杀掉 → `connection_lost`。用 `pkill -f '[d]sh web'` 括号转义规避——**且模式不得出现在同命令行任何位置**（含同脚本其他命令如 setsid 行，照样炸）；无法避免用变量拼接或拆两次调用（详见 docs/edge-cases.md）
 - 其他边界（MSYS 路径改写、ANSI 风险、MaxStartups、信号窗口、Windows 文件名安全化、后台进程 drain 等）见 **docs/edge-cases.md**
 
 ## 推荐操作序列
