@@ -2,9 +2,9 @@
 
 **给 AI 用的结构化 SSH 工具 — A structured SSH tool built for AI agents**
 
-当前版本：**v2.0.0**（行为与 v1.5.19 完全一致的代码结构重构——源码 12 域模块化开发 + 构建合成单文件分发，见 CHANGELOG）
+当前版本：**v2.1.0**（v2.0.0 行为零变化重构 + v2.1 使用 AI 反馈五项：--field 失败直接给 stderr 尾巴 / host add 别名 / upload --exclude / $(cat 凭据豁免 / --progress 心跳）
 
-**Current version: v2.0.0** — behavior-identical restructuring of v1.5.19 (12-domain modular dev source, single-file build for distribution; see CHANGELOG).
+**Current version: v2.1.0** — v2.0.0 behavior-identical restructuring plus v2.1 user-AI feedback fixes (field stderr tail / host add aliases / upload --exclude / credential-warn $(cat) exemption / --progress heartbeat).
 
 裸 `ssh` 给 AI 用有四个坑：
 

@@ -386,6 +386,7 @@ def _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client):
             warnings.append(msg)
             total_limit = MAX_TIME_CAP
         total_deadline = time.time() + total_limit
+        last_hb = [time.time()]  # --progress 心跳（v2.1）：仅告知仍在运行，不重置静默计时
         while not chan.exit_status_ready():
             if _SIGTERM_RECEIVED:
                 # 在我们自己的 Python 帧里抛 KI 是安全的（在 paramiko C 级
@@ -426,6 +427,15 @@ def _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client):
                     "命令执行超时（持续输出但未结束，总时长超过 %ds）。长任务请用 --max-time "
                     "调大（最高 %d）；注意：远程进程可能仍在运行，重试前请先 pgrep 确认/清理"
                     % (total_limit, MAX_TIME_CAP))
+            if args.progress:
+                now = time.time()
+                if now - last_hb[0] >= args.progress:
+                    # 心跳（--progress）：进程活着但静默——打 stderr 让 AI 安心，
+                    # 不重置 silence_deadline（否则永远不 idle 超时）
+                    log("[PROGRESS] 仍在运行，已持续 %ds（连续 %ds 无输出/未结束；"
+                        "更久任务调大 --idle-timeout/--max-time）"
+                        % (int(now - start), args.progress))
+                    last_hb[0] = now
             time.sleep(POLL_TICK)
         exit_code = chan.exit_status if chan.exit_status_ready() else -1
         if exit_code == -1:

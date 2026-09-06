@@ -6,6 +6,17 @@
 底层原语在 07_sftp_transfer.py；失败上下文 _transfer_extra 见 07。
 """
 
+def _excluded_by(rel, name, pats):
+    """--exclude 匹配（v2.1）：任一模式（fnmatch glob）命中文件名或相对路径即排除。
+    rel 传入正斜杠相对路径（Windows 也先归一）。"""
+    for p in pats:
+        if not p:
+            continue
+        if fnmatch.fnmatch(name, p) or fnmatch.fnmatch(rel, p):
+            return True
+    return False
+
+
 def cmd_upload(args):
     start = time.time()  # 计时含连接耗时
     local = _fix_msys_local_path(args.local)
@@ -73,6 +84,10 @@ def cmd_upload(args):
     tag = "递归" if (is_dir and not no_recur) else ("目录(不递归)" if is_dir else "单文件")
     log("[SFTP] 上传 %s -> %s (%s%s)" % (
         local, remote, tag, ", dry-run" if args.dry_run else ""))
+    # --exclude（v2.1）：逗号分隔 glob，目录整树剪枝 / 文件跳过（不上传不计数）
+    exclude_pats = [p.strip() for p in (args.exclude or "").split(",") if p.strip()]
+    if exclude_pats:
+        log("[EXCL] 排除模式: %s" % ", ".join(exclude_pats))
 
     sftp = None
     try:
@@ -104,6 +119,13 @@ def cmd_upload(args):
                 rel_root = os.path.relpath(root, local)
                 remote_root = remote if rel_root == "." else posixpath.join(
                     remote, rel_root.replace(os.sep, "/"))
+                if exclude_pats:
+                    dirs[:] = [d for d in dirs
+                               if not _excluded_by(os.path.join(rel_root, d).replace(os.sep, "/"),
+                                                   d, exclude_pats)]
+                    filenames = [f for f in filenames
+                                 if not _excluded_by(os.path.join(rel_root, f).replace(os.sep, "/"),
+                                                     f, exclude_pats)]
                 if not args.dry_run:
                     sftp_makedirs(sftp, remote_root)
                 for fn in filenames:

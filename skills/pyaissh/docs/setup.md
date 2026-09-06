@@ -6,6 +6,7 @@
 ## 目标格式与主机别名
 
 - 目标格式：`[user@]host[:port]`，如 `root@1.2.3.4:22`；支持 IPv6：`user@[2001:db8::1]:22`、`[2001:db8::1]`、裸 IPv6 地址；**主机别名**：`.env` 配 `PYAISSH_HOST_<名称>=user@host:port`（如 `PYAISSH_HOST_PROD=root@1.2.3.4:22`），target 写 `@名称` 即可引用（如 `pyaissh test @prod`；**键名整体大小写不敏感**：`PYAISSH_HOST_PROD` / `pyaissh_host_prod` / `PYAISSH_host_prod` 都能命中，Linux 与 Windows 行为一致）；**显式 `-p/--port` 优先于 target/别名内嵌端口**（与 ssh 惯例一致，写 `-p` 通常就是想纠正 target 里的端口）
+- **`host add` 免手写 .env（v2.1，多主机不同密码闭环）**：`pyaissh host add prod root@1.2.3.4 --password 'xxx'` 自动把 `PYAISSH_HOST_PROD=root@1.2.3.4`（+`_PASSWORD`，`--key` 时写 `_KEY`）写进脚本同目录 .env——**幂等**（同名别名整行更新）；含空格/`#`/引号的密码自动引号包裹（含双引号的密码拒写，建议密钥认证）。两台机器不同密码 = 各 `host add` 一次，之后 `exec @prod` / `exec @test` 各走各的凭据——不再逐条 `--password`（进程列表可见 + 每条触发凭据 WARN）。密码仍是 .env 明文，勿提交 git
 
 ## 凭据（认证优先级）
 
@@ -15,7 +16,7 @@
 
 ## 凭据安全
 
-- 命令含疑似凭据（如 `mysql -p'xxx'`、`DB_PASS=...`）时 pyaissh 会在 stderr 打 WARN——照常执行，但注意日志可能泄露敏感信息，**敏感凭据用远程环境变量注入**
+- 命令含疑似凭据（如 `mysql -p'xxx'`、`DB_PASS=...`）时 pyaissh 会在 stderr 打 WARN——照常执行，但注意日志可能泄露敏感信息，**敏感凭据用远程环境变量注入**；**从文件读值豁免**（v2.1）：命令含 `$(cat f)` / `$(<f)` 整条不报 WARN（值来自文件、不进命令行文本、无明文泄漏——`DB_PASS=$(cat /srv/x)` 类不再误报；真凭据字面如 `-psecret` 仍命中）
 - **远程命令原文会打印到日志**（超长截断、终端转义序列被替换为 `<ESC>`），避免在命令里内嵌长期凭据
 
 ## `.env` 加载规则（供应链安全）

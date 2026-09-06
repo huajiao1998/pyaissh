@@ -63,6 +63,11 @@ _SENSITIVE_CMD_RE = re.compile(
         _P_SENS_MYSQL, _P_SENS_CURL_U,
     ))
 
+# "从文件读值"形态（v2.1 豁免：$(cat f) / $(<f)）——凭据不进命令行文本，
+# 日志无明文可泄，warn_sensitive_cmd 对含此形态的命令整条放行（实测误报：
+# DB_PASS=$(cat /srv/x)、export PASS=$(cat /tmp/p)、mysql -p $(cat f)）。
+_READ_FROM_FILE_RE = re.compile(r"\$\(\s*(?:cat\b|<)")
+
 # ---- 验收案例（改 _P_SENS_* 片段必对照自查；完整矩阵见开发机 verify_r3 L4）----
 # 应命中（疑似凭据）：
 #   -psecret / -p secret / -p'xxx' / -p"xxx"       紧贴与空格形态

@@ -59,7 +59,7 @@ python3 pyaissh.py exec root@1.2.3.4 --cmd-file - <<'EOF'   # 长脚本走 stdin
 ls -la /var/log
 EOF
 ```
-超时双参数（`--idle-timeout`/`--max-time`，均退出码 124）、输出截断（`--max-output`）、`--pty`/`--pty-strip-ansi`、`--encoding`（GBK 系统日志乱码时指定编码）、`--sudo`（见速查第 10 条）完整语义见 **docs/exec.md**
+超时双参数（`--idle-timeout`/`--max-time`，均退出码 124）、输出截断（`--max-output`）、`--pty`/`--pty-strip-ansi`、`--encoding`（GBK 系统日志乱码时指定编码）、`--sudo`（见速查第 10 条）、`--progress [SECS]`（v2.1 长任务心跳：静默每 N 秒打 `[PROGRESS] 仍在运行`，不重置静默计时）完整语义见 **docs/exec.md**
 
 ### ls — 列远程目录
 ```bash
@@ -70,9 +70,17 @@ python3 pyaissh.py ls root@1.2.3.4 --path /etc         # entries JSON
 ### upload / download — 传输文件
 ```bash
 python3 pyaissh.py upload root@1.2.3.4 --local ./dist --remote /opt/app/dist
+python3 pyaissh.py upload root@1.2.3.4 --local ./web --remote /var/www --exclude node_modules,.git   # 部署排除（v2.1）
 python3 pyaissh.py download root@1.2.3.4 --remote /var/log/x.log --local ./x.log
 ```
-并行分片（`--parallel 8` 大文件提速）、断点续传（`--resume`）、`.part` 原子性/双丢防护/中断残留、`file_list` 断点重试、`--dry-run`/`--skip-existing`/`--no-recursive`、路径语义完整见 **docs/transfer.md**
+并行分片（`--parallel 8` 大文件提速）、断点续传（`--resume`）、`.part` 原子性/双丢防护/中断残留、`file_list` 断点重试、`--dry-run`/`--skip-existing`/`--no-recursive`、`--exclude` 目录排除（v2.1：逗号分隔 glob，目录整树剪枝/文件不上传）、路径语义完整见 **docs/transfer.md**
+
+### host — 主机别名（多主机不同密码闭环，v2.1）
+```bash
+python3 pyaissh.py host add prod root@1.2.3.4 --password 'xxx'   # 写 .env（幂等更新）
+python3 pyaissh.py exec @prod --cmd 'df -h'                       # 之后用 @别名 走专属凭据
+```
+两台机器不同密码不再逐条 `--password`（进程列表可见 + WARN 刷屏）：`host add` 把 `PYAISSH_HOST_<NAME>`（+`_PASSWORD`/`_KEY`）写进脚本同目录 .env，`@别名` 调用自动用专属凭据；密码是明文存 .env，勿提交 git/分享
 
 ### 跳板机
 ```bash
@@ -82,9 +90,9 @@ python3 pyaissh.py exec root@10.0.0.5 --jump root@1.2.3.4:2222 --cmd 'hostname'
 
 ## 安全规则
 
-- 凭据优先环境变量 / `.env`，**不要写进命令行参数**（进程列表可见）——完整凭据实践见 docs/setup.md
+- 凭据优先环境变量 / `.env`，**不要写进命令行参数**（进程列表可见）——完整凭据实践见 docs/setup.md；多主机别名用 `host add`（上节）
 - **JSON 结果的 `cmd`/`stdout`/`stderr` 字段同样含凭据且不截断**：把结果转发/落盘/写入任务记录前先脱敏
-- 命令含疑似凭据（如 `mysql -p'xxx'`）时 pyaissh 在 stderr 打 WARN——照常执行，但日志可能泄露敏感信息
+- 命令含疑似凭据（如 `mysql -p'xxx'`）时 pyaissh 在 stderr 打 WARN——照常执行，但日志可能泄露敏感信息；**从文件读值**（`PW=$(cat f)` / `$(<f)`）不报（v2.1：值不进命令行文本，无明文泄漏）
 
 ## 已知边界（需警惕的几条，完整见 docs/edge-cases.md）
 

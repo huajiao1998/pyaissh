@@ -139,12 +139,24 @@ def _emit_fields(result, field_spec):
             print(text, file=sys.stderr, flush=True)
         else:
             print(text, flush=True)
-    # A 升级：stderr 盲区兜底提示（结果有非空 stderr 且本次没提取它）
+    # stderr 盲区处理（v2.1 升级：命令失败直接给内容，不再让 AI 多跑一轮取 stderr）
     err_val = result.get("stderr")
     if err_val is not None and str(err_val).strip() and "stderr" not in names:
-        print("[pyaissh: 结果含非空 stderr（%d 字节）——本次 --field 未提取 stderr，"
-              "真实报错可能在其中；用 -stderr 字段（--field stdout,-stderr）查看]"
-              % len(str(err_val)), file=sys.stderr, flush=True)
+        err_s = str(err_val)
+        rc = result.get("exit_code")
+        failed = result.get("ok") is False or (rc not in (0, None))
+        if failed:
+            # 失败路径：直接打 stderr 尾巴（1KB 封顶，报错通常在尾部）——AI 一次
+            # 往返拿到真实报错（实测教训：pip 装依赖失败只给提示要多烧一轮真金白银）
+            tail = err_s if len(err_s) <= 1024 else "…" + err_s[-1024:]
+            print("[pyaissh: 命令失败(exit_code=%s) 且本次未提取 stderr——"
+                  "stderr 尾巴%s（完整内容用 -stderr 字段: --field stdout,-stderr）:\n%s]"
+                  % (rc, "" if len(err_s) <= 1024 else "（仅尾部 1KB）", tail),
+                  file=sys.stderr, flush=True)
+        else:
+            print("[pyaissh: 结果含非空 stderr（%d 字节）——本次 --field 未提取 stderr，"
+                  "真实报错可能在其中；用 -stderr 字段（--field stdout,-stderr）查看]"
+                  % len(err_s), file=sys.stderr, flush=True)
 
 
 def _emit_result(args, result, header=None, sections=None):

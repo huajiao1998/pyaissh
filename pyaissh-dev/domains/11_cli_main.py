@@ -218,6 +218,10 @@ def build_parser():
     p.add_argument("--idle-timeout", dest="exec_timeout", type=_exec_timeout, default=60,
                    help="静默超时秒数：连续无输出超过该值即终止，默认 60，最高 1200 "
                         "（区别于 --max-time 总时长；输出少的慢命令调大这个）")
+    p.add_argument("--progress", type=_positive_int, nargs="?", const=30, metavar="SECS",
+                   help="长任务心跳（v2.1）：命令每静默/持续运行超过 N 秒（默认 30）往 stderr "
+                        "打一行[PROGRESS]仍在运行——AI 知道进程活着不是挂死；"
+                        "不重置静默计时（idle-timeout 仍按真实输出判定）")
     # 兼容别名：v1.3 前叫 --exec-timeout，名字容易被误当成"总超时"而用错
     p.add_argument("--exec-timeout", dest="exec_timeout", type=_exec_timeout,
                    default=argparse.SUPPRESS, help=argparse.SUPPRESS)
@@ -266,6 +270,10 @@ def build_parser():
     p.add_argument("--dry-run", action="store_true", help="只打印清单不实际传输")
     p.add_argument("--skip-existing", dest="skip_existing", action="store_true",
                    help="目标文件已存在且大小一致则跳过（幂等重传，失败重试不重复传）")
+    p.add_argument("--exclude", metavar="GLOB[,GLOB...]",
+                   help="目录递归时排除匹配项（v2.1）：逗号分隔 glob，命中文件名或相对路径"
+                        "即整项跳过——目录整树剪枝、文件不上传不计数；"
+                        "例：--exclude node_modules,.git,'*.log'")
     p.add_argument("--resume", action="store_true",
                    help="断点续传：中断后保留远端 .part，重试从断点继续（仅单文件；"
                         "续传点基于大小，极端损坏场景可下载后 md5sum 复核；"
@@ -320,6 +328,24 @@ def build_parser():
     p.add_argument("--limit", type=_positive_int, default=2000,
                    help="最多返回条目数 (默认 2000，超出截断并置 truncated=true)")
     p.set_defaults(func=cmd_ls)
+
+    # host（v2.1）：主机别名管理——host add 把别名写进 .env
+    p = sub.add_parser("host", help="主机别名管理 (host add NAME user@host)",
+                       description="host add：把主机别名与专属凭据写进脚本同目录 .env，"
+                                   "之后 pyaissh exec @NAME 直接使用（多主机不同密码不再"
+                                   "逐条 --password）。")
+    hsub = p.add_subparsers(dest="host_cmd", metavar="{add}")
+    ha = hsub.add_parser("add", help="添加/更新主机别名",
+                         description="例: pyaissh host add prod root@203.0.113.10 --password xxx"
+                                     "  → 之后 pyaissh exec @prod 使用别名凭据")
+    ha.add_argument("name", help="别名（字母/数字/下划线，不区分大小写）")
+    ha.add_argument("host_target", metavar="USER@HOST[:PORT]",
+                    help="目标（必须带用户名，如 root@1.2.3.4:22）")
+    ha.add_argument("--password", dest="password", default=None,
+                    help="该主机专属密码（写 .env；不给则复用全局 PYAISSH_PASSWORD/私钥）")
+    ha.add_argument("--key", dest="key", default=None,
+                    help="该主机专属私钥路径（写 .env；与密码同时给时 KEY 优先）")
+    ha.set_defaults(func=cmd_host_add)
 
     return parser
 

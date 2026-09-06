@@ -63,6 +63,7 @@
 import argparse
 import codecs
 import errno
+import fnmatch
 import json
 import os
 import posixpath
@@ -131,7 +132,7 @@ except (ValueError, OSError, ImportError):
 被 00_head（信号区）、各 cmd_*（超时/常量）引用；拼接后与本包其余域同模块共享命名空间。
 """
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -311,6 +312,11 @@ _SENSITIVE_CMD_RE = re.compile(
         _P_SENS_P_QUOTED, _P_SENS_P_ATTACH, _P_SENS_P_SPACE,
         _P_SENS_MYSQL, _P_SENS_CURL_U,
     ))
+
+# "从文件读值"形态（v2.1 豁免：$(cat f) / $(<f)）——凭据不进命令行文本，
+# 日志无明文可泄，warn_sensitive_cmd 对含此形态的命令整条放行（实测误报：
+# DB_PASS=$(cat /srv/x)、export PASS=$(cat /tmp/p)、mysql -p $(cat f)）。
+_READ_FROM_FILE_RE = re.compile(r"\$\(\s*(?:cat\b|<)")
 
 # ---- 验收案例（改 _P_SENS_* 片段必对照自查；完整矩阵见开发机 verify_r3 L4）----
 # 应命中（疑似凭据）：
@@ -704,12 +710,24 @@ def _emit_fields(result, field_spec):
             print(text, file=sys.stderr, flush=True)
         else:
             print(text, flush=True)
-    # A 升级：stderr 盲区兜底提示（结果有非空 stderr 且本次没提取它）
+    # stderr 盲区处理（v2.1 升级：命令失败直接给内容，不再让 AI 多跑一轮取 stderr）
     err_val = result.get("stderr")
     if err_val is not None and str(err_val).strip() and "stderr" not in names:
-        print("[pyaissh: 结果含非空 stderr（%d 字节）——本次 --field 未提取 stderr，"
-              "真实报错可能在其中；用 -stderr 字段（--field stdout,-stderr）查看]"
-              % len(str(err_val)), file=sys.stderr, flush=True)
+        err_s = str(err_val)
+        rc = result.get("exit_code")
+        failed = result.get("ok") is False or (rc not in (0, None))
+        if failed:
+            # 失败路径：直接打 stderr 尾巴（1KB 封顶，报错通常在尾部）——AI 一次
+            # 往返拿到真实报错（实测教训：pip 装依赖失败只给提示要多烧一轮真金白银）
+            tail = err_s if len(err_s) <= 1024 else "…" + err_s[-1024:]
+            print("[pyaissh: 命令失败(exit_code=%s) 且本次未提取 stderr——"
+                  "stderr 尾巴%s（完整内容用 -stderr 字段: --field stdout,-stderr）:\n%s]"
+                  % (rc, "" if len(err_s) <= 1024 else "（仅尾部 1KB）", tail),
+                  file=sys.stderr, flush=True)
+        else:
+            print("[pyaissh: 结果含非空 stderr（%d 字节）——本次 --field 未提取 stderr，"
+                  "真实报错可能在其中；用 -stderr 字段（--field stdout,-stderr）查看]"
+                  % len(err_s), file=sys.stderr, flush=True)
 
 
 def _emit_result(args, result, header=None, sections=None):
@@ -977,8 +995,17 @@ def warn_sensitive_cmd(cmd, enabled=True):
     enabled=False 关闭启发式（--no-credential-warn）：误报时使用；注意关闭后
     命令里的真实凭据不再被提示，日志脱敏责任回到调用方（结果 JSON 的 cmd 字段
     仍会原样回显命令）。
+
+    v2.1 豁免：命令含 `$(cat ...)` / `$(<file)` 这类"从文件读值"时整条不报——
+    值来自文件、不落在命令字符串里，日志无明文可泄，WARN 只剩噪音（实测误报：
+    DB_PASS=$(cat /srv/x)、export PASS=$(cat /tmp/p)、mysql -p $(cat f)）。
     """
-    if enabled and cmd and _SENSITIVE_CMD_RE.search(cmd):
+    if not (enabled and cmd):
+        return None
+    if _SENSITIVE_CMD_RE.search(cmd):
+        # 从文件读值（$(cat f) / $(<f)）：凭据不进命令行文本，无明文泄漏，豁免
+        if _READ_FROM_FILE_RE.search(cmd):
+            return None
         msg = ("命令中疑似包含密码/凭据（日志会原样打印命令），"
                "敏感场景建议改用密钥或环境变量注入")
         log("[WARN] " + msg)
@@ -1635,6 +1662,97 @@ def _make_sftp_touch(sftp):
     return _cb
 
 
+
+
+# =========================================================================
+# host 子命令（v2.1）：host add NAME user@host[:port] —— 把主机别名写进 .env
+# =========================================================================
+
+def _env_write_value(env_path, key, value):
+    """把 key=value 写入 .env（已有同名行则整行替换，否则追加）；返回是否新增。
+
+    行内值含空格/#/引号时用双引号包裹（解析器支持引号内 # 不拆）；
+    值内含双引号时拒写（密码等凭据建议 --key 认证替代）。
+    """
+    lines = None
+    if os.path.isfile(env_path):
+        with open(env_path, "r", encoding="utf-8", newline="") as f:
+            lines = f.read().splitlines(keepends=True)
+    newline_eol = "\r\n" if lines and any(l.endswith("\r\n") for l in lines) else "\n"
+    if value and any(ch in value for ch in ' "#\''):
+        if '"' in value:
+            return None  # 拒写信号
+        value = '"%s"' % value
+    line = "%s=%s%s" % (key, value, newline_eol)
+    if lines is None:
+        os.makedirs(os.path.dirname(env_path), exist_ok=True)
+        with open(env_path, "w", encoding="utf-8", newline="") as f:
+            f.write("# pyaissh 主机别名配置（host add 写入；.env 明文请勿提交 git）" + newline_eol + line)
+        return True
+    out, replaced, done = [], False, False
+    for ln in lines:
+        stripped = ln.split("=", 1)
+        if len(stripped) == 2 and stripped[0].strip() == key:
+            if not done:
+                out.append(line)
+                done = True
+                replaced = True
+            continue  # 丢弃旧的重复行
+        out.append(ln)
+    if not done:
+        out.append(line)
+    with open(env_path, "w", encoding="utf-8", newline="") as f:
+        f.write("".join(out))
+    return not replaced
+
+
+def cmd_host_add(args):
+    """pyaissh host add <name> <user@host[:port]> [--password P] [--key PATH]
+
+    把主机别名写进脚本同目录 .env（幂等：同名别名整行更新），随后可用
+    `pyaissh exec @name ...` 直接调用（凭据由别名专属环境变量提供）。
+    密码存 .env 是明文（与 PYAISSH_PASSWORD 同风险），脚本目录 .env 不会被
+    供应链意外加载（仅同目录自动读），但切勿提交 git/分享。
+    """
+    name = getattr(args, "name", "") or ""
+    target = getattr(args, "host_target", "") or ""
+    if not re.match(r"^[A-Za-z0-9_]+$", name):
+        emit_error(args.json, "bad_args",
+                   "别名只允许字母/数字/下划线: %r" % name)
+        return 2
+    try:
+        user, host, port = parse_target(target)
+    except SshError as e:
+        emit_error(args.json, "bad_args", "目标格式错误: %s" % e)
+        return 2
+    if not user:
+        emit_error(args.json, "bad_args",
+                   "别名 target 必须写 user@host[:port]（别名凭据完全由 target 决定）")
+        return 2
+    key = "PYAISSH_HOST_%s" % name.upper()
+    canonical = "%s@%s" % (user, host)
+    if port and port != 22:
+        canonical += ":%d" % port
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    added = _env_write_value(env_path, key, canonical)
+    pw = getattr(args, "password", None)
+    key_path = getattr(args, "key", None)
+    if pw is not None:
+        if _env_write_value(env_path, key + "_PASSWORD", pw) is None:
+            emit_error(args.json, "bad_args",
+                       "密码含双引号无法安全写入 .env——建议用密钥认证（--key）替代")
+            return 2
+    if key_path:
+        _env_write_value(env_path, key + "_KEY", key_path)
+    tips = ["别名 %s -> %s（调用: pyaissh exec @%s ...）" % (name, canonical, name.lower())]
+    if pw is None and not key_path:
+        tips.append("未存密码/密钥：将复用全局 PYAISSH_PASSWORD 或默认私钥；"
+                    "要专属凭据可重跑加 --password/--key")
+    tips.append(".env 是明文（路径 %s），请勿提交 git/分享" % env_path)
+    emit({"ok": True, "action": "host", "alias": "@%s" % name.lower(),
+          "target": canonical, "env_path": env_path, "tips": tips},
+         use_json=getattr(args, "json", True))
+    return 0
 
 # ================= [域 07/12] SFTP 传输层：上传/下载的底层原语 ================= 
 """SFTP 传输层（域 07）：上传/下载的底层原语。
@@ -2820,6 +2938,7 @@ def _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client):
             warnings.append(msg)
             total_limit = MAX_TIME_CAP
         total_deadline = time.time() + total_limit
+        last_hb = [time.time()]  # --progress 心跳（v2.1）：仅告知仍在运行，不重置静默计时
         while not chan.exit_status_ready():
             if _SIGTERM_RECEIVED:
                 # 在我们自己的 Python 帧里抛 KI 是安全的（在 paramiko C 级
@@ -2860,6 +2979,15 @@ def _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client):
                     "命令执行超时（持续输出但未结束，总时长超过 %ds）。长任务请用 --max-time "
                     "调大（最高 %d）；注意：远程进程可能仍在运行，重试前请先 pgrep 确认/清理"
                     % (total_limit, MAX_TIME_CAP))
+            if args.progress:
+                now = time.time()
+                if now - last_hb[0] >= args.progress:
+                    # 心跳（--progress）：进程活着但静默——打 stderr 让 AI 安心，
+                    # 不重置 silence_deadline（否则永远不 idle 超时）
+                    log("[PROGRESS] 仍在运行，已持续 %ds（连续 %ds 无输出/未结束；"
+                        "更久任务调大 --idle-timeout/--max-time）"
+                        % (int(now - start), args.progress))
+                    last_hb[0] = now
             time.sleep(POLL_TICK)
         exit_code = chan.exit_status if chan.exit_status_ready() else -1
         if exit_code == -1:
@@ -3157,6 +3285,17 @@ def cmd_exec(args):
 底层原语在 07_sftp_transfer.py；失败上下文 _transfer_extra 见 07。
 """
 
+def _excluded_by(rel, name, pats):
+    """--exclude 匹配（v2.1）：任一模式（fnmatch glob）命中文件名或相对路径即排除。
+    rel 传入正斜杠相对路径（Windows 也先归一）。"""
+    for p in pats:
+        if not p:
+            continue
+        if fnmatch.fnmatch(name, p) or fnmatch.fnmatch(rel, p):
+            return True
+    return False
+
+
 def cmd_upload(args):
     start = time.time()  # 计时含连接耗时
     local = _fix_msys_local_path(args.local)
@@ -3224,6 +3363,10 @@ def cmd_upload(args):
     tag = "递归" if (is_dir and not no_recur) else ("目录(不递归)" if is_dir else "单文件")
     log("[SFTP] 上传 %s -> %s (%s%s)" % (
         local, remote, tag, ", dry-run" if args.dry_run else ""))
+    # --exclude（v2.1）：逗号分隔 glob，目录整树剪枝 / 文件跳过（不上传不计数）
+    exclude_pats = [p.strip() for p in (args.exclude or "").split(",") if p.strip()]
+    if exclude_pats:
+        log("[EXCL] 排除模式: %s" % ", ".join(exclude_pats))
 
     sftp = None
     try:
@@ -3255,6 +3398,13 @@ def cmd_upload(args):
                 rel_root = os.path.relpath(root, local)
                 remote_root = remote if rel_root == "." else posixpath.join(
                     remote, rel_root.replace(os.sep, "/"))
+                if exclude_pats:
+                    dirs[:] = [d for d in dirs
+                               if not _excluded_by(os.path.join(rel_root, d).replace(os.sep, "/"),
+                                                   d, exclude_pats)]
+                    filenames = [f for f in filenames
+                                 if not _excluded_by(os.path.join(rel_root, f).replace(os.sep, "/"),
+                                                     f, exclude_pats)]
                 if not args.dry_run:
                     sftp_makedirs(sftp, remote_root)
                 for fn in filenames:
@@ -4352,6 +4502,10 @@ def build_parser():
     p.add_argument("--idle-timeout", dest="exec_timeout", type=_exec_timeout, default=60,
                    help="静默超时秒数：连续无输出超过该值即终止，默认 60，最高 1200 "
                         "（区别于 --max-time 总时长；输出少的慢命令调大这个）")
+    p.add_argument("--progress", type=_positive_int, nargs="?", const=30, metavar="SECS",
+                   help="长任务心跳（v2.1）：命令每静默/持续运行超过 N 秒（默认 30）往 stderr "
+                        "打一行[PROGRESS]仍在运行——AI 知道进程活着不是挂死；"
+                        "不重置静默计时（idle-timeout 仍按真实输出判定）")
     # 兼容别名：v1.3 前叫 --exec-timeout，名字容易被误当成"总超时"而用错
     p.add_argument("--exec-timeout", dest="exec_timeout", type=_exec_timeout,
                    default=argparse.SUPPRESS, help=argparse.SUPPRESS)
@@ -4400,6 +4554,10 @@ def build_parser():
     p.add_argument("--dry-run", action="store_true", help="只打印清单不实际传输")
     p.add_argument("--skip-existing", dest="skip_existing", action="store_true",
                    help="目标文件已存在且大小一致则跳过（幂等重传，失败重试不重复传）")
+    p.add_argument("--exclude", metavar="GLOB[,GLOB...]",
+                   help="目录递归时排除匹配项（v2.1）：逗号分隔 glob，命中文件名或相对路径"
+                        "即整项跳过——目录整树剪枝、文件不上传不计数；"
+                        "例：--exclude node_modules,.git,'*.log'")
     p.add_argument("--resume", action="store_true",
                    help="断点续传：中断后保留远端 .part，重试从断点继续（仅单文件；"
                         "续传点基于大小，极端损坏场景可下载后 md5sum 复核；"
@@ -4454,6 +4612,24 @@ def build_parser():
     p.add_argument("--limit", type=_positive_int, default=2000,
                    help="最多返回条目数 (默认 2000，超出截断并置 truncated=true)")
     p.set_defaults(func=cmd_ls)
+
+    # host（v2.1）：主机别名管理——host add 把别名写进 .env
+    p = sub.add_parser("host", help="主机别名管理 (host add NAME user@host)",
+                       description="host add：把主机别名与专属凭据写进脚本同目录 .env，"
+                                   "之后 pyaissh exec @NAME 直接使用（多主机不同密码不再"
+                                   "逐条 --password）。")
+    hsub = p.add_subparsers(dest="host_cmd", metavar="{add}")
+    ha = hsub.add_parser("add", help="添加/更新主机别名",
+                         description="例: pyaissh host add prod root@203.0.113.10 --password xxx"
+                                     "  → 之后 pyaissh exec @prod 使用别名凭据")
+    ha.add_argument("name", help="别名（字母/数字/下划线，不区分大小写）")
+    ha.add_argument("host_target", metavar="USER@HOST[:PORT]",
+                    help="目标（必须带用户名，如 root@1.2.3.4:22）")
+    ha.add_argument("--password", dest="password", default=None,
+                    help="该主机专属密码（写 .env；不给则复用全局 PYAISSH_PASSWORD/私钥）")
+    ha.add_argument("--key", dest="key", default=None,
+                    help="该主机专属私钥路径（写 .env；与密码同时给时 KEY 优先）")
+    ha.set_defaults(func=cmd_host_add)
 
     return parser
 

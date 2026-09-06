@@ -608,3 +608,94 @@ def _make_sftp_touch(sftp):
     return _cb
 
 
+
+
+# =========================================================================
+# host 子命令（v2.1）：host add NAME user@host[:port] —— 把主机别名写进 .env
+# =========================================================================
+
+def _env_write_value(env_path, key, value):
+    """把 key=value 写入 .env（已有同名行则整行替换，否则追加）；返回是否新增。
+
+    行内值含空格/#/引号时用双引号包裹（解析器支持引号内 # 不拆）；
+    值内含双引号时拒写（密码等凭据建议 --key 认证替代）。
+    """
+    lines = None
+    if os.path.isfile(env_path):
+        with open(env_path, "r", encoding="utf-8", newline="") as f:
+            lines = f.read().splitlines(keepends=True)
+    newline_eol = "\r\n" if lines and any(l.endswith("\r\n") for l in lines) else "\n"
+    if value and any(ch in value for ch in ' "#\''):
+        if '"' in value:
+            return None  # 拒写信号
+        value = '"%s"' % value
+    line = "%s=%s%s" % (key, value, newline_eol)
+    if lines is None:
+        os.makedirs(os.path.dirname(env_path), exist_ok=True)
+        with open(env_path, "w", encoding="utf-8", newline="") as f:
+            f.write("# pyaissh 主机别名配置（host add 写入；.env 明文请勿提交 git）" + newline_eol + line)
+        return True
+    out, replaced, done = [], False, False
+    for ln in lines:
+        stripped = ln.split("=", 1)
+        if len(stripped) == 2 and stripped[0].strip() == key:
+            if not done:
+                out.append(line)
+                done = True
+                replaced = True
+            continue  # 丢弃旧的重复行
+        out.append(ln)
+    if not done:
+        out.append(line)
+    with open(env_path, "w", encoding="utf-8", newline="") as f:
+        f.write("".join(out))
+    return not replaced
+
+
+def cmd_host_add(args):
+    """pyaissh host add <name> <user@host[:port]> [--password P] [--key PATH]
+
+    把主机别名写进脚本同目录 .env（幂等：同名别名整行更新），随后可用
+    `pyaissh exec @name ...` 直接调用（凭据由别名专属环境变量提供）。
+    密码存 .env 是明文（与 PYAISSH_PASSWORD 同风险），脚本目录 .env 不会被
+    供应链意外加载（仅同目录自动读），但切勿提交 git/分享。
+    """
+    name = getattr(args, "name", "") or ""
+    target = getattr(args, "host_target", "") or ""
+    if not re.match(r"^[A-Za-z0-9_]+$", name):
+        emit_error(args.json, "bad_args",
+                   "别名只允许字母/数字/下划线: %r" % name)
+        return 2
+    try:
+        user, host, port = parse_target(target)
+    except SshError as e:
+        emit_error(args.json, "bad_args", "目标格式错误: %s" % e)
+        return 2
+    if not user:
+        emit_error(args.json, "bad_args",
+                   "别名 target 必须写 user@host[:port]（别名凭据完全由 target 决定）")
+        return 2
+    key = "PYAISSH_HOST_%s" % name.upper()
+    canonical = "%s@%s" % (user, host)
+    if port and port != 22:
+        canonical += ":%d" % port
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    added = _env_write_value(env_path, key, canonical)
+    pw = getattr(args, "password", None)
+    key_path = getattr(args, "key", None)
+    if pw is not None:
+        if _env_write_value(env_path, key + "_PASSWORD", pw) is None:
+            emit_error(args.json, "bad_args",
+                       "密码含双引号无法安全写入 .env——建议用密钥认证（--key）替代")
+            return 2
+    if key_path:
+        _env_write_value(env_path, key + "_KEY", key_path)
+    tips = ["别名 %s -> %s（调用: pyaissh exec @%s ...）" % (name, canonical, name.lower())]
+    if pw is None and not key_path:
+        tips.append("未存密码/密钥：将复用全局 PYAISSH_PASSWORD 或默认私钥；"
+                    "要专属凭据可重跑加 --password/--key")
+    tips.append(".env 是明文（路径 %s），请勿提交 git/分享" % env_path)
+    emit({"ok": True, "action": "host", "alias": "@%s" % name.lower(),
+          "target": canonical, "env_path": env_path, "tips": tips},
+         use_json=getattr(args, "json", True))
+    return 0

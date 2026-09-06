@@ -202,8 +202,17 @@ def warn_sensitive_cmd(cmd, enabled=True):
     enabled=False 关闭启发式（--no-credential-warn）：误报时使用；注意关闭后
     命令里的真实凭据不再被提示，日志脱敏责任回到调用方（结果 JSON 的 cmd 字段
     仍会原样回显命令）。
+
+    v2.1 豁免：命令含 `$(cat ...)` / `$(<file)` 这类"从文件读值"时整条不报——
+    值来自文件、不落在命令字符串里，日志无明文可泄，WARN 只剩噪音（实测误报：
+    DB_PASS=$(cat /srv/x)、export PASS=$(cat /tmp/p)、mysql -p $(cat f)）。
     """
-    if enabled and cmd and _SENSITIVE_CMD_RE.search(cmd):
+    if not (enabled and cmd):
+        return None
+    if _SENSITIVE_CMD_RE.search(cmd):
+        # 从文件读值（$(cat f) / $(<f)）：凭据不进命令行文本，无明文泄漏，豁免
+        if _READ_FROM_FILE_RE.search(cmd):
+            return None
         msg = ("命令中疑似包含密码/凭据（日志会原样打印命令），"
                "敏感场景建议改用密钥或环境变量注入")
         log("[WARN] " + msg)

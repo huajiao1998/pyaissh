@@ -22,6 +22,7 @@ python3 pyaissh.py upload root@1.2.3.4 --local ./dist --remote /opt/app/dist --s
 - **字节字段**：`bytes` = 清单总大小（含 skipped，失败时也如实反映），`bytes_transferred` = 实际传输字节（skip-existing 全跳过时为 0；dry-run 恒 0；**上传中断/失败时反映回调记账的真实已传字节**——实测跨境 50MB 传 8 秒被中断报 13139968，据此判断断点而非误判"全没传"再全量重传）
 - **`--skip-existing` 仅比大小**（`st_size`，不比内容/时间戳）：跳过的文件**假定完整**——pyaissh 原子传输（`.part` + 原子改名）保证**自己产生的最终文件必完整**（硬杀时只留 `.part` 孤儿、无最终名），"大小一致内容损坏"只能来自外部（用户自放/磁盘损坏）。若担心外部文件损坏，skip 后可 `md5sum` 抽查
 - **目录下载不跟随符号链接**：symlink 条目一律跳过并进 `warnings`（悬空/指向目录的链接跟随会中止整个目录且报错无法理解，lstat 尺寸还会让记账失真）；需要链接指向的内容，请对具体路径单独 download。**FIFO/套接字/设备文件同样跳过 + WARN**（服务端 open FIFO 会阻塞挂死）。**空目录也会重建**（结构完整到达）。**`--parallel` 对目录下载不生效**（逐文件串行，会 WARN 提示）
+- **目录排除（`--exclude GLOB[,GLOB...]`，v2.1，仅 upload 递归）**：逗号分隔 glob，**命中文件名或相对路径即排除**——目录**整树剪枝**（不再深入）、文件**不上传不计数**（`file_list`/`bytes_transferred` 均不含，排除是"从未打算传"而非 skipped）；典型：`--exclude node_modules,.git,'*.log'` 部署前清理（实测曾把 11MB 的 Windows esbuild 二进制白传上去再 ssh 删）。注意 fnmatch 语义：`*` 不跨 `/`（深路径精确匹配需写相对路径模式）；单文件上传不受影响（只对目录递归生效）
 - `file_list` 每项含 `transferred`/`skipped` 状态：失败/中断时 AI 可精确断点重试
 - 目录自动递归，远程目录自动创建；download 保留远程权限位（**setuid/setgid/sticky 特殊位会被掩掉**，防止 root 下载 4755 文件在本地造出提权落点）；跳过不可读目录会进 `warnings`（注意 `file_list` 缺项）
 - `file_list` 的 `path`：upload 是**本地**路径，download 是**远程**相对路径（两侧语义不同，勿混用）；`--no-recursive`：只创建目录壳（本地/远程空目录），不传输任何子项

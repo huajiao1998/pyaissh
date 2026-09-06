@@ -45,7 +45,7 @@ EOF
 
 1. **先预估时长，调大 `--idle-timeout`**：`--idle-timeout 600`（上限 1200s=20min；`--max-time` 默认 2×idle-timeout 且至少 120，**记得同步调大覆盖总时长**，如 `--max-time 1200`）。零输出但继续等：持续有输出就无限续、无输出超 idle-timeout 判挂死——长任务先估总时长给足两个参数
 2. **传输类（upload/download 大文件）**：默认 ≥8MB 自动 4 连接并行分片（也可显式 `--parallel 8` 提速）；真超时中断是安全的——写 `.part.<pid>` 原子改名不留半截最终文件，重跑 `--resume` 续传或整传重跑即可（幂等）；**轮询远端确认**：中断后用 `ls`/`test` 查远端文件大小/存在性再决定续传还是重跑（`file_list`/`bytes_transferred` 字段对账）
-3. **循环/长命令类**：给命令**自己加心跳输出**——`while ...; do ...; echo "heartbeat $(date +%s)"; done`（循环内周期 echo，让 idle-timeout 不触发）；纯等待类（`sleep 300`）直接给足 `--idle-timeout` 即可
+3. **循环/长命令类**：给命令**自己加心跳输出**——`while ...; do ...; echo "heartbeat $(date +%s)"; done`（循环内周期 echo，让 idle-timeout 不触发）；纯等待类（`sleep 300`）直接给足 `--idle-timeout` 即可；**工具侧心跳 `--progress [SECS]`（v2.1，默认 30）**：命令每静默/持续运行超过 N 秒往 stderr 打一行 `[PROGRESS] 仍在运行，已 Xs`——AI 知道进程活着不是挂死，不用靠猜；**注意心跳不重置静默计时**（idle-timeout 仍按真实输出判定，心跳防不了超时，只解决"是否还活着"的不确定性）
 4. **不可预估/超 20min 上限**：拆段执行（分批 apt/分片传输）或**后台化 + 轮询**——`--cmd "nohup <长命令> >/tmp/task.log 2>&1 & echo started"` 立即返回，之后周期 `exec --cmd "tail -3 /tmp/task.log"` 轮询日志（配 `--idle-timeout` 小的短命令查进度），完成标志出现在日志后取最终结果
 5. **中断后**：先 pgrep/tail 确认远端实际状态（超时类 JSON 带 `remote_may_be_running:true` = 进程可能仍在跑，别盲目重跑副作用命令），再决定续传/重跑/清理
 

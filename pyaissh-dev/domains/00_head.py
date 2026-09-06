@@ -63,6 +63,7 @@
 import argparse
 import codecs
 import errno
+import fnmatch
 import json
 import os
 import posixpath
