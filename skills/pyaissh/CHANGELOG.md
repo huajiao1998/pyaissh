@@ -218,3 +218,20 @@
 - **验证（重构前后行为一致性）**：金标往返逐字节一致 → 搬移期 12 域 join = 原文件；改码期 A 机 15/15 + B2 机 18/18 用例 JSON 逐字段一致（exec 各形态/pty/超时/截断/sudo/cmd-file/传输往返）+ 回归 54/54 + sudo 12/12 + field 10/10。
 - **代码地图**：每个域文件带模块 docstring（内容/关键符号/被谁引用）；`pyaissh-dev/` 独立 git 全程可回滚。
 - **构建器自动生成域边界横幅**：join 时在每个域拼接处插入 `# ===== [域 NN/12] <标题> =====`（标题从域 docstring 首行自动提取）——成品单文件与 12 域文档视觉对应，使用 AI 滚到任意位置知道在哪个域；纯注释、行为零变化、确定性构建。曾评估"函数行号索引"（文件尾跳转表）后**回退**：使用 AI 改文件后行号漂移会成为错误导航（横幅/docstring 是内容标记不依赖行号，稳定可用）。
+
+## [2.1.0] - 2026-09-07
+
+### 新增/修复（来自真实使用 AI 反馈，按烦人程度排序）
+1. **`--field` 命令失败直接给 stderr 尾巴**（修复"多跑一轮真金白银"）：`--field stdout` + exit≠0 + stderr 未提取时，stderr 通道直接打**截断尾巴（1KB 封顶）**，不再只给"结果含非空 stderr"提示让 AI 再跑一次取 stderr；命令成功但 stderr 非空仍保持原提示（内容非报错不塞）。实测：pip 装依赖失败一次往返拿到真实报错。
+2. **`host add` 子命令（多主机不同密码闭环）**：`pyaissh host add prod root@1.2.3.4 --password xxx` 把别名写进脚本同目录 .env（幂等更新；含 #/空格的密码自动引号包裹）→ 之后 `pyaissh exec @prod` 直接用别名专属凭据，不再逐条 `--password`（进程列表可见 + WARN 刷屏）。KEY 专属私钥同支持。
+3. **upload `--exclude GLOB[,GLOB...]`**（部署排除）：目录递归时排除匹配项——目录整树剪枝、文件不上传不计数（命中文件名或相对路径的 fnmatch glob）；`--exclude node_modules,.git` 部署不再白传 11MB。
+4. **凭据扫描豁免从文件读值**：命令含 `$(cat f)` / `$(<f)` 整条不报 WARN（值来自文件、不进命令行文本、无明文泄漏——DB_PASS=$(cat /srv/x) 类实测误报消除）；真凭据字面（-psecret 等）仍命中。
+5. **exec `--progress [SECS]`（长任务心跳）**：命令静默/持续运行每 N 秒（默认 30）往 stderr 打 `[PROGRESS] 仍在运行，已 Xs`——AI 知道进程活着不是挂死；**不重置静默计时**（idle-timeout 仍按真实输出判定，心跳不防超时）。
+### 变更
+- 凭据 WARN 的 `$(cat` 豁免在 warn_sensitive_cmd 内实现（_READ_FROM_FILE_RE，05/02 域）
+- host add 实现于 06_conn 域（_env_write_value/cmd_host_add）；.env 写入与 load_env 同路径（脚本同目录）
+### 测试
+- 测试体系扩至 152 断言：unit 58+47+6 + live 12+22+7（$(cat 豁免 6 / exclude 匹配 4+真机 1 / field 失败尾巴 2 / progress 心跳 1），B2 真机全绿
+- host add 手动验证：副本 .env 写入（含引号密码/幂等更新/别名调用 @prod 解析正确）
+### 文档
+- SKILL/docs 同步见仓库文档更新（transfer.md --exclude / exec.md --progress + field 尾巴 / setup.md host add / .env.example）
