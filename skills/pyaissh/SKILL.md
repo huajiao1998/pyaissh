@@ -80,7 +80,7 @@ python3 pyaissh.py download root@1.2.3.4 --remote /var/log/x.log --local ./x.log
 python3 pyaissh.py host add prod root@1.2.3.4 --password 'xxx'   # 写 .env（幂等更新）
 python3 pyaissh.py exec @prod --cmd 'df -h'                       # 之后用 @别名 走专属凭据
 ```
-两台机器不同密码不再逐条 `--password`（进程列表可见 + WARN 刷屏）：`host add` 把 `PYAISSH_HOST_<NAME>`（+`_PASSWORD`/`_KEY`）写进脚本同目录 .env，`@别名` 调用自动用专属凭据；密码是明文存 .env，勿提交 git/分享
+两台机器不同密码不再逐条 `--password`（进程列表可见 + WARN 刷屏）：`host add` 把 `PYAISSH_HOST_<NAME>`（+`_PASSWORD`/`_KEY`）写进脚本同目录 .env，`@别名` 调用自动用专属凭据；密码是明文存 .env，勿提交 git/分享。管理：`host list`（列别名，不回显密码）/ `host remove NAME`（删别名含专属凭据）；均支持 `--field`（如 `host list --field entries`）
 
 ### 跳板机
 ```bash

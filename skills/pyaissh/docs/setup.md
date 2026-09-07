@@ -7,6 +7,7 @@
 
 - 目标格式：`[user@]host[:port]`，如 `root@1.2.3.4:22`；支持 IPv6：`user@[2001:db8::1]:22`、`[2001:db8::1]`、裸 IPv6 地址；**主机别名**：`.env` 配 `PYAISSH_HOST_<名称>=user@host:port`（如 `PYAISSH_HOST_PROD=root@1.2.3.4:22`），target 写 `@名称` 即可引用（如 `pyaissh test @prod`；**键名整体大小写不敏感**：`PYAISSH_HOST_PROD` / `pyaissh_host_prod` / `PYAISSH_host_prod` 都能命中，Linux 与 Windows 行为一致）；**显式 `-p/--port` 优先于 target/别名内嵌端口**（与 ssh 惯例一致，写 `-p` 通常就是想纠正 target 里的端口）
 - **`host add` 免手写 .env（v2.1，多主机不同密码闭环）**：`pyaissh host add prod root@1.2.3.4 --password 'xxx'` 自动把 `PYAISSH_HOST_PROD=root@1.2.3.4`（+`_PASSWORD`，`--key` 时写 `_KEY`）写进脚本同目录 .env——**幂等**（同名别名整行更新）；含空格/`#`/引号的密码自动引号包裹（含双引号的密码拒写，建议密钥认证）。两台机器不同密码 = 各 `host add` 一次，之后 `exec @prod` / `exec @test` 各走各的凭据——不再逐条 `--password`（进程列表可见 + 每条触发凭据 WARN）。密码仍是 .env 明文，勿提交 git
+- **管理（v2.1.3）**：`pyaissh host list` 列已配别名（`entries[{name,target}]`，**不回显密码/密钥**；`--field entries` 只取清单）；`pyaissh host remove NAME` 删别名（连同其 `_PASSWORD`/`_KEY` 行；不存在报 bad_args 并提示 list）
 
 ## 凭据（认证优先级）
 

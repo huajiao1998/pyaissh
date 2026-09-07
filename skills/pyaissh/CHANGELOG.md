@@ -256,3 +256,13 @@
 - host --field 手动副本验证（alias/target 裸值 + 默认 JSON 不回归）；全量 153 断言不受影响（纯输出路径调整，回归已绿）
 ### 文档
 - transfer.md dry-run field 姿势；pyaissh-dev/README backlog 节
+
+## [2.1.3] - 2026-09-07
+
+### 新增（backlog 兑现）
+1. **`host remove NAME`**：从 .env 删除别名——连同其专属 `_PASSWORD`/`_KEY` 行（`已删除 N 行` 明示）；别名不存在报 bad_args 并提示 `host list` 查看。支持 `--field removed`。
+2. **`host list`**：列出 .env 已配置别名——`entries[{name,target}]`（**只读 host 行，绝不回显密码/密钥**）；`--field entries` 只取清单。add/remove/list 三者闭环，别名管理不再需要手改 .env。
+### 测试
+- 副本手动验证：add×3 → list(3，无密码) → list --field entries → remove test(删 2 行) → remove 不存在(明确 bad_args) → 再 list(剩 2)；.env 行级核对干净
+### 文档
+- SKILL host 节 + setup.md 补 remove/list；pyaissh-dev/README backlog 标记已实现

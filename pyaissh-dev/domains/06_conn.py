@@ -700,3 +700,77 @@ def cmd_host_add(args):
     # v2.1.2：统一走 _emit_result——host 也支持 --field（如 --field alias 只取别名）
     _emit_result(args, result)
     return 0
+
+
+def _env_remove_keys(env_path, prefix):
+    """从 .env 删除所有以 prefix 开头的键行（返回删除行数）。"""
+    if not os.path.isfile(env_path):
+        return 0
+    with open(env_path, "r", encoding="utf-8", newline="") as f:
+        lines = f.read().splitlines(keepends=True)
+    newline_eol = "\r\n" if any(l.endswith("\r\n") for l in lines) else "\n"
+    kept, removed = [], 0
+    for ln in lines:
+        key = ln.split("=", 1)[0].strip()
+        if key.startswith(prefix):
+            removed += 1
+            continue
+        kept.append(ln)
+    if removed:
+        with open(env_path, "w", encoding="utf-8", newline="") as f:
+            f.write("".join(kept))
+    return removed
+
+
+def _env_host_entries(env_path):
+    """读 .env 的 PYAISSH_HOST_<NAME>=user@host 行 -> [(name, target), ...]
+    （只读 host 行，不含密码/密钥——list 绝不回显凭据）。"""
+    if not os.path.isfile(env_path):
+        return []
+    out = []
+    with open(env_path, "r", encoding="utf-8") as f:
+        for ln in f:
+            line = ln.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not line.startswith("PYAISSH_HOST_"):
+                continue
+            if "_PASSWORD" in line or "_KEY" in line:
+                continue
+            key, _, val = line.partition("=")
+            name = key[len("PYAISSH_HOST_"):].strip()
+            target = val.strip().strip('"').strip("'")
+            if name and target:
+                out.append((name.lower(), target))
+    return out
+
+
+def cmd_host_remove(args):
+    """pyaissh host remove <name> —— 从 .env 删除别名（含专属密码/密钥行）。"""
+    name = getattr(args, "name", "") or ""
+    if not re.match(r"^[A-Za-z0-9_]+$", name):
+        emit_error(args.json, "bad_args", "别名只允许字母/数字/下划线: %r" % name)
+        return 2
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    prefix = "PYAISSH_HOST_%s" % name.upper()
+    removed = _env_remove_keys(env_path, prefix)
+    if removed == 0:
+        emit_error(args.json, "bad_args",
+                   "别名 %s 不存在（host list 可查看已配置别名）" % name)
+        return 2
+    result = {"ok": True, "action": "host", "removed": "@%s" % name.lower(),
+              "env_path": env_path,
+              "note": "已删除 %d 行（host 目标及其专属密码/密钥，如有）" % removed}
+    _emit_result(args, result)
+    return 0
+
+
+def cmd_host_list(args):
+    """pyaissh host list —— 列出 .env 已配置的别名（只列 host 行，不回显密码/密钥）。"""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    entries = [{"name": n, "target": t} for n, t in _env_host_entries(env_path)]
+    result = {"ok": True, "action": "host_list", "count": len(entries),
+              "entries": entries,
+              "tip": "调用: pyaissh exec @<name> ...（别名专属密码/密钥不在此列出）"}
+    _emit_result(args, result)
+    return 0

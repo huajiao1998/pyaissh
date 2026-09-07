@@ -329,12 +329,12 @@ def build_parser():
                    help="最多返回条目数 (默认 2000，超出截断并置 truncated=true)")
     p.set_defaults(func=cmd_ls)
 
-    # host（v2.1）：主机别名管理——host add 把别名写进 .env
-    p = sub.add_parser("host", help="主机别名管理 (host add NAME user@host)",
+    # host（v2.1）：主机别名管理——host add 把别名写进 .env；remove/list（v2.1.3）
+    p = sub.add_parser("host", help="主机别名管理 (host add/remove/list)",
                        description="host add：把主机别名与专属凭据写进脚本同目录 .env，"
                                    "之后 pyaissh exec @NAME 直接使用（多主机不同密码不再"
-                                   "逐条 --password）。")
-    hsub = p.add_subparsers(dest="host_cmd", metavar="{add}")
+                                   "逐条 --password）；remove/list 管理已配别名。")
+    hsub = p.add_subparsers(dest="host_cmd", metavar="{add,remove,list}")
     ha = hsub.add_parser("add", help="添加/更新主机别名",
                          description="例: pyaissh host add prod root@203.0.113.10 --password xxx"
                                      "  → 之后 pyaissh exec @prod 使用别名凭据")
@@ -349,6 +349,19 @@ def build_parser():
                     help="只取结果字段裸值（如 --field alias 得 @prod；dict/list JSON 序列化）"
                          "——host 与各子命令统一（v2.1.2）")
     ha.set_defaults(func=cmd_host_add)
+
+    hr = hsub.add_parser("remove", help="删除主机别名（含专属密码/密钥）",
+                         description="例: pyaissh host remove prod  → 从 .env 删该别名（含其专属密码/密钥行）")
+    hr.add_argument("name", help="别名")
+    hr.add_argument("--field", dest="field", default=argparse.SUPPRESS,
+                    help="只取结果字段裸值（如 --field removed）")
+    hr.set_defaults(func=cmd_host_remove)
+
+    hl = hsub.add_parser("list", help="列出已配置别名（只列 host 行，不回显密码/密钥）",
+                         description="例: pyaissh host list  → entries[{name,target}]；--field entries 只取清单")
+    hl.add_argument("--field", dest="field", default=argparse.SUPPRESS,
+                    help="只取结果字段裸值（如 --field entries 得清单 JSON）")
+    hl.set_defaults(func=cmd_host_list)
 
     return parser
 

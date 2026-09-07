@@ -90,3 +90,9 @@
 ### 变更
 - host add 输出走 _emit_result（--field 支持）；副本手动验证（alias/target 裸值 + 默认 JSON 不回归）
 - host remove/list 进 dev README backlog（自动化测试跳过——host add 写 .env 需副本，代价高收益低，手动验证已覆盖）
+
+## [2026-09-07] v2.1.3 host remove/list（backlog 兑现）
+
+### 新增
+- host remove NAME（删别名+专属凭据行；不存在明确 bad_args）+ host list（entries 不回显密码）
+- 副本手动验证全流程（add×3/list/remove/不存在/再 list + .env 行级核对）——host 写 .env 需副本，未自动化（同 v2.1.2 理由）
