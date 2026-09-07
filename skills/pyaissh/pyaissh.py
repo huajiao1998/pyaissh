@@ -132,7 +132,7 @@ except (ValueError, OSError, ImportError):
 被 00_head（信号区）、各 cmd_*（超时/常量）引用；拼接后与本包其余域同模块共享命名空间。
 """
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -647,10 +647,12 @@ _setup_console_utf8()
 _QUIET = False
 
 
-def log(msg):
+def log(msg, force=False):
     """进度日志，打到 stderr（两种模式都打），不污染 stdout。
-    --field 静音模式下只保留 [WARN] 级信号（凭据警告等），丢进度行。"""
-    if _QUIET and not msg.startswith("[WARN]"):
+    --field 静音模式下只保留 [WARN] 级信号（凭据警告等），丢进度行。
+    force=True 时绕过 _QUIET（v2.1：--progress 心跳是显式请求的信号——
+    长任务 + --field stdout 恰是最需要心跳的场景，不该被噪音静音吞掉）。"""
+    if _QUIET and not force and not msg.startswith("[WARN]"):
         return
     print(msg, file=sys.stderr, flush=True)
 
@@ -2983,10 +2985,11 @@ def _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client):
                 now = time.time()
                 if now - last_hb[0] >= args.progress:
                     # 心跳（--progress）：进程活着但静默——打 stderr 让 AI 安心，
-                    # 不重置 silence_deadline（否则永远不 idle 超时）
+                    # 不重置 silence_deadline（否则永远不 idle 超时）；force=True
+                    # 绕过 --field 静音（长任务 + --field stdout 恰最需要心跳）
                     log("[PROGRESS] 仍在运行，已持续 %ds（连续 %ds 无输出/未结束；"
                         "更久任务调大 --idle-timeout/--max-time）"
-                        % (int(now - start), args.progress))
+                        % (int(now - start), args.progress), force=True)
                     last_hb[0] = now
             time.sleep(POLL_TICK)
         exit_code = chan.exit_status if chan.exit_status_ready() else -1

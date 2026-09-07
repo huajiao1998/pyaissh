@@ -76,10 +76,12 @@ _setup_console_utf8()
 _QUIET = False
 
 
-def log(msg):
+def log(msg, force=False):
     """进度日志，打到 stderr（两种模式都打），不污染 stdout。
-    --field 静音模式下只保留 [WARN] 级信号（凭据警告等），丢进度行。"""
-    if _QUIET and not msg.startswith("[WARN]"):
+    --field 静音模式下只保留 [WARN] 级信号（凭据警告等），丢进度行。
+    force=True 时绕过 _QUIET（v2.1：--progress 心跳是显式请求的信号——
+    长任务 + --field stdout 恰是最需要心跳的场景，不该被噪音静音吞掉）。"""
+    if _QUIET and not force and not msg.startswith("[WARN]"):
         return
     print(msg, file=sys.stderr, flush=True)
 

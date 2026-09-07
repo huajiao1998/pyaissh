@@ -14,7 +14,7 @@
   2) unit_credential   凭据启发式 47 例（含 \$(cat 豁免）
   3) unit_artifacts    制品结构（域边界横幅 11 + 域 docstring 代码地图 + VERSION 一致）
   4) live_sudo         --sudo 提权 12 例（真机）
-  5) live_exec_field   exec+field 22 例（真机）
+  5) live_exec_field   exec+field 23 例（真机）
   6) live_transfer     传输往返 7 例（真机：默认/--parallel/--resume/--exclude）
 
 本文件代码地图（改测试先看这里；维护记录见 tests/CHANGELOG.md）：
@@ -477,6 +477,12 @@ def suite_live_exec_field(s):
     p = _live_sub(["exec", tgt, "--cmd", "sleep 3", "--progress", "1"], timeout=60)
     s.check("--progress 心跳", "[PROGRESS] 仍在运行" in p.stderr
             and p.returncode == 0)
+    # v2.1.1：心跳是显式请求的信号——--field stdout 下不被噪音静音吞掉
+    #   （长任务 + --field stdout 恰是最需要心跳的场景，实测教训）
+    p = _live_sub(["exec", tgt, "--cmd", "sleep 2", "--progress", "1", "--field", "stdout"],
+                  timeout=60)
+    s.check("--field 下 --progress 心跳可见", "[PROGRESS] 仍在运行" in p.stderr
+            and "[SSH]" not in p.stderr and p.stdout.strip() == "")
 
 
 # ============================================================
@@ -592,7 +598,7 @@ SUITES = [
     ("unit_credential", "凭据启发式 47 例（含 \$(cat 豁免）", suite_unit_credential),
     ("unit_artifacts", "制品结构 6 例（域横幅/代码地图/VERSION）", suite_unit_artifacts),
     ("live_sudo", "--sudo 提权 12 例（真机）", suite_live_sudo),
-    ("live_exec_field", "exec+field 22 例（真机）", suite_live_exec_field),
+    ("live_exec_field", "exec+field 23 例（真机）", suite_live_exec_field),
     ("live_transfer", "传输往返 7 例（真机：默认/--parallel/--resume/--exclude）", suite_live_transfer),
 ]
 

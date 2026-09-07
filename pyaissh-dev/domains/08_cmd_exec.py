@@ -431,10 +431,11 @@ def _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client):
                 now = time.time()
                 if now - last_hb[0] >= args.progress:
                     # 心跳（--progress）：进程活着但静默——打 stderr 让 AI 安心，
-                    # 不重置 silence_deadline（否则永远不 idle 超时）
+                    # 不重置 silence_deadline（否则永远不 idle 超时）；force=True
+                    # 绕过 --field 静音（长任务 + --field stdout 恰最需要心跳）
                     log("[PROGRESS] 仍在运行，已持续 %ds（连续 %ds 无输出/未结束；"
                         "更久任务调大 --idle-timeout/--max-time）"
-                        % (int(now - start), args.progress))
+                        % (int(now - start), args.progress), force=True)
                     last_hb[0] = now
             time.sleep(POLL_TICK)
         exit_code = chan.exit_status if chan.exit_status_ready() else -1

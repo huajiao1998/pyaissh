@@ -235,3 +235,12 @@
 - host add 手动验证：副本 .env 写入（含引号密码/幂等更新/别名调用 @prod 解析正确）
 ### 文档
 - SKILL/docs 同步见仓库文档更新（transfer.md --exclude / exec.md --progress + field 尾巴 / setup.md host add / .env.example）
+
+## [2.1.1] - 2026-09-07
+
+### 修复
+- **`--progress` 心跳在 `--field` 模式下被静音（v2.1.0 缺陷）**：心跳走 log() 被 v1.5.19 的 `--field` 噪音静音机制吞掉——而**长任务恰恰最常用 `--field stdout`**（消费端只等字段，静默期最需要"还在跑"的信号）。修复：log() 加 force 参数，心跳 `force=True` 绕过 `_QUIET`（显式请求 = 信号不是噪音；`[WARN]` 同理本就例外）。实测：`--field stdout` + `--progress 1` 心跳行正常输出，其余进度行仍静音。
+### 测试
+- live_exec_field +1：`--field` 下 `--progress` 心跳可见（且无 [SSH] 进度噪音、stdout 裸值纯净）——exec_field 22→23，全量 153 断言
+### 文档
+- contract.md `--field` stderr 契约补例外（v2.1.1）：`[PROGRESS]`/`[WARN]` 绕过静音，其他进度行仍静音

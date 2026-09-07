@@ -76,3 +76,11 @@
 ### 修的问题
 - 初版 exclude 用例误用 fnmatch `**` 跨目录语义（fnmatch 不跨 /）→ 改为"目录剪枝靠名字命中"断言
 - 例数同步：unit 58+47+6 / live 12+22+7（README/run_tests 描述）
+
+## [2026-09-07] v2.1.1 --progress 心跳 --field 静音修复的测试覆盖
+
+### 新增
+- live_exec_field +1：`--field stdout` + `--progress 1` 心跳可见（长任务+field 恰最需心跳；
+  且无 [SSH] 进度噪音、stdout 裸值纯净）——实测教训转正为回归用例
+### 例数
+- exec_field 22→23；全量 153（unit 111 + live 42）
