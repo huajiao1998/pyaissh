@@ -132,7 +132,7 @@ except (ValueError, OSError, ImportError):
 被 00_head（信号区）、各 cmd_*（超时/常量）引用；拼接后与本包其余域同模块共享命名空间。
 """
 
-VERSION = "2.1.1"
+VERSION = "2.1.2"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -1751,9 +1751,10 @@ def cmd_host_add(args):
         tips.append("未存密码/密钥：将复用全局 PYAISSH_PASSWORD 或默认私钥；"
                     "要专属凭据可重跑加 --password/--key")
     tips.append(".env 是明文（路径 %s），请勿提交 git/分享" % env_path)
-    emit({"ok": True, "action": "host", "alias": "@%s" % name.lower(),
-          "target": canonical, "env_path": env_path, "tips": tips},
-         use_json=getattr(args, "json", True))
+    result = {"ok": True, "action": "host", "alias": "@%s" % name.lower(),
+              "target": canonical, "env_path": env_path, "tips": tips}
+    # v2.1.2：统一走 _emit_result——host 也支持 --field（如 --field alias 只取别名）
+    _emit_result(args, result)
     return 0
 
 # ================= [域 07/12] SFTP 传输层：上传/下载的底层原语 ================= 
@@ -4632,6 +4633,9 @@ def build_parser():
                     help="该主机专属密码（写 .env；不给则复用全局 PYAISSH_PASSWORD/私钥）")
     ha.add_argument("--key", dest="key", default=None,
                     help="该主机专属私钥路径（写 .env；与密码同时给时 KEY 优先）")
+    ha.add_argument("--field", dest="field", default=argparse.SUPPRESS,
+                    help="只取结果字段裸值（如 --field alias 得 @prod；dict/list JSON 序列化）"
+                         "——host 与各子命令统一（v2.1.2）")
     ha.set_defaults(func=cmd_host_add)
 
     return parser

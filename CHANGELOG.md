@@ -244,3 +244,15 @@
 - live_exec_field +1：`--field` 下 `--progress` 心跳可见（且无 [SSH] 进度噪音、stdout 裸值纯净）——exec_field 22→23，全量 153 断言
 ### 文档
 - contract.md `--field` stderr 契约补例外（v2.1.1）：`[PROGRESS]`/`[WARN]` 绕过静音，其他进度行仍静音
+
+## [2.1.2] - 2026-09-07
+
+### 改进（使用注意实测反馈）
+1. **host add 接入 `--field`**（子命令统一消费端模式）：`pyaissh host add prod root@1.2.3.4 --password x --field alias` → 裸值 `@prod`（--field target/tips 等同理）；默认 JSON 输出不变。此前 host 是唯一没接 field 机制的子命令（--field 报 bad_args）。
+2. **dry-run 消费姿势文档化**：`--dry-run` 默认完整 JSON 里 file_list 是清单全集（stdout 字段为空属预期）——正确姿势 `--dry-run --field file_list` 只取清单。transfer.md 示例行补此姿势（v2.1.2 提示）。
+### 待办（backlog）
+- host `remove`/`list`（add 已实现；错误提示已带指引）——见 pyaissh-dev/README.md backlog
+### 测试
+- host --field 手动副本验证（alias/target 裸值 + 默认 JSON 不回归）；全量 153 断言不受影响（纯输出路径调整，回归已绿）
+### 文档
+- transfer.md dry-run field 姿势；pyaissh-dev/README backlog 节

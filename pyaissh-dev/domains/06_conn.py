@@ -695,7 +695,8 @@ def cmd_host_add(args):
         tips.append("未存密码/密钥：将复用全局 PYAISSH_PASSWORD 或默认私钥；"
                     "要专属凭据可重跑加 --password/--key")
     tips.append(".env 是明文（路径 %s），请勿提交 git/分享" % env_path)
-    emit({"ok": True, "action": "host", "alias": "@%s" % name.lower(),
-          "target": canonical, "env_path": env_path, "tips": tips},
-         use_json=getattr(args, "json", True))
+    result = {"ok": True, "action": "host", "alias": "@%s" % name.lower(),
+              "target": canonical, "env_path": env_path, "tips": tips}
+    # v2.1.2：统一走 _emit_result——host 也支持 --field（如 --field alias 只取别名）
+    _emit_result(args, result)
     return 0

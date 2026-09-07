@@ -12,6 +12,7 @@ python3 pyaissh.py download root@1.2.3.4 --remote /var/log/x.log --local ./x.log
 python3 pyaissh.py download root@1.2.3.4 --remote big.tar.gz --local . --parallel 8   # --local . 可用（scp 语义）；高丢包/跨境链路大文件提速
 python3 pyaissh.py download root@1.2.3.4 --remote '~/.bashrc' --local ./bashrc        # ~ 自动展开
 python3 pyaissh.py upload root@1.2.3.4 --local ./dist --remote /tmp/x --dry-run  # 先预览清单
+python3 pyaissh.py upload root@1.2.3.4 --local ./dist --remote /tmp/x --dry-run --field file_list  # 预览清单的正确姿势（v2.1.2 提示：--dry-run 默认输出 file_list 是清单全集，只取 file_list 字段用 --field）
 python3 pyaissh.py upload root@1.2.3.4 --local ./dist --remote /opt/app/dist --skip-existing  # 跳过已存在且大小一致的文件
 ```
 

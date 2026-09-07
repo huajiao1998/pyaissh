@@ -59,3 +59,8 @@ python tests/run_tests.py                 # 交互菜单选集；--all/--unit/--
 
 测 dev built 产物：`PYAISSH_PY=<pyaissh.built.py> python tests/run_tests.py --unit`；
 live 测任意产物：`PYAISSH_BIN=<pyaissh.py> python tests/run_tests.py --exec`。
+
+## Backlog（候选功能，按需取用）
+
+- host 子命令扩展：`host remove NAME`（删别名）、`host list`（列别名）——add 已实现，错误提示已带指引（v2.1 使用反馈 backlog）
+- 其他使用 AI 反馈积压项按 CHANGELOG v2.1.0 五大项扩展（如 --progress 与 field 的静音边界已修于 2.1.1）

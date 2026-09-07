@@ -84,3 +84,9 @@
   且无 [SSH] 进度噪音、stdout 裸值纯净）——实测教训转正为回归用例
 ### 例数
 - exec_field 22→23；全量 153（unit 111 + live 42）
+
+## [2026-09-07] v2.1.2 host --field 统一（使用注意反馈）
+
+### 变更
+- host add 输出走 _emit_result（--field 支持）；副本手动验证（alias/target 裸值 + 默认 JSON 不回归）
+- host remove/list 进 dev README backlog（自动化测试跳过——host add 写 .env 需副本，代价高收益低，手动验证已覆盖）

@@ -345,6 +345,9 @@ def build_parser():
                     help="该主机专属密码（写 .env；不给则复用全局 PYAISSH_PASSWORD/私钥）")
     ha.add_argument("--key", dest="key", default=None,
                     help="该主机专属私钥路径（写 .env；与密码同时给时 KEY 优先）")
+    ha.add_argument("--field", dest="field", default=argparse.SUPPRESS,
+                    help="只取结果字段裸值（如 --field alias 得 @prod；dict/list JSON 序列化）"
+                         "——host 与各子命令统一（v2.1.2）")
     ha.set_defaults(func=cmd_host_add)
 
     return parser
