@@ -108,3 +108,17 @@
 - 修 4 处 \$ 无效转义（SyntaxWarning）
 ### 教训
 - host 写"模块同目录 .env"使单测无法直接调被测（会污染仓库根）——副本 importlib 模式解决
+
+## [2026-09-08] fail2ban 事故防护：live 集凭据预检（重要）
+
+### 事故（真实发生）
+- sudo 集一次凭据 env 配错 → T1-T12 每用例各试 1 次错误密码 = **连刷 5 次 tester/tester_np 登录失败**
+  → 触发服务器 fail2ban「2h 5 次错封 2h」封本机出口 IP 2h → 直连全断，靠 A 机跳板救回（差点 VNC 救援）
+- 教训：测试脚本绝不能在凭据错时对真实服务器刷认证失败（pyaissh 工具本身失败即停无责，测试套件有责）
+### 防护（已实现）
+- live 三集（sudo/exec/transfer）开跑前 `_preflight()`：单次 test 验证凭据（tester/tester_np/root 各 1 次）
+  → 失败打印 SKIP 原因并跳过整集（预检只产生 1 次失败，远低于 fail2ban 阈值）
+### 验证
+- 错误密码场景：预检 SKIP ✓（不再刷用例）；正确密码：sudo 12/exec 23/transfer 7 全绿
+### 备注
+- tester/tester_np 密码已由用户重置为 QZG4sown@（2026-09-08）
