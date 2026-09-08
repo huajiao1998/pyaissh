@@ -415,6 +415,26 @@ def suite_unit_host(s):
 # ============================================================
 # 测试集 4：live --sudo 提权 12 例
 # ============================================================
+# live 凭据预检（2026-09-08 事故教训：凭据 env 配错时整集用例会对真实
+# 服务器连刷认证失败——sudo 集曾一次连发 5 次 tester 失败登录触发 fail2ban
+# 封出口 IP 2h，靠跳板才救回。预检失败立即 SKIP，绝不用失败用例刷服务器）
+# ============================================================
+
+def _preflight(user, login_pw, tag):
+    """开跑前单次连通/凭据验证：跑 test 一次；失败打印 SKIP 原因并返回 False。
+    预检本身只产生 1 次失败（若凭据错），远低于 fail2ban 5 次阈值。"""
+    tgt = "%s@%s" % (user, _live_host().split("@")[-1])
+    rc, j, _ = _live_run(["test", tgt], login_pw=login_pw, timeout=60)
+    if j and j.get("ok") is True:
+        return True
+    reason = (j or {}).get("error") or ("rc=%s" % rc)
+    print("SKIP %s 预检失败（%s: %s）——先修 env 凭据/网络再跑；"
+          "不要在凭据错时硬跑整集（会对服务器连刷认证失败触发 fail2ban 封 IP）"
+          % (tag, reason, (j or {}).get("message", "")))
+    return False
+
+
+# ============================================================
 
 _REQ_SUDO = ["PYAISSH_TEST_HOST", "PYAISSH_TEST_SUDO_USER", "PYAISSH_TEST_SUDO_PASSWORD",
              "PYAISSH_TEST_SUDO_NP_USER", "PYAISSH_TEST_SUDO_NP_PASSWORD"]
@@ -428,6 +448,12 @@ def suite_live_sudo(s):
     sudo_user = os.environ.get("PYAISSH_TEST_SUDO_USER")
     np_user = os.environ.get("PYAISSH_TEST_SUDO_NP_USER")
     pw = os.environ.get("PYAISSH_TEST_SUDO_PASSWORD")
+    # 预检：tester 与 tester_np 密码都验证通过才开跑（任一错 → SKIP 不刷失败）
+    if not _preflight(sudo_user, pw, "sudo 集 tester"):
+        return None
+    if not _preflight(np_user, os.environ.get("PYAISSH_TEST_SUDO_NP_PASSWORD"),
+                      "sudo 集 tester_np"):
+        return None
     np_pw = os.environ.get("PYAISSH_TEST_SUDO_NP_PASSWORD")
     tgt = "%s@%s" % (sudo_user, base)
     np_tgt = "%s@%s" % (np_user, base)
@@ -484,6 +510,8 @@ _REQ_EXEC = ["PYAISSH_TEST_HOST", "PYAISSH_TEST_PASSWORD"]
 def suite_live_exec_field(s):
     if _missing_env(_REQ_EXEC):
         print("SKIP: 需配置 %s" % " / ".join(_REQ_EXEC))
+        return None
+    if not _preflight("root", os.environ.get("PYAISSH_TEST_PASSWORD"), "exec 集 root"):
         return None
     tgt = _live_host()
 
@@ -567,6 +595,8 @@ def suite_live_exec_field(s):
 def suite_live_transfer(s):
     if _missing_env(_REQ_EXEC):
         print("SKIP: 需配置 %s" % " / ".join(_REQ_EXEC))
+        return None
+    if not _preflight("root", os.environ.get("PYAISSH_TEST_PASSWORD"), "transfer 集 root"):
         return None
     tgt = _live_host()
     local = os.path.join(_REPO, "tests", "_tmp_xfer.bin")
