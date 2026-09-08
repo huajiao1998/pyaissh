@@ -355,10 +355,14 @@ def suite_unit_host(s):
     import contextlib
     import importlib.util
     import shutil
-    import tempfile
 
     m = _module()
-    tmp = tempfile.mkdtemp(prefix="pyaissh_ht_")
+    # 不用 tempfile.mkdtemp：它在受限令牌下建 0o700 目录（空 DACL），
+    # 创建进程自己都写不进（os.chmod WinError 5）——用脚本同目录 +
+    # os.makedirs 默认 ACL 继承，可写可删（实测教训 2026-09-08）
+    tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       ".tmp_host_%d" % os.getpid())
+    os.makedirs(tmp, exist_ok=True)
     try:
         dst = os.path.join(tmp, "pyaissh.py")
         shutil.copyfile(os.path.abspath(m.__file__), dst)

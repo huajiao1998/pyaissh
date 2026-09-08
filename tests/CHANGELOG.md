@@ -120,3 +120,13 @@
   → 失败打印 SKIP 原因并跳过整集（预检只产生 1 次失败，远低于 fail2ban 阈值）
 ### 验证
 - 错误密码场景：预检 SKIP ✓（不再刷用例）；正确密码：sudo 12/exec 23/transfer 7 全绿
+
+## [2026-09-08] unit_host 临时目录改 makedirs（受限令牌修复）
+
+### 修复
+- suite_unit_host 原用 tempfile.mkdtemp()：Windows 受限令牌下建 0o700 目录（空 DACL）——
+  创建进程自己写不进（os.chmod WinError 5）
+- 改为脚本同目录 `.tmp_host_<pid>` + os.makedirs（默认 ACL 继承，可写可删）+ finally rmtree；
+  不再 import tempfile
+### 验证
+- --unit 全绿（host 7/7）；无 .tmp_host 残留
