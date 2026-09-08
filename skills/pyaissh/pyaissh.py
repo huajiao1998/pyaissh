@@ -132,7 +132,7 @@ except (ValueError, OSError, ImportError):
 被 00_head（信号区）、各 cmd_*（超时/常量）引用；拼接后与本包其余域同模块共享命名空间。
 """
 
-VERSION = "2.1.3"
+VERSION = "2.1.4"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -268,35 +268,47 @@ _RE_WIN_ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 #   - password=xxx / password: xxx / --password xxx / --password=xxx
 #   - -p'xxx' / -p"xxx" / -psecret / -p secret（排除纯数字端口：-p 22 / -p'22' / -p123456）
 #   - mysql -u root -p xxx / curl -u user:pass
-_P_SENS_PASSWORD = r"passw[o0]?rd\s*[=:]\s*\S+|--password(?:\s+|=)\S+"
+_P_SENS_PASSWORD = (r"passw[o0]?rd\s*[=:]\s*(?!-)(?![\"']{2}(?:\s|$))\S+"
+                     r"|--password(?:\s+|=)(?!-)(?![\"']{2}(?:\s|$))\S+")
 _P_SENS_USER = r"--user\s+\S+:\S+"          # curl --user admin:pw 长形式
 _P_SENS_URL = r"\b[a-z][a-z0-9+.-]*://[^\s/@]+:[^\s/@]+@"   # https://user:pass@host/
-_P_SENS_ENV = r"\b\w*(?:PASS(?:WORD|WD|CODE)?|PWD)\s*[=:]\s*\S+"   # DB_PASS=x / DB_PASS: x / MYSQL_PWD=
+# DB_PASS=x / DB_PASS: x / MYSQL_PWD=；v2.1.4：(?!-) 排除赋值后跟 -参数
+# （java -Dspring.datasource.password= -jar 实测误报——password= 空、-jar 是下个参数）；
+# 空引号对排除（DB_PASS='' 空值无秘密）
+_P_SENS_ENV = (r"\b\w*(?:PASS(?:WORD|WD|CODE)?|PWD)\s*[=:]\s*(?!-)(?![\"']{2}(?:\s|$))\S+")
 # 统一防线 (?<![A-Za-z0-9-])：-p 作为密码选项时前字符必为空白/行首/引号，
 # 绝不可能是字母/数字/连字符——连字符复合词中间的 -p（--no-pager、a-px）与
-# 词内 -p 全部排除（1.5.16 修：原 (?<!-) 只挡双横线开头，挡不住 no-pager 的 -p）
-_P_LOOKBEHIND_P = r"(?<![A-Za-z0-9-])-p"
+# 词内 -p 全部排除（1.5.16 修：原 (?<!-) 只挡双横线开头，挡不住 no-pager 的 -p）。
+# v2.1.4：(?-i:-p) 局部区分大小写——-p 密码选项恒小写；-P（grep -P 等）是
+# Perl/端口 flag 不命中（实测误报 "grep -P 'a+b' file" 因 (?i) 吞了大写）。
+_P_LOOKBEHIND_P = r"(?<![A-Za-z0-9-])(?-i:-p)"
 _P_SENS_P_QUOTED = _P_LOOKBEHIND_P + r"['\"](?!\d+['\"])[^'\"]+['\"]"   # -p'secret'（排除 -p'22' 纯数字端口/ID）
 # -psecret 紧贴形态（-p 后必须非空白，空格形态交给 _P_SENS_P_SPACE）：
-# 前缀 lookbehind 排除常见非密码工具（scp/rsync/curl/make/install/find/perl/echo/unzip/gcc/xargs/awk）
+# 前缀 lookbehind 排除常见非密码工具（scp/rsync/curl/make/install/find/perl/echo/unzip/gcc/xargs/awk；
+# v2.1.4 +ffmpeg/ffprobe——-pix_fmt 实测误报）
 _P_SENS_P_ATTACH = (
     r"(?<!scp )(?<!rsync )(?<!curl )(?<!make )(?<!install )"
     r"(?<!find )(?<!perl )(?<!echo )(?<!unzip )(?<!gcc )(?<!xargs )(?<!awk )"
+    r"(?<!ffmpeg )(?<!ffprobe )"
     + _P_LOOKBEHIND_P
     + r"(?!['\"]?\d+(?:['\"]|\b))(?!\s)"
     r"(?!rin|rune|thread|pe\b|roxy|ort|ath|ass|lain)\S+"
 )
 # -p secret（空格分隔）：lookbehind 排除常见非密码工具（cp/mkdir/ls/tar/scp/rsync/curl/
-# make/install/unzip/pytest/awk/xargs/wget，覆盖单/双空格）；(?!--)/(?!-) 排除 -p 后跟选项；
-# 词表排除选项名、工具参数与协议名；[^\s/]+ 排除路径类参数（rsync -p /x、mkdir -p a/b 的兜底）
+# make/install/unzip/pytest/awk/xargs/wget，覆盖单/双空格；v2.1.4 +grep/egrep/fgrep——
+# 实测误报 "grep -p foo /etc/passwd"）；(?!--)/(?!-) 排除 -p 后跟选项；
+# 词表排除选项名、工具参数与协议名；[^\s/]+ 排除路径类参数（rsync -p /x、mkdir -p a/b 的兜底）；
+# (?!["']{2}...) 排除空引号值（useradd -p '' 实测误报——空值无秘密）
 _P_SENS_P_SPACE = (
     r"(?<!cp )(?<!cp  )(?<!ls )(?<!ls  )(?<!tar )(?<!tar  )(?<!scp )(?<!scp  )"
     r"(?<!mkdir )(?<!mkdir  )(?<!rsync )(?<!rsync  )(?<!curl )(?<!curl  )"
     r"(?<!make )(?<!make  )(?<!install )(?<!install  )"
     r"(?<!unzip )(?<!unzip  )(?<!pytest )(?<!pytest  )(?<!awk )(?<!awk  )"
     r"(?<!xargs )(?<!xargs  )(?<!wget )(?<!wget  )"
+    r"(?<!grep )(?<!grep  )(?<!egrep )(?<!egrep  )(?<!fgrep )(?<!fgrep  )"
     + _P_LOOKBEHIND_P
-    + r"\s+(?!\d+\b)(?!--)(?!-)(?!proxy\b|roxy\b|port\b|path\b|pass\b|plain\b|"
+    + r"\s+(?!\d+\b)(?!--)(?!-)(?![\"']{2}(?:\s|$))"
+    r"(?!proxy\b|roxy\b|port\b|path\b|pass\b|plain\b|"
     r"log\b|diff\b|show\b|status\b|add\b|commit\b|clone\b|pull\b|push\b|remote\b|"
     r"branch\b|checkout\b|merge\b|tag\b|stash\b|init\b|config\b|fetch\b|rebase\b|"
     r"reset\b|rm\b|mv\b|help\b|version\b|verbose\b|git\b|docker\b|nmap\b|"
@@ -1001,18 +1013,46 @@ def warn_sensitive_cmd(cmd, enabled=True):
     v2.1 豁免：命令含 `$(cat ...)` / `$(<file)` 这类"从文件读值"时整条不报——
     值来自文件、不落在命令字符串里，日志无明文可泄，WARN 只剩噪音（实测误报：
     DB_PASS=$(cat /srv/x)、export PASS=$(cat /tmp/p)、mysql -p $(cat f)）。
+    v2.1.4 段级豁免：按 shell 分隔符拆段，echo/printf 打印段（字符串无执行语义）
+    不贡献命中——"echo 'PASSWORD='" 实测误报；&&/| 后的真命令段独立保留
+    （"echo x && mysql -u r -psecret" 的 mysql 段照报）。
     """
     if not (enabled and cmd):
         return None
-    if _SENSITIVE_CMD_RE.search(cmd):
-        # 从文件读值（$(cat f) / $(<f)）：凭据不进命令行文本，无明文泄漏，豁免
-        if _READ_FROM_FILE_RE.search(cmd):
-            return None
+    if _READ_FROM_FILE_RE.search(cmd):
+        return None
+    for seg in _CMD_SEG_RE.split(cmd):
+        seg = seg.strip()
+        if not seg or not _SENSITIVE_CMD_RE.search(seg):
+            continue
+        first = _first_cmd_word(seg)
+        if first in _PRINT_ONLY_TOOLS:
+            continue
         msg = ("命令中疑似包含密码/凭据（日志会原样打印命令），"
                "敏感场景建议改用密钥或环境变量注入")
         log("[WARN] " + msg)
         return msg
     return None
+
+
+# v2.1.4：shell 段分隔（粗分：括号内嵌套 $() 罕见凭据形态，不细拆）
+_CMD_SEG_RE = re.compile(r";|&&|\|\||\||\n")
+
+
+def _first_cmd_word(seg):
+    """段首命令词：剥常见前缀(sudo/env/nohup/command/time)与开头引号后取首词。"""
+    s = seg.lstrip()
+    s = re.sub(r"^(?:sudo|env|nohup|command|time|exec)\s+", "", s)
+    if not s:
+        return ""
+    s = s.lstrip("'\"!~")
+    parts = s.split(None, 1)
+    return parts[0].strip("'\"") if parts else ""
+
+
+# 纯打印工具段（无执行语义——echo/printf 只把文本打到 stdout，字符串里的
+# PASSWORD= 不是赋值、-p 不是选项；实测误报 "echo 'PASSWORD='"）
+_PRINT_ONLY_TOOLS = frozenset(("echo", "printf", "print", "logger"))
 
 
 def _spill_writers(args):

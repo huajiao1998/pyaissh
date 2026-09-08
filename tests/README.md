@@ -20,16 +20,16 @@ python tests/run_tests.py --transfer     # 仅传输集
 python tests/run_tests.py --list         # 列出测试集
 ```
 
-## 测试集
+## 测试集（例数以运行输出为准——描述不写死数字，防漂移）
 
-| # | 集 | 例数 | 说明 |
-|---|---|---|---|
-| 1 | unit_regression | 54 | 凭据矩阵（L4）/ parse_target（N10）/ 编码机制（M1）/ 契约单元 |
-| 2 | unit_credential | 41 | 凭据启发式：真凭据命中 + 工具 flag 不误报 |
-| 3 | unit_artifacts | 6 | 制品结构：域边界横幅 11 + docstring 代码地图 + VERSION 一致 |
-| 4 | live_sudo | 12 | --sudo 提权/整链/NOPASSWD/失败提示/互斥（真机）|
-| 5 | live_exec_field | 23 | exec 行为 + --field 消费端（真机）|
-| 6 | live_transfer | 7 | 传输往返：默认/`--parallel 4` 上下行 + `--resume` 断点续传 |
+| # | 集 | 覆盖 |
+|---|---|---|
+| 1 | unit_regression | 凭据矩阵（L4）/ parse_target / 编码机制 / --exclude 匹配 |
+| 2 | unit_credential | 凭据启发式：真凭据命中 + 工具 flag/空值/打印段/读文件豁免误报 |
+| 3 | unit_artifacts | 制品结构：域边界横幅 / docstring 代码地图 / VERSION 一致 |
+| 4 | live_sudo | --sudo 提权/整链/NOPASSWD/失败提示/互斥（真机）|
+| 5 | live_exec_field | exec 行为 + --field 消费端 + 失败尾巴 + --progress（真机）|
+| 6 | live_transfer | 传输往返字节一致 + --parallel + --resume + --exclude（真机）|
 
 ## live 凭据（脱敏，不入库）
 
@@ -57,9 +57,11 @@ PYAISSH_BIN=<pyaissh.py 路径> python tests/run_tests.py --exec  # live：子�
 1. 在 `run_tests.py` 内对应 `suite_xxx()` 函数加 `s.check("名称", 条件)`
 2. 或新加集：写 `suite_xxx(s)` + 在 `SUITES` 注册一行
 3. 跑 `--all` 全绿后提交（连同工具改动）
+4. `tests/CHANGELOG.md` 末尾追加记录
 
 ## 原则
 
 - **测真实函数不测复制品**：unit 调被测模块的 `warn_sensitive_cmd`/`parse_target`/`_SENSITIVE_CMD_RE` 等
 - **live 是行为真源**：sudo 门控/组装等端到端由真机断言
 - **凭据零硬编码**：live 只用 `PYAISSH_TEST_*` env
+- **描述不写死例数**（漂移教训 v2.1.4）：数字以运行输出为准

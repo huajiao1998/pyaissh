@@ -18,35 +18,47 @@ _RE_WIN_ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 #   - password=xxx / password: xxx / --password xxx / --password=xxx
 #   - -p'xxx' / -p"xxx" / -psecret / -p secret（排除纯数字端口：-p 22 / -p'22' / -p123456）
 #   - mysql -u root -p xxx / curl -u user:pass
-_P_SENS_PASSWORD = r"passw[o0]?rd\s*[=:]\s*\S+|--password(?:\s+|=)\S+"
+_P_SENS_PASSWORD = (r"passw[o0]?rd\s*[=:]\s*(?!-)(?![\"']{2}(?:\s|$))\S+"
+                     r"|--password(?:\s+|=)(?!-)(?![\"']{2}(?:\s|$))\S+")
 _P_SENS_USER = r"--user\s+\S+:\S+"          # curl --user admin:pw 长形式
 _P_SENS_URL = r"\b[a-z][a-z0-9+.-]*://[^\s/@]+:[^\s/@]+@"   # https://user:pass@host/
-_P_SENS_ENV = r"\b\w*(?:PASS(?:WORD|WD|CODE)?|PWD)\s*[=:]\s*\S+"   # DB_PASS=x / DB_PASS: x / MYSQL_PWD=
+# DB_PASS=x / DB_PASS: x / MYSQL_PWD=；v2.1.4：(?!-) 排除赋值后跟 -参数
+# （java -Dspring.datasource.password= -jar 实测误报——password= 空、-jar 是下个参数）；
+# 空引号对排除（DB_PASS='' 空值无秘密）
+_P_SENS_ENV = (r"\b\w*(?:PASS(?:WORD|WD|CODE)?|PWD)\s*[=:]\s*(?!-)(?![\"']{2}(?:\s|$))\S+")
 # 统一防线 (?<![A-Za-z0-9-])：-p 作为密码选项时前字符必为空白/行首/引号，
 # 绝不可能是字母/数字/连字符——连字符复合词中间的 -p（--no-pager、a-px）与
-# 词内 -p 全部排除（1.5.16 修：原 (?<!-) 只挡双横线开头，挡不住 no-pager 的 -p）
-_P_LOOKBEHIND_P = r"(?<![A-Za-z0-9-])-p"
+# 词内 -p 全部排除（1.5.16 修：原 (?<!-) 只挡双横线开头，挡不住 no-pager 的 -p）。
+# v2.1.4：(?-i:-p) 局部区分大小写——-p 密码选项恒小写；-P（grep -P 等）是
+# Perl/端口 flag 不命中（实测误报 "grep -P 'a+b' file" 因 (?i) 吞了大写）。
+_P_LOOKBEHIND_P = r"(?<![A-Za-z0-9-])(?-i:-p)"
 _P_SENS_P_QUOTED = _P_LOOKBEHIND_P + r"['\"](?!\d+['\"])[^'\"]+['\"]"   # -p'secret'（排除 -p'22' 纯数字端口/ID）
 # -psecret 紧贴形态（-p 后必须非空白，空格形态交给 _P_SENS_P_SPACE）：
-# 前缀 lookbehind 排除常见非密码工具（scp/rsync/curl/make/install/find/perl/echo/unzip/gcc/xargs/awk）
+# 前缀 lookbehind 排除常见非密码工具（scp/rsync/curl/make/install/find/perl/echo/unzip/gcc/xargs/awk；
+# v2.1.4 +ffmpeg/ffprobe——-pix_fmt 实测误报）
 _P_SENS_P_ATTACH = (
     r"(?<!scp )(?<!rsync )(?<!curl )(?<!make )(?<!install )"
     r"(?<!find )(?<!perl )(?<!echo )(?<!unzip )(?<!gcc )(?<!xargs )(?<!awk )"
+    r"(?<!ffmpeg )(?<!ffprobe )"
     + _P_LOOKBEHIND_P
     + r"(?!['\"]?\d+(?:['\"]|\b))(?!\s)"
     r"(?!rin|rune|thread|pe\b|roxy|ort|ath|ass|lain)\S+"
 )
 # -p secret（空格分隔）：lookbehind 排除常见非密码工具（cp/mkdir/ls/tar/scp/rsync/curl/
-# make/install/unzip/pytest/awk/xargs/wget，覆盖单/双空格）；(?!--)/(?!-) 排除 -p 后跟选项；
-# 词表排除选项名、工具参数与协议名；[^\s/]+ 排除路径类参数（rsync -p /x、mkdir -p a/b 的兜底）
+# make/install/unzip/pytest/awk/xargs/wget，覆盖单/双空格；v2.1.4 +grep/egrep/fgrep——
+# 实测误报 "grep -p foo /etc/passwd"）；(?!--)/(?!-) 排除 -p 后跟选项；
+# 词表排除选项名、工具参数与协议名；[^\s/]+ 排除路径类参数（rsync -p /x、mkdir -p a/b 的兜底）；
+# (?!["']{2}...) 排除空引号值（useradd -p '' 实测误报——空值无秘密）
 _P_SENS_P_SPACE = (
     r"(?<!cp )(?<!cp  )(?<!ls )(?<!ls  )(?<!tar )(?<!tar  )(?<!scp )(?<!scp  )"
     r"(?<!mkdir )(?<!mkdir  )(?<!rsync )(?<!rsync  )(?<!curl )(?<!curl  )"
     r"(?<!make )(?<!make  )(?<!install )(?<!install  )"
     r"(?<!unzip )(?<!unzip  )(?<!pytest )(?<!pytest  )(?<!awk )(?<!awk  )"
     r"(?<!xargs )(?<!xargs  )(?<!wget )(?<!wget  )"
+    r"(?<!grep )(?<!grep  )(?<!egrep )(?<!egrep  )(?<!fgrep )(?<!fgrep  )"
     + _P_LOOKBEHIND_P
-    + r"\s+(?!\d+\b)(?!--)(?!-)(?!proxy\b|roxy\b|port\b|path\b|pass\b|plain\b|"
+    + r"\s+(?!\d+\b)(?!--)(?!-)(?![\"']{2}(?:\s|$))"
+    r"(?!proxy\b|roxy\b|port\b|path\b|pass\b|plain\b|"
     r"log\b|diff\b|show\b|status\b|add\b|commit\b|clone\b|pull\b|push\b|remote\b|"
     r"branch\b|checkout\b|merge\b|tag\b|stash\b|init\b|config\b|fetch\b|rebase\b|"
     r"reset\b|rm\b|mv\b|help\b|version\b|verbose\b|git\b|docker\b|nmap\b|"

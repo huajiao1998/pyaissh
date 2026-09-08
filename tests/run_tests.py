@@ -10,24 +10,25 @@
   python tests/run_tests.py --list        列出测试集
 
 测试集：
-  1) unit_regression   回归 54 例   （凭据矩阵/parse_target/编码/stdin）
-  2) unit_credential   凭据启发式 47 例（含 \$(cat 豁免）
-  3) unit_artifacts    制品结构（域边界横幅 11 + 域 docstring 代码地图 + VERSION 一致）
-  4) live_sudo         --sudo 提权 12 例（真机）
-  5) live_exec_field   exec+field 23 例（真机）
-  6) live_transfer     传输往返 7 例（真机：默认/--parallel/--resume/--exclude）
+  1) unit_regression   回归（凭据矩阵/parse_target/编码/stdin/--exclude 匹配）
+  2) unit_credential   凭据启发式（真命中/误报豁免矩阵）
+  3) unit_artifacts    制品结构（域边界横幅/代码地图/VERSION）
+  4) unit_host         host add/remove/list 闭环（副本 .env）
+  5) live_sudo         --sudo 提权（真机）
+  6) live_exec_field   exec+field（真机：行为/超时/field/失败尾巴/progress）
+  7) live_transfer     传输往返（真机：默认/并行/断点续传/排除）
 
 本文件代码地图（改测试先看这里；维护记录见 tests/CHANGELOG.md）：
   [框架]      _module()  被测模块加载（PYAISSH_PY / 缺省根）
               _bin()     live 被测二进制（PYAISSH_BIN / 缺省根）
               _Suite     断言运行器（check/计数/result）
               _live_run/_live_sub/_last_json/_live_host/_missing_env
-  [unit 集]   suite_unit_regression  回归 54 例（verify_r3 迁入）
-              suite_unit_credential  凭据启发式 47 例（含 \$(cat 豁免）
-              suite_unit_artifacts   制品结构：域横幅/代码地图/VERSION
-  [live 集]   suite_live_sudo        --sudo 12 例（真机）
-              suite_live_exec_field  exec+field 19 例（真机）
-              suite_live_transfer    传输 3 例（真机）
+  [unit 集]   suite_unit_regression  回归（verify_r3 迁入，凭据矩阵/parse_target/编码）
+              suite_unit_credential  凭据启发式（真命中/误报豁免矩阵）
+              suite_unit_artifacts   制品结构（构建产物可读性）
+  [live 集]   suite_live_sudo        --sudo 提权（真机）
+              suite_live_exec_field  exec+field（真机）
+              suite_live_transfer    传输往返（真机）
   [CLI]       SUITES/_run_suite/_interactive/main
 脱敏：live 凭据一律 env（PYAISSH_TEST_*），本文件零硬编码。
 被测目标：env PYAISSH_PY（unit importlib）/ PYAISSH_BIN（live 子进程）；缺省仓库根。
@@ -271,7 +272,7 @@ def suite_unit_regression(s):
 
 
 # ============================================================
-# 测试集 2：unit 凭据启发式 47 例（含 \$(cat 豁免）
+# 测试集 2：unit 凭据启发式 47 例（含 $(cat 豁免）
 # ============================================================
 
 def suite_unit_credential(s):
@@ -290,6 +291,12 @@ def suite_unit_credential(s):
     nohit += ["PW=$(cat /root/.abbs-webui-password)", "DB_PASS=$(cat /srv/x)",
               "export PASS=$(cat /tmp/p)", "mysql -u root -p $(cat /etc/mysql/pw)",
               "PW=$(< ~/.secret)", "my_pw=$(cat ~/.pw)"]
+    # v2.1.4 P0：六误报修复（工具 flag/大小写/空值/打印段/属性空值）
+    nohit += ["grep -p foo /etc/passwd", "grep -P 'a+b' file",
+              "ffmpeg -pix_fmt yuv420p in.mp4", "useradd -p '' guest",
+              "echo 'PASSWORD='", "java -Dspring.datasource.password= -jar app.jar"]
+    # v2.1.4：真命中边界保留（&& 后真命令段独立命中 / 非空 -p 值仍命中）
+    hit += ["echo x && mysql -u r -psecret", "useradd -p 'hash123' bob"]
     for c in hit:
         s.check("应命中 %r" % c[:30], bool(m.warn_sensitive_cmd(c, enabled=True)))
     for c in nohit:
@@ -335,6 +342,74 @@ def suite_unit_artifacts(s):
     vm = re.search(r'VERSION = "([^"]+)"', text)
     s.check("VERSION 一致", bool(vm) and vm.group(1) == m.VERSION,
             "src=%r module=%r" % (vm.group(1) if vm else None, m.VERSION))
+
+
+# ============================================================
+# 测试集 4：unit host add/remove/list 闭环（v2.1.4 自动化）
+# 被测模块复制到临时副本 importlib——host 命令写"模块同目录 .env"=
+# 副本 .env，不碰仓库根（此前 CHANGELOG 自述"手动验证"的缺口）
+# ============================================================
+
+def suite_unit_host(s):
+    import argparse
+    import contextlib
+    import importlib.util
+    import shutil
+    import tempfile
+
+    m = _module()
+    tmp = tempfile.mkdtemp(prefix="pyaissh_ht_")
+    try:
+        dst = os.path.join(tmp, "pyaissh.py")
+        shutil.copyfile(os.path.abspath(m.__file__), dst)
+        spec = importlib.util.spec_from_file_location("pyaissh_copy", dst)
+        hm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hm)
+        env_p = os.path.join(tmp, ".env")
+
+        def ns(**kw):
+            d = dict(json=True, field=None)
+            d.update(kw)
+            return argparse.Namespace(**d)
+
+        def quiet(fn):
+            # host 命令正常输出 JSON 到 stdout——测试重定向防污染
+            with contextlib.redirect_stdout(io.StringIO()):
+                return fn()
+
+        # add：写 .env（含 # 密码引号包裹）
+        quiet(lambda: hm.cmd_host_add(ns(name="prod", host_target="root@1.2.3.4", password="Secret#9!", key=None)))
+        txt = open(env_p, encoding="utf-8").read()
+        s.check("host add 写 .env", "PYAISSH_HOST_PROD=root@1.2.3.4" in txt
+                and 'PYAISSH_HOST_PROD_PASSWORD="Secret#9!"' in txt, txt)
+        # add 幂等（重复 add 更新不重复行）
+        quiet(lambda: hm.cmd_host_add(ns(name="prod", host_target="root@1.2.3.4", password="NewPw2", key=None)))
+        txt = open(env_p, encoding="utf-8").read()
+        s.check("host add 幂等更新", txt.count("PYAISSH_HOST_PROD=") == 1
+                and "NewPw2" in txt and 'Secret#9!' not in txt, txt)
+        # add 第二个别名
+        hm.cmd_host_add(ns(name="stage", host_target="deploy@1.2.3.5:2222", password=None,
+                           key="/k/kk"))
+        # list：entries 正确、不回显密码/密钥
+        entries = hm._env_host_entries(env_p)
+        names = sorted(e[0] for e in entries)  # _env_host_entries 返回 (name, target) 元组
+        s.check("host list entries", names == ["prod", "stage"]
+                and any(e[1] == "deploy@1.2.3.5:2222" for e in entries), repr(entries))
+        s.check("host list 不回显凭据", all("password" not in e[1].lower()
+                                           for e in entries))
+        # remove：删别名 + 专属凭据行
+        rc = quiet(lambda: hm.cmd_host_remove(ns(name="prod")))
+        txt = open(env_p, encoding="utf-8").read()
+        s.check("host remove 删别名及凭据", rc == 0
+                and "PYAISSH_HOST_PROD" not in txt and "PYAISSH_HOST_STAGE=" in txt, txt)
+        # remove 不存在 -> bad_args 明确（返回 2）
+        rc = quiet(lambda: hm.cmd_host_remove(ns(name="nope")))
+        s.check("host remove 不存在报错", rc == 2)
+        # add 非法名 -> 2
+        rc = quiet(lambda: hm.cmd_host_add(ns(name="bad name!", host_target="root@1.2.3.4", password=None, key=None)))
+        s.check("host add 非法名报错", rc == 2)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ============================================================
@@ -594,12 +669,13 @@ def suite_live_transfer(s):
 # ============================================================
 
 SUITES = [
-    ("unit_regression", "回归 58 例（凭据矩阵/parse_target/编码/stdin/--exclude 匹配）", suite_unit_regression),
-    ("unit_credential", "凭据启发式 47 例（含 \$(cat 豁免）", suite_unit_credential),
-    ("unit_artifacts", "制品结构 6 例（域横幅/代码地图/VERSION）", suite_unit_artifacts),
-    ("live_sudo", "--sudo 提权 12 例（真机）", suite_live_sudo),
-    ("live_exec_field", "exec+field 23 例（真机）", suite_live_exec_field),
-    ("live_transfer", "传输往返 7 例（真机：默认/--parallel/--resume/--exclude）", suite_live_transfer),
+    ("unit_regression", "回归（凭据矩阵/parse_target/编码/stdin/--exclude 匹配）", suite_unit_regression),
+    ("unit_credential", "凭据启发式（真命中/误报豁免矩阵）", suite_unit_credential),
+    ("unit_artifacts", "制品结构（域横幅/代码地图/VERSION）", suite_unit_artifacts),
+    ("unit_host", "host add/remove/list 闭环（副本 .env，v2.1.4 自动化）", suite_unit_host),
+    ("live_sudo", "--sudo 提权（真机）", suite_live_sudo),
+    ("live_exec_field", "exec+field（真机）", suite_live_exec_field),
+    ("live_transfer", "传输往返（真机：默认/并行/续传/排除）", suite_live_transfer),
 ]
 
 
@@ -655,17 +731,17 @@ def main():
     if a.all:
         order = list(range(len(SUITES)))
     elif a.unit:
-        order = [0, 1, 2]
+        order = [0, 1, 2, 3]
     elif a.artifacts:
         order = [2]
     elif a.sudo or a.exec or a.transfer:
         order = []
         if a.sudo:
-            order.append(3)
-        if a.exec:
             order.append(4)
-        if a.transfer:
+        if a.exec:
             order.append(5)
+        if a.transfer:
+            order.append(6)
     else:
         order = _interactive()
         if order is None:

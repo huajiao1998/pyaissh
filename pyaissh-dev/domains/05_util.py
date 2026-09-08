@@ -206,18 +206,46 @@ def warn_sensitive_cmd(cmd, enabled=True):
     v2.1 豁免：命令含 `$(cat ...)` / `$(<file)` 这类"从文件读值"时整条不报——
     值来自文件、不落在命令字符串里，日志无明文可泄，WARN 只剩噪音（实测误报：
     DB_PASS=$(cat /srv/x)、export PASS=$(cat /tmp/p)、mysql -p $(cat f)）。
+    v2.1.4 段级豁免：按 shell 分隔符拆段，echo/printf 打印段（字符串无执行语义）
+    不贡献命中——"echo 'PASSWORD='" 实测误报；&&/| 后的真命令段独立保留
+    （"echo x && mysql -u r -psecret" 的 mysql 段照报）。
     """
     if not (enabled and cmd):
         return None
-    if _SENSITIVE_CMD_RE.search(cmd):
-        # 从文件读值（$(cat f) / $(<f)）：凭据不进命令行文本，无明文泄漏，豁免
-        if _READ_FROM_FILE_RE.search(cmd):
-            return None
+    if _READ_FROM_FILE_RE.search(cmd):
+        return None
+    for seg in _CMD_SEG_RE.split(cmd):
+        seg = seg.strip()
+        if not seg or not _SENSITIVE_CMD_RE.search(seg):
+            continue
+        first = _first_cmd_word(seg)
+        if first in _PRINT_ONLY_TOOLS:
+            continue
         msg = ("命令中疑似包含密码/凭据（日志会原样打印命令），"
                "敏感场景建议改用密钥或环境变量注入")
         log("[WARN] " + msg)
         return msg
     return None
+
+
+# v2.1.4：shell 段分隔（粗分：括号内嵌套 $() 罕见凭据形态，不细拆）
+_CMD_SEG_RE = re.compile(r";|&&|\|\||\||\n")
+
+
+def _first_cmd_word(seg):
+    """段首命令词：剥常见前缀(sudo/env/nohup/command/time)与开头引号后取首词。"""
+    s = seg.lstrip()
+    s = re.sub(r"^(?:sudo|env|nohup|command|time|exec)\s+", "", s)
+    if not s:
+        return ""
+    s = s.lstrip("'\"!~")
+    parts = s.split(None, 1)
+    return parts[0].strip("'\"") if parts else ""
+
+
+# 纯打印工具段（无执行语义——echo/printf 只把文本打到 stdout，字符串里的
+# PASSWORD= 不是赋值、-p 不是选项；实测误报 "echo 'PASSWORD='"）
+_PRINT_ONLY_TOOLS = frozenset(("echo", "printf", "print", "logger"))
 
 
 def _spill_writers(args):

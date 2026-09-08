@@ -96,3 +96,15 @@
 ### 新增
 - host remove NAME（删别名+专属凭据行；不存在明确 bad_args）+ host list（entries 不回显密码）
 - 副本手动验证全流程（add×3/list/remove/不存在/再 list + .env 行级核对）——host 写 .env 需副本，未自动化（同 v2.1.2 理由）
+
+## [2026-09-08] v2.1.4（P0 误报收敛 + P1 PS 注 + P2 漂移修复）
+
+### 新增
+- unit_credential +8：六误报修复用例（grep -p/-P/ffmpeg -pix_fmt/useradd 空/useradd -p 空引号/echo 打印段/java 属性空值）
+  +2 真命中边界（echo && mysql 段独立 / useradd -p hash）
+- **unit_host 集（7 断言）**：host add/remove/list 自动化——副本 importlib（被测复制 temp 目录 → 写副本 .env）；覆盖写入/幂等/list/不回显/remove/报错。此前"手动验证"缺口补齐
+### 变更
+- 全部 suite 描述与 README 去硬编码例数（漂移根因）——数字以运行输出为准
+- 修 4 处 \$ 无效转义（SyntaxWarning）
+### 教训
+- host 写"模块同目录 .env"使单测无法直接调被测（会污染仓库根）——副本 importlib 模式解决

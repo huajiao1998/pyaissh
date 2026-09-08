@@ -266,3 +266,23 @@
 - 副本手动验证：add×3 → list(3，无密码) → list --field entries → remove test(删 2 行) → remove 不存在(明确 bad_args) → 再 list(剩 2)；.env 行级核对干净
 ### 文档
 - SKILL host 节 + setup.md 补 remove/list；pyaissh-dev/README backlog 标记已实现
+
+## [2.1.4] - 2026-09-08
+
+### 修复（P0：凭据 WARN 误报 6/20→收敛，逐条实测）
+1. **-p 系列区分大小写**（(?-i:-p)）：-P 不再命中（grep -P 'a+b' 误报）
+2. **ATTACH 排除 ffmpeg/ffprobe**：-pix_fmt 误报修复
+3. **SPACE 排除 grep/egrep/fgrep**：grep -p foo 误报修复
+4. **空引号值排除**（-p '' / password='' / DB_PASS=''）：useradd -p '' 类空值无秘密不报
+5. **赋值形态排除 - 开头参数**（(?!-)）：java -D…password= -jar 误报修复（= 后空、-jar 是下个参数）
+6. **echo/printf 打印段豁免**（warn 按 shell 分隔拆段）：echo 'PASSWORD=' 字符串打印无执行语义不报；&&/| 后真命令段独立保留（echo x && mysql -u r -psecret 照报）
+### 修复（P1：PowerShell @别名被吞——PS 层行为，文档注记）
+- SKILL host 节加注：PowerShell 下 `@名称` 需加引号（`pyaissh test "@prod"`）
+### 修复（P2：测试与文档漂移）
+- run_tests 描述去硬编码例数（54/19/3 等旧数字漂移根因）——例数以运行输出为准；README 同步去数字化
+- 修 4 处 `\$` 无效转义（SyntaxWarning，未来 Python 会变错误）
+- **host add/remove/list 自动化集**（unit_host，7 断言）：被测复制到临时副本 importlib 加载 → host 写副本 .env（此前 CHANGELOG 自述"手动验证"的缺口）；覆盖 add 写入（含 # 密码引号包裹）/幂等更新/list 条目与不回显凭据/remove 及不存在报错/非法名
+### 测试
+- unit 扩至 126（58+55+6+7，新增 P0 六误报 + 2 真命中边界 + host 7）
+### 文档
+- SKILL（PS 注）；tests README/CHANGELOG 同步
