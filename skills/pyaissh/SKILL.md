@@ -1,6 +1,7 @@
 ---
 name: pyaissh
-description: 通过 pyaissh（paramiko CLI）执行远程 SSH 操作：exec/upload/download/test/ls，默认输出整行 JSON 供 AI 精确解析；支持跳板机、主机别名（@名称）、大文件并行分片下载、多级超时防挂死、断点续传；传输零 token 消耗（文件内容永不回传，AI 只消费元数据）
+description: 通过 pyaissh（paramiko CLI）做远程 SSH 运维与排障：exec 执行命令（--sudo 提权、--field 取裸字段、--cmd-file 喂脚本），log 读后台作业（exec --detach 起长任务后按 offset 增量读日志、--wait-rc 等退出码、--kill 停掉），upload/download 传文件（大文件并行分片、断点续传），test 探活，ls 列目录，host 管理主机别名；支持跳板机 --jump、默认输出整行 JSON 供 AI 精确解析、多级超时防挂死、传输零 token 消耗（文件内容不回传，只给元数据）。长任务后台化、边跑边看日志、服务器故障排查优先用它。
+whenToUse: 需要 SSH 到远程主机执行命令、跑长任务（后台作业 + 增量看日志）、传文件、查目录、探活或管理主机别名时；宿主 shell 会吃掉 $ 等特殊字符（PowerShell/MSYS）需改用 --cmd-file 时
 ---
 
 # pyaissh — 结构化 SSH 工具（给 AI 用）
