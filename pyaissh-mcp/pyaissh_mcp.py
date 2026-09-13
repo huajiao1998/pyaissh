@@ -47,7 +47,7 @@ import time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CLI_PATH = os.path.join(BASE_DIR, "pyaissh.py")
-SERVER_VERSION = "0.2.4"
+SERVER_VERSION = "0.2.5"
 SERVER_NAME = "pyaissh-mcp"
 
 SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
@@ -356,7 +356,7 @@ TOOLS = [
                 "wait_rc": {"type": "integer", "description": "阻塞等待作业结束最多 N 秒（MCP 层上限 45s，受客户端 toolCallTimeoutMs 约束），结束即返回 exit_code（作业被 kill/OOM 时状态收敛为 dead）"},
                 "kill": {"type": "boolean", "description": "整组停掉作业：读 job.pid 对进程组 TERM → 宽限 5s → KILL（Linux 上先校验 pid 确属本作业防误杀）；需 job_id，可与 wait_rc 连用（kill 后立即收敛 dead）"},
                 "cleanup": {"type": "boolean", "description": "读完后删除远端作业目录（job.sh/run.sh/job.log/job.rc/job.pid）；需 job_id；作业仍在运行时会被拒绝（job_running，防自断追踪），先 kill 或用 force"},
-                "force": {"type": "boolean", "description": "配合 cleanup：作业仍在运行时也强制清理（本工具不再追踪该作业，远端进程可能仍在跑）；须与 cleanup 同用"},
+                "force": {"type": "boolean", "description": "配合 cleanup：作业仍在运行时也强制清理（本工具不再追踪该作业，远端进程可能仍在跑）；须与 cleanup 同用。清理后要停进程用返回的 group_kill（kill -9 -<pid>，负号=进程组，一次清整组，无需 pgrep）"},
                 "job_dir": {"type": "string", "description": "作业根目录（默认 /tmp/pyaissh-jobs）"},
                 "limit": {"type": "integer", "description": "list 最多返回条数（默认 50）"},
                 "max_output": {"type": "integer", "description": "单次回传内容上限字节（默认 64KB；截断时看 omitted_bytes，增量读用 offset 继续）"},

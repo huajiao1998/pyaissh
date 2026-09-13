@@ -1367,10 +1367,19 @@ def _log_read(sftp, client, args, job_dir, conn, start):
         result["cleaned"] = True
         if status == "running":
             result["forced_cleanup"] = True
-            result["warnings"].append(
-                "作业仍在运行（pid %s）时被强制清理：本工具已失去该作业的追踪，"
-                "远端进程可能仍在跑（要停掉请人工 pgrep/kill 或下次改用 --kill --cleanup）"
-                % (pid if pid is not None else "?"))
+            if pid is not None:
+                # pid 就是 setsid 的进程组组长（pid==pgid），负号即"整组"——一次清干净，
+                # 不必 pgrep；此时 job.pid 已删，--kill 用不了，这是唯一出路（v2.2.3）
+                result["group_kill"] = "kill -9 -%s" % pid
+                result["warnings"].append(
+                    "作业仍在运行（pid %s）时被强制清理：本工具已失去该作业的追踪，远端进程仍在跑"
+                    "——要停掉直接整组杀：kill -9 -%s（负号 = 进程组；pid 即 setsid 组长，"
+                    "子进程一并清掉，无需 pgrep）。下次可直接用 --kill --cleanup"
+                    % (pid, pid))
+            else:
+                result["warnings"].append(
+                    "作业仍在运行（pid 未知）时被强制清理：本工具已失去该作业的追踪，"
+                    "远端进程可能仍在跑（job.pid 缺失，只能人工 pgrep 定位）")
     if status == "finished":
         result["next_action"] = ("作业已结束（exit_code=%s）。%s"
                                  % (rc_val, "已清理远端作业目录"
@@ -1382,6 +1391,14 @@ def _log_read(sftp, client, args, job_dir, conn, start):
         result["next_action"] = ("作业已死（无退出码）。看日志尾部确认原因；%s"
                                  % ("已清理远端作业目录" if result.get("cleaned")
                                     else "清理：加 --cleanup"))
+    elif result.get("forced_cleanup"):
+        # 目录（含 job.pid）已按 --force 删除 → job.log 也没了，不能再"继续增量读"，
+        # --kill 同样不可用；唯一出路是按组长 pid 手工整组杀（v2.2.3 修掉误导文案）
+        result["next_action"] = (
+            "作业目录已按 --force 清理，无法再追踪也无法用 --kill（job.pid 已删）。"
+            "要停掉远端进程：%s（负号 = 进程组，一次清整组）；"
+            "下次改用：pyaissh log <target> --job-id <id> --kill --cleanup"
+            % (result.get("group_kill") or "kill -9 -<pid>"))
     else:
         result["next_action"] = ("作业仍在运行。继续增量读：--offset %s（或稍后重读）；"
                                  "等结束：--wait-rc 30；停掉：--kill"

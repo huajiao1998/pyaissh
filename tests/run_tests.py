@@ -682,18 +682,48 @@ def suite_live_exec_field(s):
         s.check("--cleanup --force 强制清理且留痕",
                 bool(jf) and jf.get("cleaned") is True and jf.get("forced_cleanup") is True
                 and any("仍在运行" in w for w in (jf.get("warnings") or [])), repr(jf)[:200])
-        # 该作业的进程此刻仍在跑（正是 force 的代价），用 kill 收尾并验证整组被杀
+        # v2.2.3：force 之后 job.pid 已删、--kill 不可用 → 唯一的恢复路径必须**直接给命令**
+        # （pid 就是 setsid 组长，负号=整组；省掉一次 pgrep）
+        gk = jf.get("group_kill") if jf else None
+        s.check("force 后给出可执行整组杀命令（group_kill/warning/next_action 三处一致）",
+                bool(jf) and gk == "kill -9 -%s" % jf.get("pid")
+                and gk in " ".join(jf.get("warnings") or [])
+                and gk in (jf.get("next_action") or "")
+                and "整组" in (jf.get("next_action") or ""), repr(jf)[:260])
+        s.check("force 后 next_action 不再误导为「继续增量读」",
+                bool(jf) and "--offset" not in (jf.get("next_action") or ""),
+                repr(jf.get("next_action"))[:160])
+        # 该作业的进程此刻仍在跑（正是 force 的代价）
         p = _live_sub(["exec", tgt, "--cmd",
                        "pgrep -af '[s]leep 120' >/dev/null && echo ORPHAN_ALIVE "
                        "|| echo NO_ORPHAN", "--field", "stdout"], timeout=60)
         s.check("force 清理后进程确实仍在跑（代价可见）", "ORPHAN_ALIVE" in (p.stdout or ""),
                 repr(p.stdout)[:120])
+        # 直接执行结果里给的那条命令（不 pgrep）——文档路径必须真能一次清整组
         p = _live_sub(["exec", tgt, "--cmd",
-                       "pkill -f '[s]leep 120'; sleep 0.3; "
-                       "pgrep -af '[s]leep 120' >/dev/null && echo STILL_ALIVE "
-                       "|| echo KILLED", "--field", "stdout"], timeout=60)
-        s.check("外部 pkill 收尾（测试环境不留孤儿）", "KILLED" in (p.stdout or ""),
-                repr(p.stdout)[:120])
+                       "%s; sleep 0.5; pgrep -af '[s]leep 120' >/dev/null && echo STILL_ALIVE "
+                       "|| echo GROUP_KILLED" % (gk or "echo NO_CMD"), "--field", "stdout"],
+                      timeout=60)
+        s.check("照 group_kill 执行即一次清整组（无需 pgrep）",
+                "GROUP_KILLED" in (p.stdout or ""), repr(p.stdout)[:120])
+        # 对照：正 pid（非整组）只杀组长，子进程被 reparent 成孤儿——证明负号必要
+        rc, jc2, _ = _live_run(["exec", tgt, "--detach", "--cmd",
+                                "sleep 120 # pyaissh_orphan_control"], timeout=90)
+        cjob = (jc2 or {}).get("job_id")
+        if cjob:
+            p = _live_sub(["exec", tgt, "--cmd",
+                           "kill -9 %s; sleep 0.5; pgrep -af '[s]leep 120' >/dev/null "
+                           "&& echo ORPHAN_LEFT || echo NO_ORPHAN" % jc2.get("pid"),
+                           "--field", "stdout"], timeout=60)
+            s.check("对照：正 pid 杀只留孤儿（负号不可省）", "ORPHAN_LEFT" in (p.stdout or ""),
+                    repr(p.stdout)[:120])
+            p = _live_sub(["exec", tgt, "--cmd",
+                           "pkill -f '[s]leep 120'; sleep 0.3; "
+                           "pgrep -af '[s]leep 120' >/dev/null && echo STILL_ALIVE "
+                           "|| echo KILLED", "--field", "stdout"], timeout=60)
+            s.check("外部 pkill 收尾（测试环境不留孤儿）", "KILLED" in (p.stdout or ""),
+                    repr(p.stdout)[:120])
+            _live_run(["log", tgt, "--job-id", cjob, "--cleanup"], timeout=60)
     else:
         s.check("运行中 --cleanup 被拒（job_running, exit 2）", False, "detach 未返回 job_id")
 

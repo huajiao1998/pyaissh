@@ -322,6 +322,8 @@ def build_parser():
   truncated=true 且非 --offset 模式时，中段被省略（omitted_bytes）→ 用 --offset 0 顺序读补齐
   --cleanup 只在作业已结束（finished/dead）时执行：运行中会拒绝并报 job_running——
   删掉 job.pid/job.log 会让本工具彻底失去追踪，而进程仍在远端跑（要停用 --kill 整组停）
+  --force 强制清理后 job.pid 已删、--kill 不可用：要停掉远端进程直接整组杀
+  kill -9 -<pid>（负号 = 进程组；pid 即 setsid 组长，子进程一并清掉，无需 pgrep）
 """)
     add_conn(p)
     p.add_argument("--job-id", dest="job_id",
@@ -346,7 +348,8 @@ def build_parser():
                         "作业仍在运行时拒绝（会自断追踪），先 --kill 或 --wait-rc，或用 --force 放弃追踪")
     p.add_argument("--force", action="store_true",
                    help="配合 --cleanup：作业仍在运行时也强制清理（本工具不再追踪该作业，"
-                        "远端进程可能仍在跑——正常应先 --kill）")
+                        "远端进程可能仍在跑——正常应先 --kill）；清理后要停掉进程用 "
+                        "kill -9 -<pid>（负号=进程组，pid 即 setsid 组长，一次清整组，无需 pgrep）")
     p.add_argument("--limit", type=_positive_int, default=50, help="--list 最多返回条数（默认 50）")
     p.add_argument("--max-output", dest="max_output", type=_positive_int, default=DEFAULT_MAX_OUTPUT,
                    help="单次回传内容上限字节（默认 64KB；截断时看 omitted_bytes，"

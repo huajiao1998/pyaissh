@@ -167,3 +167,13 @@
 - 三条用例最初报 FAIL 是**测试自身写法错误**（`--field` 模式 stdout 是裸值，`_live_run` 的 last_json 为 None）
   ——改用 `_live_sub` 取裸 stdout 后修正，产品行为经手工复核正确
 - 孤儿检查用 `[s]leep` 技巧避免 pgrep/pkill **自匹配**（自匹配会把自己的包装 shell 也算进去/杀掉）
+
+## [2026-09-13] v2.2.3 `--force` 后给出可执行整组杀命令
+
+### 新增用例
+- live_exec_field +4：`group_kill` == `kill -9 -<pid>` 且与 warnings/next_action 三处一致；force 后
+  `next_action` 不再出现 `--offset`（日志已删，旧文案误导）；照 `group_kill` 原样执行 → `GROUP_KILLED`
+  （一次清整组，无需 pgrep）；**对照**用正 pid `kill -9 <pid>` → `ORPHAN_LEFT`（证明负号不可省）
+### 说明
+- 对照组是"负号必要性"的证据：只杀组长时 job.sh 的子进程会被 reparent 成孤儿
+- 该组用例仍全部用 `[s]leep` 技巧避免 pgrep/pkill 自匹配

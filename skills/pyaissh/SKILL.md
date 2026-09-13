@@ -77,6 +77,7 @@ python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --cleanup                    
 - **状态三级**：`finished`（有 job.rc = 退出码）/ `dead`（无 rc 且进程已消失：被 kill/OOM/崩溃，带 `hint`）/ `running`——被 kill 的作业不再永远 running，`--wait-rc` 能收敛；要主动停用 `--kill`
 - **落盘权限**：目录 0700、job.sh/job.log/job.rc/job.pid 0600（命令原文与输出都在盘上，同机他人不可读）
 - **清理有守卫**：`--cleanup` 在作业仍运行时**拒绝**（job_running，防自断追踪 + 进程还在跑）；收尾用 `--kill --cleanup` 一步到位，或 `--cleanup --force` 显式放弃追踪
+- **force 之后要停进程**：结果直接给 `kill -9 -<pid>`（负号=进程组；pid 即 setsid 组长，一条命令清整组含子进程，**不用先 pgrep**）
 - **与 `--sudo`/`--pty` 互斥**（bad_args）；命令原文会落远端 `job.sh`（别写明文凭据，用完 `--cleanup`）
 
 ### ls — 列远程目录

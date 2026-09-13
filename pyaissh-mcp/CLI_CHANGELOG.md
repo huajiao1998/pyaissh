@@ -367,3 +367,22 @@
   force 后进程确实仍在跑（代价可见）、外部 pkill 收尾、`--kill` 收敛 dead + 快速收敛 + hint、
   **`--kill` 后无孤儿进程**（`pgrep -af '[s]leep 300'` 为空）、`--force` 缺 `--cleanup` → bad_args）
 - 真机验证数据（B2）：47/47 PASS
+
+## [2.2.3] - 2026-09-13
+
+### 改进：`--force` 之后直接给出可执行的整组杀命令（省掉一次 pgrep）
+
+- **背景**：`--cleanup --force` 之后 `job.pid` 已随目录删除 → `--kill` 用不了，而远端进程还在跑。
+  旧警告只写"要停掉请人工 pgrep/kill"——其实 `exec --detach` 返回的 `pid` 就是 `setsid` 的
+  **进程组组长**（`pid==pgid`），`kill -9 -<pid>` 加个负号即可一次清整组（含子进程），不必 pgrep
+- **改动**：
+  - 强制清理结果新增 **`group_kill`** 字段（= `kill -9 -<pid>`，可直接执行），同一命令同时写进
+    `warnings` 与 `next_action`
+  - `next_action` 修掉误导：此前 force 后仍按 running 给"继续增量读：--offset N"，而 `job.log`
+    已被删除——现在明确"目录已清理，无法再追踪也无法用 --kill"，并给出整组杀命令
+  - `log --help` 的 `--force` 说明与 epilog 状态章节同步写入 `kill -9 -<pid>`（负号 = 进程组）
+- **实测对照**（真机）：照结果里的 `group_kill` 直接执行 → `GROUP_KILLED`（一次干净，无需 pgrep）；
+  对照组用**正** pid `kill -9 <pid>` → 只杀组长，`sleep` 子进程被 reparent 成孤儿（`ORPHAN_LEFT`）
+  ——证明负号不可省
+- **测试**：live_exec_field +4（group_kill/warning/next_action 三处一致、next_action 不再误导为
+  「继续增量读」、照 group_kill 执行即一次清整组、正 pid 对照组留孤儿）；真机 51/51 全绿

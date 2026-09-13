@@ -44,6 +44,7 @@
 - **截断时的 `next_action`**（v2.2，exec 前台输出）：任一流超 `--max-output`（默认 64KB）被截断时，结果直接给"完整输出落盘路径 + 读文件不要重跑"的下一步提示，无需自己拼线索
 - **`log --kill`**（v2.2.1）：读 `job.pid` → 对**进程组**（setsid 后 pid==pgid）`TERM` → 宽限 5s → `KILL`；Linux 上先用 `/proc/<pid>/cmdline` 校验 pid 确属本作业（防 pid 复用误杀），不匹配则拒绝并报 `kill_failed`。与 `--wait-rc` 可同用（kill 后立即收敛为 `dead`）；需 `--job-id`。**整组杀**是必须的：只杀 run.sh 会让 job.sh 的子进程被 reparent 成孤儿继续跑
 - **`--cleanup` 状态守卫**（v2.2.2）：只在作业**已结束**（`finished`/`dead`）时删目录；作业仍 `running` 时**拒绝**并报 `job_running`（退出码 2，附 `pid` 与 `hint`）——删掉 `job.pid`/`job.log` 会让工具彻底失去追踪，而远端进程仍在跑。正路是 `--kill --cleanup`（一步到位）或 `--wait-rc` 后清理；确要放弃追踪用 `--cleanup --force`（照删，但结果带 `forced_cleanup:true` + `warnings` 明示"已失去追踪、进程可能仍在跑"）。`--force` 只允许配合 `--cleanup`（否则 bad_args）
+- **`--force` 之后的唯一出路**（v2.2.3）：目录（含 `job.pid`）已删 → `--kill` 不可用，而远端进程还在跑。此时结果直接给出可执行命令 `group_kill`（= `kill -9 -<pid>`，同时写进 `warnings` 与 `next_action`）：**负号 = 进程组**，`pid` 就是 `setsid` 的组长（`pid==pgid`），一条命令清掉整组含子进程——**不需要先 pgrep**（对照实测：不带负号的 `kill -9 <pid>` 只杀组长，子进程被 reparent 成孤儿）
 - **远端落盘与权限**（v2.2.1）：`job.sh`（命令原文）/`job.log`（完整输出）/`job.rc`/`job.pid` 均 **0600**，作业目录与作业根目录 **0700**，`run.sh` 0700（`run.sh` 首行 `umask 077` 保证 shell 创建的日志/rc 也是 0600）
 - **退出码**：`exec --detach` 成功启动 = 0（作业自身的退出码在 `log` 的 `exit_code`）；启动失败 = 255（`detach_failed`）；`log` 读不到作业 = 2（`job_not_found`）、运行中拒绝清理 = 2（`job_running`）；`--kill` 拒绝/失败 = 255（`kill_failed`）
 - **默认契约零变化**：不用 `--field` 时 stdout 恒单行 JSON

@@ -132,7 +132,7 @@ except (ValueError, OSError, ImportError):
 被 00_head（信号区）、各 cmd_*（超时/常量）引用；拼接后与本包其余域同模块共享命名空间。
 """
 
-VERSION = "2.2.2"
+VERSION = "2.2.3"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -4043,10 +4043,19 @@ def _log_read(sftp, client, args, job_dir, conn, start):
         result["cleaned"] = True
         if status == "running":
             result["forced_cleanup"] = True
-            result["warnings"].append(
-                "作业仍在运行（pid %s）时被强制清理：本工具已失去该作业的追踪，"
-                "远端进程可能仍在跑（要停掉请人工 pgrep/kill 或下次改用 --kill --cleanup）"
-                % (pid if pid is not None else "?"))
+            if pid is not None:
+                # pid 就是 setsid 的进程组组长（pid==pgid），负号即"整组"——一次清干净，
+                # 不必 pgrep；此时 job.pid 已删，--kill 用不了，这是唯一出路（v2.2.3）
+                result["group_kill"] = "kill -9 -%s" % pid
+                result["warnings"].append(
+                    "作业仍在运行（pid %s）时被强制清理：本工具已失去该作业的追踪，远端进程仍在跑"
+                    "——要停掉直接整组杀：kill -9 -%s（负号 = 进程组；pid 即 setsid 组长，"
+                    "子进程一并清掉，无需 pgrep）。下次可直接用 --kill --cleanup"
+                    % (pid, pid))
+            else:
+                result["warnings"].append(
+                    "作业仍在运行（pid 未知）时被强制清理：本工具已失去该作业的追踪，"
+                    "远端进程可能仍在跑（job.pid 缺失，只能人工 pgrep 定位）")
     if status == "finished":
         result["next_action"] = ("作业已结束（exit_code=%s）。%s"
                                  % (rc_val, "已清理远端作业目录"
@@ -4058,6 +4067,14 @@ def _log_read(sftp, client, args, job_dir, conn, start):
         result["next_action"] = ("作业已死（无退出码）。看日志尾部确认原因；%s"
                                  % ("已清理远端作业目录" if result.get("cleaned")
                                     else "清理：加 --cleanup"))
+    elif result.get("forced_cleanup"):
+        # 目录（含 job.pid）已按 --force 删除 → job.log 也没了，不能再"继续增量读"，
+        # --kill 同样不可用；唯一出路是按组长 pid 手工整组杀（v2.2.3 修掉误导文案）
+        result["next_action"] = (
+            "作业目录已按 --force 清理，无法再追踪也无法用 --kill（job.pid 已删）。"
+            "要停掉远端进程：%s（负号 = 进程组，一次清整组）；"
+            "下次改用：pyaissh log <target> --job-id <id> --kill --cleanup"
+            % (result.get("group_kill") or "kill -9 -<pid>"))
     else:
         result["next_action"] = ("作业仍在运行。继续增量读：--offset %s（或稍后重读）；"
                                  "等结束：--wait-rc 30；停掉：--kill"
@@ -5475,6 +5492,8 @@ def build_parser():
   truncated=true 且非 --offset 模式时，中段被省略（omitted_bytes）→ 用 --offset 0 顺序读补齐
   --cleanup 只在作业已结束（finished/dead）时执行：运行中会拒绝并报 job_running——
   删掉 job.pid/job.log 会让本工具彻底失去追踪，而进程仍在远端跑（要停用 --kill 整组停）
+  --force 强制清理后 job.pid 已删、--kill 不可用：要停掉远端进程直接整组杀
+  kill -9 -<pid>（负号 = 进程组；pid 即 setsid 组长，子进程一并清掉，无需 pgrep）
 """)
     add_conn(p)
     p.add_argument("--job-id", dest="job_id",
@@ -5499,7 +5518,8 @@ def build_parser():
                         "作业仍在运行时拒绝（会自断追踪），先 --kill 或 --wait-rc，或用 --force 放弃追踪")
     p.add_argument("--force", action="store_true",
                    help="配合 --cleanup：作业仍在运行时也强制清理（本工具不再追踪该作业，"
-                        "远端进程可能仍在跑——正常应先 --kill）")
+                        "远端进程可能仍在跑——正常应先 --kill）；清理后要停掉进程用 "
+                        "kill -9 -<pid>（负号=进程组，pid 即 setsid 组长，一次清整组，无需 pgrep）")
     p.add_argument("--limit", type=_positive_int, default=50, help="--list 最多返回条数（默认 50）")
     p.add_argument("--max-output", dest="max_output", type=_positive_int, default=DEFAULT_MAX_OUTPUT,
                    help="单次回传内容上限字节（默认 64KB；截断时看 omitted_bytes，"

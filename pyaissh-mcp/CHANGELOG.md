@@ -121,3 +121,15 @@
 
 
 
+
+## [0.2.5] - 2026-09-13
+
+### 跟随 CLI v2.2.3：force 清理后的恢复命令直接可用（group_kill）
+
+- **固定副本同步至 CLI v2.2.3**（md5 `be949a9c86ecfad8f69a0b246ac969a1`）
+- `force` 参数描述补充：CLI 现返回 **`group_kill`** 字段（= `kill -9 -<pid>`）——`--force` 清理后
+  `job.pid` 已删、`kill` 工具参数不可用，而远端进程仍在跑；该结果里的 pid 就是 `setsid` 进程组组长，
+  **负号 = 整组**，一条命令清掉整组含子进程（无需 pgrep）
+- CLI 侧同步修掉 force 后 `next_action` 的误导（此前仍提示"继续增量读 --offset"，但 `job.log` 已删）
+- 真机对照实测：照 `group_kill` 执行 → 一次干净；用正 pid `kill -9 <pid>` → 只杀组长、子进程成孤儿
+- **真机验证数据**：CLI `live_exec_field` 51/51 全绿；MCP 离线 40 + 真机后台作业 15 全绿
