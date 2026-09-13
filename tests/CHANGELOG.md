@@ -130,3 +130,14 @@
   不再 import tempfile
 ### 验证
 - --unit 全绿（host 7/7）；无 .tmp_host 残留
+
+## [2026-09-13] v2.2.0 后台作业（--detach/log）+ 默认保留量 64KB + 场景参数表
+
+### 新增
+- unit_regression +8：`_detach_scripts` 生成（命令原文/落日志写 rc/单引号转义）、`_job_files` 路径表、
+  `_JOB_ID_RE` 穿越拦截、`DEFAULT_MAX_OUTPUT == 65536`、`_sh_quote`
+- live_exec_field +10：detach 启动返回 job_id/log/rc → `log --wait-rc` 拿 exit_code=5 与输出 →
+  `--offset` 增量读（next_offset 递增、两段拼接不重复）→ `--cleanup` 生效 → 清理后 `job_not_found` →
+  `--list` 可用 → detach+sudo 互斥 / log 缺 job-id / job-id 穿越 三处 bad_args
+### 变更
+- 例数不再写死在描述里（沿用 v2.1.4 去数字化约定）

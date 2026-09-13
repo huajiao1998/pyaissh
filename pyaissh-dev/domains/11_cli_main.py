@@ -73,6 +73,17 @@ def _positive_int(value):
     return v
 
 
+def _nonneg_int(value):
+    """argparse type：非负整数校验（--offset 允许 0 = 从头读）。"""
+    try:
+        v = int(value)
+    except (ValueError, TypeError):
+        raise argparse.ArgumentTypeError("必须为非负整数（收到 %r，如 0）" % (value,))
+    if v < 0:
+        raise argparse.ArgumentTypeError("必须为非负整数（>= 0）")
+    return v
+
+
 def _encoding_type(value):
     """argparse type：编码名校验（codecs.lookup，拼错立刻 bad_args/2，不连远端）。
     裸 str 会把错误拖到解码期 LookupError，被通用 except 误归 exec_failed 误导
@@ -134,6 +145,8 @@ def build_parser():
   pyaissh exec root@1.2.3.4 --cmd 'uname -a'
   pyaissh exec root@1.2.3.4 --cmd 'apt upgrade' --max-time 1200   # 长任务调大总时长上限（最高 1200）
   pyaissh exec root@1.2.3.4 --cmd 'make' --idle-timeout 120      # 慢命令调大静默窗口
+  pyaissh exec root@1.2.3.4 --detach --cmd 'apt install -y nginx' # 后台跑（v2.2）：立即返回 job_id
+  pyaissh log root@1.2.3.4 --job-id <id> --wait-rc 300            # 读日志/等结束拿退出码/--cleanup 清理
   pyaissh exec root@1.2.3.4 --cmd-file - <<'EOF'
   ls -la /var/log
   EOF
@@ -162,7 +175,10 @@ def build_parser():
         130 中断 / 255 连接失败；exec 透传远程退出码（远程恰为 255 时本地返 254）
 字段: 结果均含 version/action/duration_ms/warnings；exec 另有 exit_success、
       stdout_bytes(原始接收字节)、stdout_truncated(该流是否截断，省略量见
-      stdout_omitted_bytes)；upload/download 的 bytes=清单总大小、
+      stdout_omitted_bytes)；截断时完整输出落盘，路径见 stdout_spill_file
+      （并有 next_action 直接告诉你下一步）；exec --detach 返回 job_id/log/rc，
+      log 返回 content/next_offset/status/exit_code（增量轮询不重复读）；
+      upload/download 的 bytes=清单总大小、
       bytes_transferred=实际传输；ls 的 entries 含 mode/mtime(epoch 秒,UTC)/is_symlink
 特性: 传输零 token 消耗——upload/download 的文件内容从不回传 JSON，AI 只消费
       元数据（files/bytes/file_list），大文件/二进制不会烧爆 LLM 上下文
@@ -208,16 +224,34 @@ def build_parser():
                        help="跳板机私钥路径 (默认 ~/.ssh/id_ed25519)")
 
     # exec
-    p = sub.add_parser("exec", help="执行远程命令",
+    p = sub.add_parser("exec", help="执行远程命令（长任务可用 --detach 后台化）",
                        description="执行远程命令。本地退出码 = 远程退出码；"
-                                   "超时 124、连接失败 255、参数错误 2、中断 130。")
+                                   "超时 124、连接失败 255、参数错误 2、中断 130。",
+                       formatter_class=argparse.RawDescriptionHelpFormatter,
+                       epilog="""\
+场景 → 参数（凭感觉调超时是坑，照表来；v2.2）:
+  systemctl restart / nginx reload（静默 1-2 分钟）   --idle-timeout 120
+  apt/yum install / docker pull / npm i（数分钟）     --idle-timeout 120 --max-time 900
+  编译构建 / 大数据处理（10-20 分钟）                 --idle-timeout 300 --max-time 1200
+  要"边跑边看"或超过宿主调用上限                     --detach，再用 pyaissh log 增量读
+  静默但想确认还活着（不解决卡死判定）               --progress 30
+  输出很大（>64KB）                                  完整输出自动落 spill，读 stdout_spill_file
+  命令里有 $ 等特殊字符（PowerShell 会吃）           写脚本文件后 --cmd-file -（勿内联）
+""")
     add_conn(p)
     p.add_argument("--cmd", help="要执行的命令")
     p.add_argument("--cmd-file", dest="cmd_file",
                    help="从文件读命令 (- 表示 stdin，适合长脚本/特殊字符)")
+    p.add_argument("--detach", action="store_true",
+                   help="后台运行（v2.2）：远端 setsid+nohup 起作业，立即返回 job_id/log/rc；"
+                        "之后用 pyaissh log 增量读日志、--wait-rc 等结束拿退出码——"
+                        "长任务不受宿主单次调用时长限制（SSH 断开作业照跑）；与 --sudo/--pty 互斥")
+    p.add_argument("--job-dir", dest="job_dir",
+                   help="后台作业根目录（默认 %s；每作业一个子目录）" % DEFAULT_JOB_DIR)
     p.add_argument("--idle-timeout", dest="exec_timeout", type=_exec_timeout, default=60,
                    help="静默超时秒数：连续无输出超过该值即终止，默认 60，最高 1200 "
-                        "（区别于 --max-time 总时长；输出少的慢命令调大这个）")
+                        "（区别于 --max-time 总时长；输出少的慢命令调大这个，"
+                        "参见 --help 末尾的场景表）")
     p.add_argument("--progress", type=_positive_int, nargs="?", const=30, metavar="SECS",
                    help="长任务心跳（v2.1）：命令每静默/持续运行超过 N 秒（默认 30）往 stderr "
                         "打一行[PROGRESS]仍在运行——AI 知道进程活着不是挂死；"
@@ -229,7 +263,9 @@ def build_parser():
                    help="命令总时长上限秒数（wall clock；默认 2×idle-timeout 且至少 120，"
                         "不得小于 --idle-timeout；构建/编译等长任务请调大，最高 1200）")
     p.add_argument("--max-output", dest="max_output", type=_positive_int, default=DEFAULT_MAX_OUTPUT,
-                   help="stdout/stderr 单流最大保留字节，超出保留头尾各一半 (默认 256KB)")
+                   help="stdout/stderr 单流最大保留字节，超出保留头尾各一半"
+                        "（默认 64KB；完整输出自动落盘并把路径回传 stdout_spill_file/"
+                        "stderr_spill_file，读文件比重跑便宜——结果过大时宿主会裁掉工具结果中段）")
     p.add_argument("--no-credential-warn", dest="no_credential_warn", action="store_true",
                    help="关闭\"命令含疑似凭据\"的 WARN 提示（启发式误报时用；仍建议敏感凭据走环境变量注入）")
     p.add_argument("--sudo", action="store_true",
@@ -253,6 +289,48 @@ def build_parser():
     p.add_argument("--pty-strip-ansi", action="store_true",
                    help="PTY 模式下剥离输出中的 ANSI 转义序列（颜色/光标），供 AI 干净解析")
     p.set_defaults(func=cmd_exec)
+
+    # log（v2.2，别名 tail）：读 exec --detach 起的后台作业日志/状态
+    p = sub.add_parser("log", aliases=["tail"], help="读后台作业日志（配合 exec --detach）",
+                       description="读取 exec --detach 启动的后台作业的日志与结束状态。"
+                                   "默认回传尾部 100 行；--offset 增量读（用返回的 next_offset 续读）；"
+                                   "--wait-rc 等结束直接拿退出码；--cleanup 清理远端作业目录。",
+                       formatter_class=argparse.RawDescriptionHelpFormatter,
+                       epilog="""\
+典型用法（配合 exec --detach）:
+  pyaissh exec h --detach --cmd 'apt install -y nginx'   # 返回 job_id/log/rc
+  pyaissh log h --list                                   # 列出作业与状态
+  pyaissh log h --job-id 20260911-120000-1234            # 尾部 100 行
+  pyaissh log h --job-id <id> --offset 0                 # 从头增量读（返回 next_offset）
+  pyaissh log h --job-id <id> --offset <next_offset>     # 接着上次读（轮询不重复）
+  pyaissh log h --job-id <id> --wait-rc 300              # 等结束（≤600s）并拿退出码
+  pyaissh log h --job-id <id> --cleanup                  # 清理远端作业目录
+
+状态判定: 看 rc 文件是否存在（存在=finished，内容即退出码）；被 kill 的作业永无 rc，恒 running
+""")
+    add_conn(p)
+    p.add_argument("--job-id", dest="job_id",
+                   help="作业 id（exec --detach 返回；只允许字母/数字/下划线/点/连字符）")
+    p.add_argument("--path", help="直接指定日志文件路径（名为 job.log 时自动配对同目录 job.rc）")
+    p.add_argument("--job-dir", dest="job_dir", help="作业根目录（默认 %s）" % DEFAULT_JOB_DIR)
+    p.add_argument("--list", dest="list_jobs", action="store_true",
+                   help="列出作业目录下所有作业（状态/日志大小/退出码/时间）")
+    p.add_argument("--lines", type=_positive_int,
+                   help="回传尾部 N 行（默认 %d；与 --offset 互斥）" % JOB_TAIL_LINES)
+    p.add_argument("--offset", type=_nonneg_int,
+                   help="从该字节偏移增量读（配返回的 next_offset 轮询；与 --lines 互斥）")
+    p.add_argument("--wait-rc", dest="wait_rc", type=_positive_int,
+                   help="阻塞等待作业结束（rc 出现）最多 N 秒（上限 %d），出现即返回退出码"
+                        % JOB_WAIT_MAX)
+    p.add_argument("--cleanup", action="store_true",
+                   help="读完后删除远端作业目录（job.sh/run.sh/job.log/job.rc）；需 --job-id")
+    p.add_argument("--limit", type=_positive_int, default=50, help="--list 最多返回条数（默认 50）")
+    p.add_argument("--max-output", dest="max_output", type=_positive_int, default=DEFAULT_MAX_OUTPUT,
+                   help="单次回传内容上限字节（默认 64KB；截断时看 omitted_bytes，"
+                        "增量读用 --offset 继续）")
+    p.add_argument("--encoding", dest="encoding", type=_encoding_type, default="utf-8",
+                   help="日志解码编码（默认 utf-8；GBK 日志用 --encoding gbk）")
+    p.set_defaults(func=cmd_log)
 
     # upload
     p = sub.add_parser("upload", help="上传文件/目录 (本地 -> 远程)",
@@ -476,7 +554,7 @@ def main():
         handler = getattr(args, "func", None)
         if handler is None:
             emit_error(args.json if args is not None else True, "bad_args",
-                       "未指定子命令（可选: exec / upload / download / test / ls）")
+                       "未指定子命令（可选: exec / log / upload / download / test / ls / host）")
             parser.print_help(sys.stderr)
             return 2
         # --field 与 --text 互斥（--text 要可读包裹、--field 要裸字段值；

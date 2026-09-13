@@ -59,7 +59,20 @@ python3 pyaissh.py exec root@1.2.3.4 --cmd-file - <<'EOF'   # 长脚本走 stdin
 ls -la /var/log
 EOF
 ```
-超时双参数（`--idle-timeout`/`--max-time`，均退出码 124）、输出截断（`--max-output`）、`--pty`/`--pty-strip-ansi`、`--encoding`（GBK 系统日志乱码时指定编码）、`--sudo`（见速查第 10 条）、`--progress [SECS]`（v2.1 长任务心跳：静默每 N 秒打 `[PROGRESS] 仍在运行`，不重置静默计时）完整语义见 **docs/exec.md**
+超时双参数（`--idle-timeout`/`--max-time`，均退出码 124）、输出截断（`--max-output` 默认 64KB，超出自动落 spill 文件并把路径写进 `stdout_spill_file`/`next_action`）、`--pty`/`--pty-strip-ansi`、`--encoding`（GBK 系统日志乱码时指定编码）、`--sudo`（见速查第 10 条）、`--progress [SECS]`（v2.1 长任务心跳：静默每 N 秒打 `[PROGRESS] 仍在运行`，不重置静默计时）完整语义见 **docs/exec.md**；**调参照 `pyaissh exec --help` 末尾的"场景 → 参数"表**（systemctl/apt/编译各该给多少 idle/max）
+
+### exec --detach + log — 后台作业（v2.2，长任务"边跑边看"）
+```bash
+python3 pyaissh.py exec root@1.2.3.4 --detach --cmd 'apt install -y nginx'   # 立即返回 job_id/log/rc
+python3 pyaissh.py log  root@1.2.3.4 --list                                  # 列作业（状态/大小/退出码）
+python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --offset 0                # 增量读（返回 next_offset）
+python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --offset <next_offset>    # 接着读，不重复
+python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --wait-rc 300             # 等结束拿 exit_code
+python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --cleanup                 # 清理远端作业目录
+```
+- **为什么用**：`exec` 前台受宿主单次调用时长限制（约 600s，pyaissh 自身可到 1200）；`--detach` 把作业丢到远端 `setsid+nohup` 后台（SSH 断开照跑），日志/退出码落 `/tmp/pyaissh-jobs/<job_id>/{job.log,job.rc}`，AI 用 `log` 轮询增量读——分钟级任务的"正在进行中"变得可见
+- **状态判定**：`job.rc` 存在 = 作业结束（内容即退出码，`status: finished`）；被 kill 的作业永无 rc（`status` 恒 `running`）
+- **与 `--sudo`/`--pty` 互斥**（bad_args）；作业命令原文会落远端 `job.sh`（别写明文凭据，用完 `--cleanup`）
 
 ### ls — 列远程目录
 ```bash

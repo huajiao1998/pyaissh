@@ -2,9 +2,9 @@
 
 **给 AI 用的结构化 SSH 工具 — A structured SSH tool built for AI agents**
 
-当前版本：**v2.1.0**（v2.0.0 行为零变化重构 + v2.1 使用 AI 反馈五项：--field 失败直接给 stderr 尾巴 / host add 别名 / upload --exclude / $(cat 凭据豁免 / --progress 心跳）
+当前版本：**v2.2.0**（v2.1 系列五项反馈修复 + v2.2 后台作业：`exec --detach` + `pyaissh log` 长任务边跑边看 / 默认输出保留量 64KB 防宿主裁中段 + 截断 `next_action` / `exec --help` 场景参数表）
 
-**Current version: v2.1.0** — v2.0.0 behavior-identical restructuring plus v2.1 user-AI feedback fixes (field stderr tail / host add aliases / upload --exclude / credential-warn $(cat) exemption / --progress heartbeat).
+**Current version: v2.2.0** — v2.1 feedback fixes plus v2.2 background jobs (`exec --detach` + `pyaissh log` for long tasks), 64KB default output retention with spill `next_action`, and a scenario→flags table in `exec --help`.
 
 裸 `ssh` 给 AI 用有四个坑：
 

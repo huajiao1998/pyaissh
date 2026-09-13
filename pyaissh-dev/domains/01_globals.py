@@ -6,7 +6,7 @@
 被 00_head（信号区）、各 cmd_*（超时/常量）引用；拼接后与本包其余域同模块共享命名空间。
 """
 
-VERSION = "2.1.4"
+VERSION = "2.2.0"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -89,7 +89,14 @@ RESPONDER_AFTER = 0.5        # 救援线程关闭连接后的再轮询间隔（�
 WATCHDOG_TICK = 5            # SFTP 看门狗检查间隔
 RECV_CHUNK = 65536           # 单次 recv 读块（64KB）
 PARALLEL_READ_CHUNK = 262144  # 分片下载单次读块（256KB；与 DEFAULT_MAX_OUTPUT 同值不同义，分开命名）
-DEFAULT_MAX_OUTPUT = 262144  # exec 单流默认最大保留字节（256KB：内存缓冲与显示截断同源）
+DEFAULT_MAX_OUTPUT = 65536   # exec 单流默认最大保留字节（v2.2 由 256KB 降为 64KB）
+#   理由：结果 JSON 过大时宿主会裁剪工具结果中段（[... tool result middle pruned ...]），
+#   连 spill 路径都可能一起被裁掉；64KB 已覆盖多数命令全文，超出的完整输出本来就
+#   落在 spill 文件里（路径回传 stdout_spill_file/stderr_spill_file，读文件比重跑便宜）
+# --- 后台作业（v2.2：exec --detach 启动 + log 子命令读取）-------------------
+DEFAULT_JOB_DIR = "/tmp/pyaissh-jobs"  # 远端作业根目录（每作业一个子目录）
+JOB_TAIL_WINDOW = 1048576    # log 取尾部时的最大回看字节窗口（1MB，防大日志全量入内存）
+JOB_WAIT_MAX = 600           # --wait-rc 上限秒数（宿主单次调用上限约 600s）
 BUF_ALIGN_WINDOW = 4096      # 截断行对齐时回退搜索窗口（字节）
 MIN_BUF_FLOOR = 4096         # 内存缓冲下限：max(args.max_output, 4096) 保证小档位也有可用缓冲
 JOIN_GRACE = 1.5             # 读线程 join 宽限（秒）

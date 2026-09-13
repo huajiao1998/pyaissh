@@ -33,4 +33,13 @@
 - **命令失败时 stderr 直接给实际内容（v2.1）**：`--field` 只提取了部分字段（如 `--field stdout`）且**命令失败（exit≠0）+ stderr 非空 + 未提取 stderr**时，stderr 通道直接打**截断的 stderr 尾巴（1KB 封顶）**+ 提示——不用再为拿真实报错多跑一轮（实测：pip 装依赖失败一次往返拿到报错）。命令成功但 stderr 非空（警告性输出）仍只打"结果含非空 stderr"提示不塞内容
 - 与 `--text` 互斥（bad_args，退出码 2）；`--json` 兼容 no-op 不冲突
 - **仅作用于成功路径**：工具错误（emit_error：连接失败/bad_args 等）仍输出**完整 JSON**（AI 需要 `retryable`/`message`）；命令非零退出是"成功路径的结果"（ok:true + exit_success:false），此时 --field 提取的是结果字段（`--field stdout,-stderr` 能拿到报错）
+
+## 后台作业字段契约（v2.2：`exec --detach` + `log`）
+
+- **`exec --detach`** 立即返回（不阻塞）：`detached:true`、`job_id`、`pid`、`status`（`running`/`finished`）、`log`、`rc`、`job_dir`、`cmd_written_to`（远端 job.sh 路径）、`next_action`（下一步命令怎么写）。启动后 0.3s 内已结束的短作业直接给 `status:"finished"` + `exit_code`/`exit_success`
+- **`log`**（别名 `tail`）：`content`（回传内容）、`bytes_returned`、`log_bytes`（远端日志总大小）、`next_offset`（**下次增量读的字节偏移**）、`has_more`、`status`、`exit_code`/`exit_success`（作业未结束时为 `null`）、`tail_window_truncated`（尾部窗口是否回看截断）、`wait_rc_secs`/`waited_ms`、`cleaned`（--cleanup）、`next_action`；`--list` 返回 `jobs[]`（job_id/log/log_bytes/status/exit_code/mtime）+ `count`
+- **增量读语义**：`--offset N` 读 `[N, N+max_output)` 字节并给 `next_offset`——轮询不会重复读同一段（`--field content` 或 `--field next_offset` 都很轻）；`--offset` 与 `--lines` 互斥
+- **`--field` 同样适用**：`--field exit_code`、`--field content`、`--field next_offset`、`--field jobs`（JSON 序列化）
+- **截断时的 `next_action`**（v2.2，exec 前台输出）：任一流超 `--max-output`（默认 64KB）被截断时，结果直接给"完整输出落盘路径 + 读文件不要重跑"的下一步提示，无需自己拼线索
+- **退出码**：`exec --detach` 成功启动 = 0（作业自身的退出码在 `log` 的 `exit_code`）；启动失败 = 255（`detach_failed`）；`log` 读不到作业 = 2（`job_not_found`）
 - **默认契约零变化**：不用 `--field` 时 stdout 恒单行 JSON

@@ -6,7 +6,7 @@
 - **`--pty`（基础版）**：exec 加 `--pty` 可分配 PTY 伪终端，支持需要 TTY 的**非交互**命令（`tty`、`watch`、`top -b -n 1`、`sudo -n`、检测 isatty 的脚本）。注意：PTY 模式下 stderr 合并进 stdout（无独立 stderr）；输出带 `\r\n` 会被自动清洗为 `\n`；`--pty-strip-ansi` 可剥离 ANSI 颜色/光标序列供 AI 干净解析；结果 JSON 带 `pty: true` 标志。**全屏交互程序（vi/vim、sudo 密码输入）仍不可用**——AI 编辑远程文件请用 download/upload 或 sed 结构化替换；**sudo 提权请用 `--sudo`**（v1.5.15 起：`sudo -S` 经 SSH stdin 注入密码，密码不进命令文本/cmd 字段/日志，见 docs/exec.md）——`--sudo` 与 `--pty` 互斥，免密环境 `--sudo` 无密码时自动 `sudo -n` 探测
 - **非 PTY 输出的 ANSI 风险**：远程命令带色输出（`grep --color`、`ls --color`、安装脚本）在非 PTY 模式下会**原样**进 JSON 的 `stdout` 字段（仅 `--pty` 时才剥离）——做正则/字符串匹配解析前先自行剥离 ANSI，或对这类命令加 `--pty-strip-ansi`
 - **远端路径 `~` 已支持自动展开**（v1.3 起，`~` / `~/x` 转为绝对路径并回显在结果里；`~user` 形式不支持）；**通配符始终不支持**（SFTP 无 glob，报错会明确提示先 ls）
-- exec 输出默认 `--max-output` 256KB 截断（可调大，见 exec.md）；内存缓冲有上界（约等于 `--max-output`，头尾各半滚动保留），不会因大输出无限吃内存；超大输出（建议 >50MB）仍应分批或改走文件
+- exec 输出默认 `--max-output` **64KB** 截断（v2.2 由 256KB 下调，防宿主裁掉工具结果中段；完整输出自动落 spill 文件并把路径写进 `next_action`，见 exec.md）；内存缓冲有上界（约等于 `--max-output`，头尾各半滚动保留），不会因大输出无限吃内存；超大输出（建议 >50MB）仍应分批或改走文件
 - 后台进程占用通道时，drain 窗口为 `min(idle_timeout, 10)` 秒，到点强制截断并标记 `output_truncated`（含 ≤数秒收尾，典型总延迟 10~13s）
 - 默认 `AutoAddPolicy` 自动接受新 host key；paramiko≥5.0 且 known_hosts 文件存在时会**写回盘**（旧版只加内存不写盘）；**写盘为原子替换（v1.4.8 起：Linux 用 flock 串行化 + 临时文件 + os.replace，Windows 用原子替换）**——多进程并发首次连接同一新主机不丢记录、写盘中断不损坏 known_hosts 文件（原生 save_host_keys 是直接覆写，存在竞态与损坏风险）；**首次连接的新主机（known_hosts 无记录）连接成功后 stderr 会打 `[WARN] 新主机 host key 已隐式接受`**——AI 可据此区分"首次连接"与"主机被劫持/重装"；敏感环境加 `--strict`
 - **并发连接上限受服务端限制**：同时 ≥10 条连接（如 10+ 并发 test、8 分片 + 主连接 + 跳板）可能触发 sshd 默认 `MaxStartups 10:30:100` 的概率性拒绝，表现为随机连接报 `ssh_error`（"Error reading SSH protocol banner"，错误消息会附带 MaxStartups 排查提示）——这是服务端配置特性非工具 bug，可降低并发或调大目标机 sshd 的 MaxStartups

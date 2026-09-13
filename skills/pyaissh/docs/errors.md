@@ -22,7 +22,7 @@
 | 124 | **exec 超时**（对齐 GNU timeout 惯例） | `exec_idle_timeout`（连续无输出超 `--idle-timeout`）或 `exec_total_timeout`（总时长超 `--max-time`）；**远程进程可能仍在运行**（断开不会杀掉它），副作用命令重试前先 pgrep 确认/清理 |
 | 130 | 用户中断（Ctrl+C / SIGTERM，仅 POSIX） | 超时机制杀子进程（`subprocess.terminate()`/`timeout` 命令发 SIGTERM）同样走此路径。v1.4.0 起信号处理器**只置标志不再抛异常**（在 paramiko C 级 I/O 中抛 KI 会导致锁损坏死锁），由救援线程强断连接 + Python 轮询点检查标志，串行/并行/上传/下载/exec/test 全部可靠 130 + `interrupted` JSON + 零本地残留（v1.4.5 起 `test`/`--cmd-file -`/exec 排水阶段也覆盖，不再有信号被吞返回假成功）；`interrupted` 消息区分来源（`用户中断（SIGTERM）`/`用户中断（SIGINT）`）；**慢链路分片下载中断也秒级退出**（v1.4.3 起分片 worker 与主线程 join 均带信号检查，不再拖到 120s 看门狗）；中断路径硬退出（跳过解释器关闭阶段，退出码确定）；**Windows 的 terminate() 是硬杀不走信号**，无 JSON 无清理（调用方应靠 `--max-time` 兜底而非外部强杀） |
 | 254 | exec 成功但远程退出码恰为 255 | 255 保留给连接失败语义；JSON 的 `local_exit_code` 字段即本地实际退出码（254），`exit_code` 仍是远程真实值 255。**歧义提示**：本地退出码 254 可能是"远程真实 254"或"远程 255 的映射"——区分只看 JSON 的 `exit_code`/`local_exit_code` 双字段（纯 `$?` 消费者无法区分，契约要求决策以 JSON 为准） |
-| 255 | 连接失败，以及 exec/test 的执行期错误（`exec_failed`/`connection_lost`/`test_failed`） | **退出码仅作粗筛，决策一律以 JSON `error` 字段为准** |
+| 255 | 连接失败，以及 exec/test/log 的执行期错误（`exec_failed`/`connection_lost`/`test_failed`/`detach_failed`/`log_failed`） | **退出码仅作粗筛，决策一律以 JSON `error` 字段为准** |
 
 ## 错误类型（JSON `error` 字段）与建议动作（完整表）
 
@@ -43,6 +43,9 @@
 | `connection_lost` | 执行中连接中断，未收到退出状态，**输出可能不完整** | 不要信任部分结果，重跑命令核对 |
 | `interrupted` | 用户中断（Ctrl+C 或 SIGTERM），退出码 130 | 任务被手动/超时机制终止；错误 JSON 带已读到的部分进展——exec 为 `stdout`/`stderr`，upload/download 为已传 `file_list`（upload 的 `bytes_transferred` 为真实已传字节）——据此判断命令是否已部分执行，`rm`/`apt install`/`git push` 等非幂等命令**谨慎重试**；上传中断可能残留 `.part`（warnings 会明示路径与清理命令），重试前先清理；下载中断不留 `.part` 残留 |
 | `ssh_error` | SSH 协商/协议错误（`--strict` 下新主机不在 known_hosts 时常见） | 查看 `message`；`--strict` 场景先确认主机或清理 known_hosts |
+| `detach_failed` | `exec --detach` 启动后台作业失败（退出码 255）：启动命令非零退出，或启动后 0.3s 内进程即死且未写 rc | 消息带日志尾巴定位（命令不可执行/语法错/作业目录不可写）；远端可能残留作业目录，`log --list` 可见或手工删除 |
+| `job_not_found` | `log` 读不到作业日志（退出码 2） | 作业 id 拼错、已被 `--cleanup` 清理，或 `--job-dir` 不一致；用 `log --list` 看现有作业 |
+| `log_failed` | `log` 读取期错误（退出码 255） | 看 `message`（多为 SFTP 权限/路径问题）；修正后重读 |
 | `internal_error` | 工具内部未预期异常（理论不可达，兜底分支） | 属于 pyaissh 自身缺陷：把 stderr 的 traceback 与复现命令反馈给维护者；可安全重试 |
 | `read_cmd_failed` | `--cmd-file` 读取失败（退出码 2） | 检查文件路径与编码 |
 | `dependency_missing` | 本地依赖缺失（如未安装 paramiko），退出码 255，`retryable=false` | **本地环境问题，与目标主机/网络无关**——`pip install paramiko` 安装后重试；重试前无需排查网络/目标机（v1.5.6 起独立分类；此前误归 `connection_failed` 且 retryable=true 导致 AI 白白重试） |

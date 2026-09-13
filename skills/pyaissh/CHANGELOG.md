@@ -286,3 +286,30 @@
 - unit 扩至 126（58+55+6+7，新增 P0 六误报 + 2 真命中边界 + host 7）
 ### 文档
 - SKILL（PS 注）；tests README/CHANGELOG 同步
+
+## [2.2.0] - 2026-09-13
+
+### 新增：后台作业（--detach + log 子命令）——长任务"边跑边看"
+- **`exec --detach`**：远端 `setsid+nohup` 起作业，**立即返回** `job_id/pid/status/log/rc/job_dir/next_action`；
+  作业脚本落 `/tmp/pyaissh-jobs/<job_id>/`（`job.sh` = 命令原文、`run.sh` = 运行器），
+  输出合并 `job.log`、退出码写 `job.rc`——**SSH 断开/宿主单次调用超时都不影响作业**
+- **`log`（别名 `tail`）子命令**：`--list` 列作业；默认回传尾部 100 行（`--lines N`）；
+  `--offset N` **增量读**（返回 `next_offset`，轮询不重复）；`--wait-rc SECS` 等结束拿退出码（≤600s）；
+  `--cleanup` 清理远端作业目录；支持 `--field content/exit_code/next_offset/jobs`
+- 状态判定以 `job.rc` 存在为准（存在=finished+exit_code；被 kill 的作业恒 running）
+- 互斥与安全：与 `--sudo`/`--pty` 互斥（bad_args）；`--job-id` 严格校验防路径穿越；
+  命令原文会落远端 `job.sh`（凭据 WARN 会额外提示此事）
+- 新错误类型：`detach_failed`（255）/ `job_not_found`（2）/ `log_failed`（255）
+### 变更：默认输出保留量 256KB → 64KB（防宿主裁掉工具结果中段）
+- 根因：结果 JSON 过大时宿主裁剪工具结果中段（`[... tool result middle pruned ...]`），
+  连 spill 路径都可能一起丢——使用者只看到"丢了一段"又得重跑
+- 完整输出本来就落 spill 文件；**截断时新增 `next_action` 字段**直接写明"完整输出在哪个文件、
+  读文件不要重跑"（不用自己拼线索）
+### 新增：`exec --help` 末尾"场景 → 参数"表
+- systemctl restart → `--idle-timeout 120`；apt/docker pull → `--idle-timeout 120 --max-time 900`；
+  编译构建 → `--idle-timeout 300 --max-time 1200`；要边跑边看 → `--detach`；
+  静默确认活着 → `--progress 30`；大输出 → 读 spill；含 `$` 特殊字符 → `--cmd-file -`
+- 同时 `log --help` 给出典型用法与状态判定说明
+### 测试
+- unit_regression +8（作业脚本生成/单引号转义/job-id 穿越拦截/默认 64KB）；live_exec_field +10
+  （detach 启动→wait-rc 拿退出码→增量读不重复→cleanup→清理后 job_not_found→--list→互斥校验）

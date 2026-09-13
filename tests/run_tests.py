@@ -270,6 +270,28 @@ def suite_unit_regression(s):
     s.check("exclude 不误伤", not m._excluded_by("src/main.py", "main.py",
                                                  ["node_modules", ".git", "*.map"]))
 
+    # v2.2 后台作业单元：默认保留量 + 作业脚本生成（纯函数，不连远端）
+    s.check("默认 max-output 64KB（防宿主裁中段）", m.DEFAULT_MAX_OUTPUT == 65536,
+            "got %r" % m.DEFAULT_MAX_OUTPUT)
+    paths = m._job_files("/tmp/pyaissh-jobs", "j1")
+    s.check("job 路径表", paths["log"].endswith("/job.log") and paths["rc"].endswith("/job.rc")
+            and paths["dir"] == "/tmp/pyaissh-jobs/j1", repr(paths))
+    tricky = "echo a'b\nls -l \"$HOME\"\nexit 3"
+    job_sh, run_sh = m._detach_scripts(paths, tricky)
+    s.check("job.sh 保留命令原文", tricky in job_sh and job_sh.startswith("#!/bin/bash"))
+    s.check("run.sh 落日志+写 rc", ("bash " in run_sh and paths["log"] in run_sh
+                                    and paths["rc"] in run_sh and "echo $?" in run_sh), run_sh)
+    # 单引号路径注入防护：路径只做 POSIX 单引号转义后进 run.sh
+    odd = m._job_files("/tmp/it's dir", "j2")
+    _j2, run2 = m._detach_scripts(odd, "true")
+    s.check("run.sh 单引号转义", "'\\''" in run2, run2)
+    # job-id 校验（防路径穿越）
+    s.check("job-id 合法", bool(m._JOB_ID_RE.match("20260913-155021-25332"))
+            and bool(m._JOB_ID_RE.match("job_1.x")))
+    s.check("job-id 拒绝穿越", not m._JOB_ID_RE.match("../etc")
+            and not m._JOB_ID_RE.match("/abs") and not m._JOB_ID_RE.match(""))
+    s.check("sh_quote 转义", m._sh_quote("a'b") == "'a'\\''b'")
+
 
 # ============================================================
 # 测试集 2：unit 凭据启发式 47 例（含 $(cat 豁免）
@@ -590,6 +612,43 @@ def suite_live_exec_field(s):
                   timeout=60)
     s.check("--field 下 --progress 心跳可见", "[PROGRESS] 仍在运行" in p.stderr
             and "[SSH]" not in p.stderr and p.stdout.strip() == "")
+
+    # v2.2 后台作业（--detach + log）：长任务不受宿主调用上限，增量读不重复
+    rc, j, _ = _live_run(["exec", tgt, "--detach", "--cmd", "sleep 2; echo detach_hi; exit 5"],
+                         timeout=90)
+    jid = (j or {}).get("job_id")
+    s.check("detach 启动返回 job_id/log/rc",
+            bool(j) and j.get("detached") is True and bool(jid)
+            and j.get("log", "").endswith("/job.log") and j.get("rc", "").endswith("/job.rc"),
+            repr(j)[:200])
+    if jid:
+        rc, j2, _ = _live_run(["log", tgt, "--job-id", jid, "--wait-rc", "30"], timeout=90)
+        s.check("log --wait-rc 拿退出码", bool(j2) and j2.get("status") == "finished"
+                and j2.get("exit_code") == 5 and "detach_hi" in j2.get("content", ""),
+                repr(j2)[:200])
+        # 增量读：--offset 0 → next_offset 递增，两段拼起来是全文
+        rc, j3, _ = _live_run(["log", tgt, "--job-id", jid, "--offset", "0"], timeout=60)
+        s.check("log --offset 增量读", bool(j3) and j3.get("next_offset", 0) > 0
+                and isinstance(j3.get("has_more"), bool), repr(j3)[:160])
+        rc, j4, _ = _live_run(["log", tgt, "--job-id", jid, "--offset",
+                               str(j3.get("next_offset", 0))], timeout=60)
+        s.check("log 续读不重复", bool(j4)
+                and (j3.get("content", "") + j4.get("content", "")).count("detach_hi") == 1,
+                "first=%r second=%r" % (j3.get("content"), j4.get("content")))
+        rc, j5, _ = _live_run(["log", tgt, "--job-id", jid, "--cleanup"], timeout=60)
+        s.check("log --cleanup 清理", bool(j5) and j5.get("cleaned") is True)
+        rc, j6, _ = _live_run(["log", tgt, "--job-id", jid], timeout=60)
+        s.check("清理后读报 job_not_found", bool(j6) and j6.get("error") == "job_not_found")
+    rc, jl, _ = _live_run(["log", tgt, "--list"], timeout=60)
+    s.check("log --list 可用", bool(jl) and jl.get("ok") is True
+            and isinstance(jl.get("jobs"), list) and "job_dir" in jl, repr(jl)[:160])
+    # 互斥与校验
+    rc, jb, _ = _live_run(["exec", tgt, "--detach", "--sudo", "--cmd", "id"], timeout=60)
+    s.check("detach+sudo 互斥", bool(jb) and jb.get("error") == "bad_args" and rc == 2)
+    rc, jb2, _ = _live_run(["log", tgt], timeout=60)
+    s.check("log 缺 --job-id", bool(jb2) and jb2.get("error") == "bad_args" and rc == 2)
+    rc, jb3, _ = _live_run(["log", tgt, "--job-id", "../etc"], timeout=60)
+    s.check("log job-id 穿越拦截", bool(jb3) and jb3.get("error") == "bad_args" and rc == 2)
 
 
 # ============================================================

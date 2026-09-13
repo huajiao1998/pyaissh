@@ -132,7 +132,7 @@ except (ValueError, OSError, ImportError):
 被 00_head（信号区）、各 cmd_*（超时/常量）引用；拼接后与本包其余域同模块共享命名空间。
 """
 
-VERSION = "2.1.4"
+VERSION = "2.2.0"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -215,7 +215,14 @@ RESPONDER_AFTER = 0.5        # 救援线程关闭连接后的再轮询间隔（�
 WATCHDOG_TICK = 5            # SFTP 看门狗检查间隔
 RECV_CHUNK = 65536           # 单次 recv 读块（64KB）
 PARALLEL_READ_CHUNK = 262144  # 分片下载单次读块（256KB；与 DEFAULT_MAX_OUTPUT 同值不同义，分开命名）
-DEFAULT_MAX_OUTPUT = 262144  # exec 单流默认最大保留字节（256KB：内存缓冲与显示截断同源）
+DEFAULT_MAX_OUTPUT = 65536   # exec 单流默认最大保留字节（v2.2 由 256KB 降为 64KB）
+#   理由：结果 JSON 过大时宿主会裁剪工具结果中段（[... tool result middle pruned ...]），
+#   连 spill 路径都可能一起被裁掉；64KB 已覆盖多数命令全文，超出的完整输出本来就
+#   落在 spill 文件里（路径回传 stdout_spill_file/stderr_spill_file，读文件比重跑便宜）
+# --- 后台作业（v2.2：exec --detach 启动 + log 子命令读取）-------------------
+DEFAULT_JOB_DIR = "/tmp/pyaissh-jobs"  # 远端作业根目录（每作业一个子目录）
+JOB_TAIL_WINDOW = 1048576    # log 取尾部时的最大回看字节窗口（1MB，防大日志全量入内存）
+JOB_WAIT_MAX = 600           # --wait-rc 上限秒数（宿主单次调用上限约 600s）
 BUF_ALIGN_WINDOW = 4096      # 截断行对齐时回退搜索窗口（字节）
 MIN_BUF_FLOOR = 4096         # 内存缓冲下限：max(args.max_output, 4096) 保证小档位也有可用缓冲
 JOIN_GRACE = 1.5             # 读线程 join 宽限（秒）
@@ -3305,6 +3312,15 @@ def _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client):
             result["stdout_spill_file"] = spill_out_path
         if err_keep and spill_err_path:
             result["stderr_spill_file"] = spill_err_path
+        if out_keep or err_keep:
+            # v2.2：截断时给显式下一步——完整输出在本地 spill 文件，读文件比重跑便宜。
+            # （默认保留量已降到 64KB：结果 JSON 太大会被宿主裁中段，连这个路径都可能丢）
+            kept = [p for p in (spill_out_path if out_keep else None,
+                                spill_err_path if err_keep else None) if p]
+            result["next_action"] = (
+                "输出超 --max-output(%d 字节) 被截断，完整内容已落盘：%s"
+                "（本地文件，直接读，不要重跑；需要内联更多才调大 --max-output）"
+                % (args.max_output, "、".join(kept)))
         _spill_handled = True
         header = "[%s]  exit_code=%d  duration=%dms" % (
             "OK" if exit_code == 0 else "EXIT %d" % exit_code, exit_code, duration)
@@ -3375,7 +3391,9 @@ def _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client):
 
 
 def cmd_exec(args):
-    """exec 编排：前置校验组装 -> 连接 -> 执行会话（三段各自独立函数）。"""
+    """exec 编排：--detach 走后台作业；否则前置校验组装 -> 连接 -> 执行会话（三段独立函数）。"""
+    if getattr(args, "detach", False):
+        return _cmd_exec_detach(args)
     start = time.time()  # 计时含连接耗时：duration_ms 在跳板/慢网络下偏大
 
     prepared = _prepare_exec_command(args)
@@ -3391,6 +3409,461 @@ def cmd_exec(args):
         return conn_ec
 
     return _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client)
+
+
+# =========================================================================
+# 后台作业（v2.2）：exec --detach 启动 + log 子命令读取
+#
+# 设计要点：
+# - 作业脚本落盘（job.sh = 用户命令原文）+ 运行器（run.sh = 落日志 + 捕获退出码）
+#   → 不把命令拼进一行 shell（本地 PowerShell 展 $?/$! 的坑实测踩过三次）
+# - setsid + nohup + 三路重定向 → SSH 断开/宿主单次调用超时都不影响作业
+# - job.rc 是"作业已结束"的唯一可靠标记（被 kill 则永不出现，status 恒 running）
+# - log 子命令增量读（--offset/next_offset）→ 轮询 payload 小、绕开宿主调用上限
+# =========================================================================
+
+_JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+JOB_SCRIPT = "job.sh"      # 作业本体（用户命令原文）
+JOB_RUNNER = "run.sh"      # 运行器（跑作业 + 落日志 + 写 rc）
+JOB_LOG_NAME = "job.log"   # 输出日志（stdout+stderr 合并）
+JOB_RC_NAME = "job.rc"     # 退出码文件（存在 = 作业已结束）
+JOB_POLL_TICK = 1.0        # --wait-rc 轮询间隔（秒）
+JOB_TAIL_LINES = 100       # 不给 --lines/--offset 时默认回传的尾部行数
+JOB_ERR_TAIL = 2048        # 启动失败时回传的日志尾巴字节数
+
+
+def _sh_quote(s):
+    """POSIX 单引号转义（远端 shell 命令里安全嵌入路径/文本）。"""
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+def _job_dir_path(job_dir, job_id):
+    """作业目录（远端 POSIX 路径；job_dir 允许尾部 /）。"""
+    return "%s/%s" % (str(job_dir).rstrip("/") or "/", job_id)
+
+
+def _job_files(job_dir, job_id):
+    """作业文件路径表：dir / job / run / log / rc。"""
+    d = _job_dir_path(job_dir, job_id)
+    return {"dir": d,
+            "job": "%s/%s" % (d, JOB_SCRIPT),
+            "run": "%s/%s" % (d, JOB_RUNNER),
+            "log": "%s/%s" % (d, JOB_LOG_NAME),
+            "rc": "%s/%s" % (d, JOB_RC_NAME)}
+
+
+def _detach_scripts(paths, cmd):
+    """生成 (job.sh 内容, run.sh 内容)——纯函数（单测覆盖）。
+
+    job.sh = 用户命令**原文**（不转义/不拼接：多行脚本天然支持，无二次解析坑）
+    run.sh = 跑 job.sh，stdout+stderr 合并进 job.log，随后退出码写入 job.rc
+             （rc 是"作业已结束"的唯一可靠标记；被 kill 则永不出现）
+    """
+    body = cmd if cmd.endswith("\n") else cmd + "\n"
+    job_sh = ("#!/bin/bash\n"
+              "# pyaissh 后台作业本体（用户命令原文；自动生成，勿手改）\n" + body)
+    run_sh = ("#!/bin/bash\n"
+              "# pyaissh 后台作业运行器（自动生成，勿手改）\n"
+              "bash %s > %s 2>&1\n"
+              "echo $? > %s\n"
+              % (_sh_quote(paths["job"]), _sh_quote(paths["log"]), _sh_quote(paths["rc"])))
+    return job_sh, run_sh
+
+
+def _sftp_mkdirs(sftp, path):
+    """远端递归建目录（已存在不报错）。"""
+    parts = [p for p in str(path).split("/") if p]
+    cur = "/" if str(path).startswith("/") else ""
+    for p in parts:
+        cur = (cur.rstrip("/") + "/" + p) if cur else p
+        try:
+            sftp.mkdir(cur)
+        except Exception:
+            pass
+
+
+def _sftp_write_bytes(sftp, path, data):
+    """SFTP 写文件（覆盖；父目录需已存在）。"""
+    with sftp.open(path, "wb") as f:
+        f.write(data)
+
+
+def _sftp_read_rc(sftp, rc_path):
+    """读 rc 文件取退出码；文件不存在/内容非法 → None（None = 作业仍在运行）。"""
+    if not rc_path:
+        return None
+    try:
+        with sftp.open(rc_path, "rb") as f:
+            raw = f.read(64)
+    except Exception:
+        return None
+    try:
+        return int(raw.decode("utf-8", errors="replace").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _detach_cleanup(sftp, paths):
+    """删除作业目录及其中文件；返回成功删除的路径列表（尽力而为，不抛错）。"""
+    removed = []
+    for key in ("job", "run", "log", "rc"):
+        p = paths.get(key)
+        if not p:
+            continue
+        try:
+            sftp.remove(p)
+            removed.append(p)
+        except Exception:
+            pass
+    try:
+        sftp.rmdir(paths["dir"])
+    except Exception:
+        pass
+    return removed
+
+
+def _cmd_exec_detach(args):
+    """exec --detach：远端后台运行命令，立即返回作业句柄（job_id/log/rc）。"""
+    start = time.time()
+    if args.sudo:
+        emit_error(args.json, "bad_args",
+                   "--detach 与 --sudo 互斥（sudo 密码需经 SSH stdin 注入，后台作业无 stdin；"
+                   "提权请在命令内自行处理，或改用前台 exec）")
+        return 2
+    if args.pty or args.pty_strip_ansi:
+        emit_error(args.json, "bad_args",
+                   "--detach 与 --pty/--pty-strip-ansi 互斥（后台作业无终端）")
+        return 2
+    prepared = _prepare_exec_command(args)
+    if prepared[0] is None:
+        _, (etype, emsg, pwarnings) = prepared
+        emit_error(args.json, etype, emsg,
+                   extra={"warnings": pwarnings} if pwarnings else None)
+        return 2
+    cmd, warnings, _sudo_pw, orig_cmd = prepared
+
+    job_dir = getattr(args, "job_dir", None) or DEFAULT_JOB_DIR
+    job_id = time.strftime("%Y%m%d-%H%M%S", time.localtime()) + "-%d" % os.getpid()
+    paths = _job_files(job_dir, job_id)
+    job_sh, run_sh = _detach_scripts(paths, cmd)
+
+    # 凭据启发式：后台作业把命令原文落盘到远端 job.sh（比前台更需注意别写明文凭据）
+    w = warn_sensitive_cmd(orig_cmd, enabled=not getattr(args, "no_credential_warn", False))
+    if w:
+        warnings.append(w + "；且 --detach 会把命令原文写入远端 %s（勿留明文凭据，用完清理）"
+                        % paths["job"])
+
+    conn, client, conn_ec = _connect_exec(args)
+    if conn_ec is not None:
+        return conn_ec
+
+    dir_made = False
+    try:
+        sftp = open_sftp(client)
+        _sftp_mkdirs(sftp, paths["dir"])
+        dir_made = True
+        _sftp_write_bytes(sftp, paths["job"], job_sh.encode("utf-8"))
+        _sftp_write_bytes(sftp, paths["run"], run_sh.encode("utf-8"))
+        try:
+            sftp.chmod(paths["run"], 0o700)
+        except Exception:
+            pass
+        # 启动：setsid+nohup 完全脱离会话；同一条命令里 sleep 0.3 探一次状态——
+        # 短作业直接给 finished+exit_code，长作业给 running，立即死掉给 dead
+        launch = (
+            "setsid nohup bash %s >/dev/null 2>&1 </dev/null &\n"
+            "P=$!\n"
+            "sleep 0.3\n"
+            "if [ -f %s ]; then echo \"pyaissh_rc=$(cat %s)\";\n"
+            "elif kill -0 $P 2>/dev/null; then echo pyaissh_state=running;\n"
+            "else echo pyaissh_state=dead; fi\n"
+            "echo \"pyaissh_pid=$P\"\n"
+            % (_sh_quote(paths["run"]), _sh_quote(paths["rc"]), _sh_quote(paths["rc"]))
+        )
+        stdin, stdout, stderr = client.exec_command(launch, timeout=args.exec_timeout)
+        try:
+            stdin.close()
+        except Exception:
+            pass
+        launch_out = stdout.read().decode(args.encoding, errors="replace")
+        launch_rc = stdout.channel.recv_exit_status()
+        launch_err = stderr.read().decode(args.encoding, errors="replace")
+        m_pid = re.search(r"pyaissh_pid=(\d+)", launch_out)
+        m_rc = re.search(r"pyaissh_rc=(-?\d+)", launch_out)
+        pid = int(m_pid.group(1)) if m_pid else None
+        rc_val = int(m_rc.group(1)) if m_rc else None
+        if launch_rc != 0:
+            _detach_cleanup(sftp, paths)
+            emit_error(args.json, "detach_failed",
+                       "后台作业启动失败（启动命令退出码 %d）：%s"
+                       % (launch_rc, (launch_err or launch_out).strip()[:JOB_ERR_TAIL]))
+            return 255
+        if rc_val is None and "pyaissh_state=running" not in launch_out:
+            # 启动后 0.3s 进程已不在且没有 rc：读日志尾巴帮定位（路径保留供人工查看）
+            tail = ""
+            try:
+                with sftp.open(paths["log"], "rb") as f:
+                    data = f.read(JOB_ERR_TAIL)
+                tail = data.decode(args.encoding, errors="replace")
+            except Exception:
+                pass
+            emit_error(args.json, "detach_failed",
+                       "后台作业启动后立即退出且未写退出码（可能命令不可执行/脚本语法错）。"
+                       "日志 %s%s" % (paths["log"], ("：\n" + tail) if tail else "（空）"),
+                       extra={"job_id": job_id, "log": paths["log"], "rc": paths["rc"],
+                              "pid": pid})
+            return 255
+
+        cmd_echo, cmd_cut, cmd_n = _truncate_cmd(cmd)
+        if cmd_cut:
+            warnings.append("cmd 字段已截断（完整命令 %d 字节；远端作业脚本 %s 保留全文）"
+                            % (cmd_n, paths["job"]))
+        status = "finished" if rc_val is not None else "running"
+        target_hint = "%s@%s" % (conn["user"], conn["host"])
+        result = {
+            "ok": True,
+            "action": "exec",
+            "version": VERSION,
+            "detached": True,
+            "job_id": job_id,
+            "pid": pid,
+            "status": status,
+            "job_dir": paths["dir"],
+            "log": paths["log"],
+            "rc": paths["rc"],
+            "host": conn["host"],
+            "user": conn["user"],
+            "port": conn["port"],
+            "cmd": cmd_echo,
+            "cmd_truncated": cmd_cut,
+            "cmd_written_to": paths["job"],
+            "warnings": warnings,
+            "duration_ms": int((time.time() - start) * 1000),
+        }
+        if rc_val is not None:
+            result["exit_code"] = rc_val
+            result["exit_success"] = rc_val == 0
+            result["next_action"] = (
+                "作业已结束（exit_code=%d）。用 pyaissh log %s --job-id %s 读日志；"
+                "--cleanup 清理远端作业目录" % (rc_val, target_hint, job_id))
+        else:
+            result["next_action"] = (
+                "作业在远端后台运行（SSH 断开不影响）。读日志：pyaissh log %s --job-id %s"
+                "（增量：--offset <next_offset>）；等结束拿退出码：--wait-rc 300；"
+                "清理：--cleanup" % (target_hint, job_id))
+        header = "[DETACHED %s] job_id=%s pid=%s log=%s" % (
+            status, job_id, pid if pid is not None else "?", paths["log"])
+        _emit_result(args, result, header=header)
+        return 0
+    except KeyboardInterrupt:
+        emit_error(args.json, "interrupted", _interrupt_msg())
+        return 130
+    except SshError as e:
+        emit_error(args.json, e.error_type, str(e))
+        return 255
+    except Exception as e:
+        if dir_made:
+            log("[WARN] --detach 失败，远端可能残留作业目录 %s（可手工删除）" % paths["dir"])
+        emit_error(args.json, "detach_failed", str(e))
+        return 255
+    finally:
+        close_all(client)
+
+
+def _log_list(sftp, job_dir, args, start):
+    """列出作业目录下的所有作业（状态/日志大小/退出码/时间）。"""
+    jobs = []
+    try:
+        attrs = sftp.listdir_attr(job_dir)
+    except Exception:
+        attrs = []
+    for a in attrs:
+        try:
+            if not stat.S_ISDIR(a.st_mode):
+                continue
+        except Exception:
+            continue
+        d = "%s/%s" % (str(job_dir).rstrip("/"), a.filename)
+        log_p, rc_p = "%s/%s" % (d, JOB_LOG_NAME), "%s/%s" % (d, JOB_RC_NAME)
+        try:
+            log_bytes = sftp.stat(log_p).st_size
+        except Exception:
+            log_bytes = None
+        rc_val = _sftp_read_rc(sftp, rc_p)
+        jobs.append({"job_id": a.filename, "log": log_p, "log_bytes": log_bytes,
+                     "status": "finished" if rc_val is not None else "running",
+                     "exit_code": rc_val, "mtime": int(getattr(a, "st_mtime", 0))})
+    jobs.sort(key=lambda e: e["mtime"], reverse=True)
+    result = {"ok": True, "action": "log", "version": VERSION,
+              "job_dir": job_dir, "count": len(jobs),
+              "jobs": jobs[:args.limit], "warnings": [],
+              "duration_ms": int((time.time() - start) * 1000)}
+    if len(jobs) > len(result["jobs"]):
+        result["truncated"] = True
+    return result
+
+
+def _log_read(sftp, args, job_dir, conn, start):
+    """读单个作业日志：--offset 增量 / 默认尾部 N 行；带结束状态与清理。
+
+    返回结果 dict；读不到日志时 emit_error 并返回 None（调用方返回 2）。
+    """
+    paths = _job_files(job_dir, args.job_id) if args.job_id else None
+    if args.path:
+        log_path = _normalize_remote_path(sftp, args.path)
+        d = log_path.rsplit("/", 1)[0] if "/" in log_path else "."
+        rc_path = ("%s/%s" % (d, JOB_RC_NAME)) if log_path.endswith("/" + JOB_LOG_NAME) else None
+        job_id = args.job_id or (d.rsplit("/", 1)[-1] if rc_path else None)
+        job_dir_out = d
+    else:
+        log_path, rc_path, job_id = paths["log"], paths["rc"], args.job_id
+        job_dir_out = paths["dir"]
+
+    # --wait-rc：轮询到 rc 出现（作业结束）或超时；期间响应中断
+    rc_val = _sftp_read_rc(sftp, rc_path)
+    waited_ms = 0
+    if args.wait_rc and rc_val is None:
+        t0 = time.time()
+        deadline = t0 + args.wait_rc
+        while time.time() < deadline:
+            if _SIGTERM_RECEIVED:
+                raise KeyboardInterrupt("SIGTERM")
+            time.sleep(JOB_POLL_TICK)
+            rc_val = _sftp_read_rc(sftp, rc_path)
+            if rc_val is not None:
+                break
+        waited_ms = int((time.time() - t0) * 1000)
+
+    try:
+        size = sftp.stat(log_path).st_size
+    except Exception as e:
+        emit_error(args.json, "job_not_found",
+                   "读不到日志文件 %s：%s（用 --list 看现有作业；作业目录 %s）"
+                   % (log_path, e, job_dir_out))
+        return None
+
+    content_raw = b""
+    next_offset = None
+    has_more = False
+    tail_window_cut = False
+    if args.offset is not None:
+        off = max(0, int(args.offset))
+        if off > size:
+            off = size
+        with sftp.open(log_path, "rb") as f:
+            f.seek(off)
+            content_raw = f.read(args.max_output)
+        next_offset = off + len(content_raw)
+        has_more = next_offset < size
+    else:
+        n = args.lines if args.lines else JOB_TAIL_LINES
+        back = min(size, JOB_TAIL_WINDOW)
+        start_off = size - back
+        tail_window_cut = start_off > 0
+        with sftp.open(log_path, "rb") as f:
+            f.seek(start_off)
+            data = f.read(back)
+        text = data.decode(args.encoding, errors="replace")
+        picked = text.splitlines()[-n:]
+        content_raw = "\n".join(picked).encode(args.encoding, errors="replace")
+        if picked:
+            content_raw += b"\n"
+        next_offset = size
+
+    cut, truncated, omitted = _truncate_output(content_raw, args.max_output, "log")
+    status = "finished" if rc_val is not None else "running"
+    result = {
+        "ok": True, "action": "log", "version": VERSION,
+        "job_id": job_id, "log": log_path, "rc": rc_path, "status": status,
+        "exit_code": rc_val,
+        "exit_success": (rc_val == 0) if rc_val is not None else None,
+        "log_bytes": size,
+        "content": cut.decode(args.encoding, errors="replace"),
+        "bytes_returned": len(cut),
+        "next_offset": next_offset, "has_more": has_more,
+        "tail_window_truncated": tail_window_cut,
+        "truncated": truncated, "omitted_bytes": omitted,
+        "wait_rc_secs": args.wait_rc or None, "waited_ms": waited_ms,
+        "host": conn["host"], "user": conn["user"], "port": conn["port"],
+        "warnings": [], "duration_ms": int((time.time() - start) * 1000),
+    }
+    if args.cleanup and paths:
+        result["cleaned_paths"] = _detach_cleanup(sftp, paths)
+        result["cleaned"] = True
+    if status == "finished":
+        result["next_action"] = ("作业已结束（exit_code=%s）。%s"
+                                 % (rc_val, "已清理远端作业目录"
+                                    if result.get("cleaned") else
+                                    "如需清理：加 --cleanup"))
+    else:
+        result["next_action"] = ("作业仍在运行。继续增量读：--offset %s（或稍后重读）；"
+                                 "等结束拿退出码：--wait-rc 300"
+                                 % (next_offset if next_offset is not None else 0))
+    return result
+
+
+def cmd_log(args):
+    """log（别名 tail）：读后台作业日志 + 结束状态，支持增量读与清理。
+
+    与其他子命令同契约：stdout 单行 JSON；--field 可提取 content/exit_code/jobs 等。
+    """
+    start = time.time()
+    job_dir = getattr(args, "job_dir", None) or DEFAULT_JOB_DIR
+    if args.list_jobs and (args.job_id or args.path):
+        emit_error(args.json, "bad_args", "--list 不与 --job-id/--path 同用（列清单即可）")
+        return 2
+    if not args.list_jobs and not (args.job_id or args.path):
+        emit_error(args.json, "bad_args", "需指定 --job-id 或 --path（列作业清单用 --list）")
+        return 2
+    if args.job_id and not _JOB_ID_RE.match(args.job_id):
+        emit_error(args.json, "bad_args",
+                   "非法 --job-id %r（只允许字母/数字/下划线/点/连字符，防路径穿越）"
+                   % (args.job_id,))
+        return 2
+    if args.lines is not None and args.offset is not None:
+        emit_error(args.json, "bad_args", "--lines 与 --offset 互斥（尾部 N 行 / 增量读，二选一）")
+        return 2
+    if args.wait_rc and args.wait_rc > JOB_WAIT_MAX:
+        emit_error(args.json, "bad_args",
+                   "--wait-rc 上限 %d 秒（宿主单次调用约 600s 上限；更久作业请稍后轮询）"
+                   % JOB_WAIT_MAX)
+        return 2
+    if args.cleanup and not args.job_id:
+        emit_error(args.json, "bad_args", "--cleanup 需配合 --job-id（清理整个作业目录）")
+        return 2
+    if args.cleanup and args.wait_rc:
+        emit_error(args.json, "bad_args", "--cleanup 与 --wait-rc 互斥（先等结束再清理，分两次调用）")
+        return 2
+
+    conn, client, conn_ec = _connect_exec(args)
+    if conn_ec is not None:
+        return conn_ec
+    try:
+        sftp = open_sftp(client)
+        if args.list_jobs:
+            result = _log_list(sftp, job_dir, args, start)
+            _emit_result(args, result, header="[JOBS] %d in %s" % (result["count"], job_dir))
+            return 0
+        result = _log_read(sftp, args, job_dir, conn, start)
+        if result is None:
+            return 2
+        head = ("[FINISHED exit_code=%s]" % result["exit_code"]
+                if result["status"] == "finished" else "[RUNNING]")
+        _emit_result(args, result, header="%s job_id=%s log=%s"
+                     % (head, result.get("job_id"), result["log"]),
+                     sections=[("LOG", result["content"])])
+        return 0
+    except KeyboardInterrupt:
+        emit_error(args.json, "interrupted", _interrupt_msg())
+        return 130
+    except SshError as e:
+        emit_error(args.json, e.error_type, str(e))
+        return 255
+    except Exception as e:
+        emit_error(args.json, "log_failed", str(e))
+        return 255
+    finally:
+        close_all(client)
 
 
 
@@ -4475,6 +4948,17 @@ def _positive_int(value):
     return v
 
 
+def _nonneg_int(value):
+    """argparse type：非负整数校验（--offset 允许 0 = 从头读）。"""
+    try:
+        v = int(value)
+    except (ValueError, TypeError):
+        raise argparse.ArgumentTypeError("必须为非负整数（收到 %r，如 0）" % (value,))
+    if v < 0:
+        raise argparse.ArgumentTypeError("必须为非负整数（>= 0）")
+    return v
+
+
 def _encoding_type(value):
     """argparse type：编码名校验（codecs.lookup，拼错立刻 bad_args/2，不连远端）。
     裸 str 会把错误拖到解码期 LookupError，被通用 except 误归 exec_failed 误导
@@ -4536,6 +5020,8 @@ def build_parser():
   pyaissh exec root@1.2.3.4 --cmd 'uname -a'
   pyaissh exec root@1.2.3.4 --cmd 'apt upgrade' --max-time 1200   # 长任务调大总时长上限（最高 1200）
   pyaissh exec root@1.2.3.4 --cmd 'make' --idle-timeout 120      # 慢命令调大静默窗口
+  pyaissh exec root@1.2.3.4 --detach --cmd 'apt install -y nginx' # 后台跑（v2.2）：立即返回 job_id
+  pyaissh log root@1.2.3.4 --job-id <id> --wait-rc 300            # 读日志/等结束拿退出码/--cleanup 清理
   pyaissh exec root@1.2.3.4 --cmd-file - <<'EOF'
   ls -la /var/log
   EOF
@@ -4564,7 +5050,10 @@ def build_parser():
         130 中断 / 255 连接失败；exec 透传远程退出码（远程恰为 255 时本地返 254）
 字段: 结果均含 version/action/duration_ms/warnings；exec 另有 exit_success、
       stdout_bytes(原始接收字节)、stdout_truncated(该流是否截断，省略量见
-      stdout_omitted_bytes)；upload/download 的 bytes=清单总大小、
+      stdout_omitted_bytes)；截断时完整输出落盘，路径见 stdout_spill_file
+      （并有 next_action 直接告诉你下一步）；exec --detach 返回 job_id/log/rc，
+      log 返回 content/next_offset/status/exit_code（增量轮询不重复读）；
+      upload/download 的 bytes=清单总大小、
       bytes_transferred=实际传输；ls 的 entries 含 mode/mtime(epoch 秒,UTC)/is_symlink
 特性: 传输零 token 消耗——upload/download 的文件内容从不回传 JSON，AI 只消费
       元数据（files/bytes/file_list），大文件/二进制不会烧爆 LLM 上下文
@@ -4610,16 +5099,34 @@ def build_parser():
                        help="跳板机私钥路径 (默认 ~/.ssh/id_ed25519)")
 
     # exec
-    p = sub.add_parser("exec", help="执行远程命令",
+    p = sub.add_parser("exec", help="执行远程命令（长任务可用 --detach 后台化）",
                        description="执行远程命令。本地退出码 = 远程退出码；"
-                                   "超时 124、连接失败 255、参数错误 2、中断 130。")
+                                   "超时 124、连接失败 255、参数错误 2、中断 130。",
+                       formatter_class=argparse.RawDescriptionHelpFormatter,
+                       epilog="""\
+场景 → 参数（凭感觉调超时是坑，照表来；v2.2）:
+  systemctl restart / nginx reload（静默 1-2 分钟）   --idle-timeout 120
+  apt/yum install / docker pull / npm i（数分钟）     --idle-timeout 120 --max-time 900
+  编译构建 / 大数据处理（10-20 分钟）                 --idle-timeout 300 --max-time 1200
+  要"边跑边看"或超过宿主调用上限                     --detach，再用 pyaissh log 增量读
+  静默但想确认还活着（不解决卡死判定）               --progress 30
+  输出很大（>64KB）                                  完整输出自动落 spill，读 stdout_spill_file
+  命令里有 $ 等特殊字符（PowerShell 会吃）           写脚本文件后 --cmd-file -（勿内联）
+""")
     add_conn(p)
     p.add_argument("--cmd", help="要执行的命令")
     p.add_argument("--cmd-file", dest="cmd_file",
                    help="从文件读命令 (- 表示 stdin，适合长脚本/特殊字符)")
+    p.add_argument("--detach", action="store_true",
+                   help="后台运行（v2.2）：远端 setsid+nohup 起作业，立即返回 job_id/log/rc；"
+                        "之后用 pyaissh log 增量读日志、--wait-rc 等结束拿退出码——"
+                        "长任务不受宿主单次调用时长限制（SSH 断开作业照跑）；与 --sudo/--pty 互斥")
+    p.add_argument("--job-dir", dest="job_dir",
+                   help="后台作业根目录（默认 %s；每作业一个子目录）" % DEFAULT_JOB_DIR)
     p.add_argument("--idle-timeout", dest="exec_timeout", type=_exec_timeout, default=60,
                    help="静默超时秒数：连续无输出超过该值即终止，默认 60，最高 1200 "
-                        "（区别于 --max-time 总时长；输出少的慢命令调大这个）")
+                        "（区别于 --max-time 总时长；输出少的慢命令调大这个，"
+                        "参见 --help 末尾的场景表）")
     p.add_argument("--progress", type=_positive_int, nargs="?", const=30, metavar="SECS",
                    help="长任务心跳（v2.1）：命令每静默/持续运行超过 N 秒（默认 30）往 stderr "
                         "打一行[PROGRESS]仍在运行——AI 知道进程活着不是挂死；"
@@ -4631,7 +5138,9 @@ def build_parser():
                    help="命令总时长上限秒数（wall clock；默认 2×idle-timeout 且至少 120，"
                         "不得小于 --idle-timeout；构建/编译等长任务请调大，最高 1200）")
     p.add_argument("--max-output", dest="max_output", type=_positive_int, default=DEFAULT_MAX_OUTPUT,
-                   help="stdout/stderr 单流最大保留字节，超出保留头尾各一半 (默认 256KB)")
+                   help="stdout/stderr 单流最大保留字节，超出保留头尾各一半"
+                        "（默认 64KB；完整输出自动落盘并把路径回传 stdout_spill_file/"
+                        "stderr_spill_file，读文件比重跑便宜——结果过大时宿主会裁掉工具结果中段）")
     p.add_argument("--no-credential-warn", dest="no_credential_warn", action="store_true",
                    help="关闭\"命令含疑似凭据\"的 WARN 提示（启发式误报时用；仍建议敏感凭据走环境变量注入）")
     p.add_argument("--sudo", action="store_true",
@@ -4655,6 +5164,48 @@ def build_parser():
     p.add_argument("--pty-strip-ansi", action="store_true",
                    help="PTY 模式下剥离输出中的 ANSI 转义序列（颜色/光标），供 AI 干净解析")
     p.set_defaults(func=cmd_exec)
+
+    # log（v2.2，别名 tail）：读 exec --detach 起的后台作业日志/状态
+    p = sub.add_parser("log", aliases=["tail"], help="读后台作业日志（配合 exec --detach）",
+                       description="读取 exec --detach 启动的后台作业的日志与结束状态。"
+                                   "默认回传尾部 100 行；--offset 增量读（用返回的 next_offset 续读）；"
+                                   "--wait-rc 等结束直接拿退出码；--cleanup 清理远端作业目录。",
+                       formatter_class=argparse.RawDescriptionHelpFormatter,
+                       epilog="""\
+典型用法（配合 exec --detach）:
+  pyaissh exec h --detach --cmd 'apt install -y nginx'   # 返回 job_id/log/rc
+  pyaissh log h --list                                   # 列出作业与状态
+  pyaissh log h --job-id 20260911-120000-1234            # 尾部 100 行
+  pyaissh log h --job-id <id> --offset 0                 # 从头增量读（返回 next_offset）
+  pyaissh log h --job-id <id> --offset <next_offset>     # 接着上次读（轮询不重复）
+  pyaissh log h --job-id <id> --wait-rc 300              # 等结束（≤600s）并拿退出码
+  pyaissh log h --job-id <id> --cleanup                  # 清理远端作业目录
+
+状态判定: 看 rc 文件是否存在（存在=finished，内容即退出码）；被 kill 的作业永无 rc，恒 running
+""")
+    add_conn(p)
+    p.add_argument("--job-id", dest="job_id",
+                   help="作业 id（exec --detach 返回；只允许字母/数字/下划线/点/连字符）")
+    p.add_argument("--path", help="直接指定日志文件路径（名为 job.log 时自动配对同目录 job.rc）")
+    p.add_argument("--job-dir", dest="job_dir", help="作业根目录（默认 %s）" % DEFAULT_JOB_DIR)
+    p.add_argument("--list", dest="list_jobs", action="store_true",
+                   help="列出作业目录下所有作业（状态/日志大小/退出码/时间）")
+    p.add_argument("--lines", type=_positive_int,
+                   help="回传尾部 N 行（默认 %d；与 --offset 互斥）" % JOB_TAIL_LINES)
+    p.add_argument("--offset", type=_nonneg_int,
+                   help="从该字节偏移增量读（配返回的 next_offset 轮询；与 --lines 互斥）")
+    p.add_argument("--wait-rc", dest="wait_rc", type=_positive_int,
+                   help="阻塞等待作业结束（rc 出现）最多 N 秒（上限 %d），出现即返回退出码"
+                        % JOB_WAIT_MAX)
+    p.add_argument("--cleanup", action="store_true",
+                   help="读完后删除远端作业目录（job.sh/run.sh/job.log/job.rc）；需 --job-id")
+    p.add_argument("--limit", type=_positive_int, default=50, help="--list 最多返回条数（默认 50）")
+    p.add_argument("--max-output", dest="max_output", type=_positive_int, default=DEFAULT_MAX_OUTPUT,
+                   help="单次回传内容上限字节（默认 64KB；截断时看 omitted_bytes，"
+                        "增量读用 --offset 继续）")
+    p.add_argument("--encoding", dest="encoding", type=_encoding_type, default="utf-8",
+                   help="日志解码编码（默认 utf-8；GBK 日志用 --encoding gbk）")
+    p.set_defaults(func=cmd_log)
 
     # upload
     p = sub.add_parser("upload", help="上传文件/目录 (本地 -> 远程)",
@@ -4878,7 +5429,7 @@ def main():
         handler = getattr(args, "func", None)
         if handler is None:
             emit_error(args.json if args is not None else True, "bad_args",
-                       "未指定子命令（可选: exec / upload / download / test / ls）")
+                       "未指定子命令（可选: exec / log / upload / download / test / ls / host）")
             parser.print_help(sys.stderr)
             return 2
         # --field 与 --text 互斥（--text 要可读包裹、--field 要裸字段值；
