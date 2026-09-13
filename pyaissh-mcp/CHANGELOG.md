@@ -101,6 +101,23 @@
   `B14` `kill` 整组无孤儿——用 `[s]leep` 技巧避免 pgrep 自匹配）
 - **真机验证数据**（B2）：15/15 PASS；离线 40 + 凭据 6 全绿
 
+## [0.2.4] - 2026-09-13
+
+### 打包：本目录成为自包含分发包（含完整 pyaissh 与技能文档），测试不出包
+
+- **内含完整 pyaissh 副本 + 技能文档**：除既有 `pyaissh.py`（CLI 主体）外，新增同步 `pyaissh` /
+  `pyaissh.cmd`（POSIX/Windows 入口）、`SKILL.md`、`docs/*.md`（七篇技能文档）、
+  `CHANGELOG.md → CLI_CHANGELOG.md`（改名避免与适配器 CHANGELOG 冲突）。本目录拷出去单独放即可
+  直接运行 CLI，也可直接当技能包使用（README 增「包内容 / What's in this directory」表）
+- **`sync_check.py` 升级为整包同步**：由"只校验 `pyaissh.py`"改为按清单（12 个文件）逐一 md5
+  校验/同步；单一源仍是 `skills/pyaissh/`——只改那里，然后 `python sync_check.py --update`
+- **测试不出包**：`test/` 从仓库移除（根 `pyaissh-mcp/test/` + 目录内 `.gitignore` 双重忽略，
+  本地开发树保留并继续可跑）——分发包只含运行所需
+- 本次为**打包与文档调整**，适配器代码逻辑零改动（`SERVER_VERSION` 随之标记 0.2.4）
+- **入仓前脱敏**：历史条目里的真机 IP 替换为 `<node1>`/`<node2>` 占位符；暂存内容经严格扫描
+  确认无明文凭据（凭据文件 `.env` / `test/local_creds.json` 均被忽略）
+
+
 
 
 

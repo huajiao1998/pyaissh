@@ -1,8 +1,9 @@
-# 本地测试产物与凭据（绝不提交）
-test/local_creds.json
-test/_tmp*/
+# 本地开发与凭据（绝不提交；本目录对外是自包含分发包，不含测试）
+
+# 整个测试目录只在本地保留（分发包不带测试文件）
+test/
+
+# 凭据与运行产物
+.env
 __pycache__/
 *.pyc
-
-# pyaissh 凭据体系（.env 由仓库根 .gitignore 同样覆盖，这里双保险）
-.env

@@ -1,4 +1,0 @@
-{
-  "host1": {"target": "root@your-server-1.example.com", "password": "your-password-1"},
-  "host2": {"target": "root@your-server-2.example.com", "password": "your-password-2"}
-}

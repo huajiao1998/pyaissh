@@ -6,6 +6,24 @@
 
 Exposes pyaissh (the structured SSH CLI built for AI agents) as MCP tools: JSON-RPC argument passing eliminates the whole class of shell-quoting bugs, and a **session-scoped connection pool** reuses connections within a working window and evicts them automatically when idle.
 
+## 包内容 / What's in this directory
+
+本目录是**自包含分发包**（拷出去单独放就能跑，也能当技能包用）：
+
+| 文件 | 说明 |
+|---|---|
+| `pyaissh_mcp.py` | MCP 服务器（stdio JSON-RPC，零 SDK 依赖）|
+| `pyaissh.py` / `pyaissh` / `pyaissh.cmd` | **完整 pyaissh CLI 固定副本**（也经 `sync_check.py` 与 `skills/pyaissh/` 逐一 md5 校验）——可脱离 MCP 直接用 |
+| `SKILL.md` + `docs/*.md` | **技能文档完整副本**（SKILL.md 入口 + contract/exec/transfer/errors/jump/setup/edge-cases 七篇）|
+| `CLI_CHANGELOG.md` | pyaissh CLI 的变更记录（改名以免与适配器自己的 `CHANGELOG.md` 冲突）|
+| `CHANGELOG.md` | 本适配层自己的变更记录 |
+| `.env.example` | 凭据模板（适配器侧重；CLI 侧的模板与规则见 `docs/setup.md`）|
+| `sync_check.py` | 与 `../skills/pyaissh/` 的**副本漂移检查/同步**（单一源：只改 `skills/pyaissh/`，然后 `python sync_check.py --update`）|
+
+**不含测试**：开发用的测试套件（离线协议 / 凭据来源 / 真机 / 压力）只保留在本地开发树，不进分发包。
+
+This directory is a **self-contained bundle** (drop it anywhere and it runs; it also doubles as a skill package): the MCP server, a byte-identical pinned copy of the complete pyaissh CLI (plus its POSIX/Windows entry points), the **full skill documentation** (`SKILL.md` + `docs/`), the CLI changelog (`CLI_CHANGELOG.md`), this adapter's changelog, `.env.example`, and `sync_check.py`. Development tests are intentionally **not shipped**.
+
 ## 快速开始 / Quick start
 
 前置：`python3` + `paramiko`（`pip install paramiko`）。零 MCP SDK 依赖——服务器是手写的 stdio JSON-RPC。
@@ -39,7 +57,7 @@ PYAISSH_HOST_PROD=<user>@<host>:<port>      # 之后工具里用 target: "@PROD"
 2. **有些客户端会清洗环境变量**：DSH 会删除匹配 `/KEY|PASSWORD|SECRET|TOKEN/i` 的名字（以及 `DSH_*`），所以 `PYAISSH_PASSWORD` 放在 shell/系统环境里会被丢掉，只有写进配置 `env` 才活——用 `.env` 就没这个坑
 3. `.env` 由 CLI 在**每次工具调用时**才读取（`load_env()`），进程环境从启动起不含密码；文件本身是本地忽略项，不进版本库
 
-`.env` 规则（与 CLI 完全一致，完整见 [`skills/pyaissh/docs/setup.md`](../skills/pyaissh/docs/setup.md)）：一行一个 `KEY=VALUE`，`#` 开头为注释，值可用引号包裹（`KEY="a # b"`），**已存在的环境变量优先**（`.env` 不覆盖真实环境变量）；主机别名用 `PYAISSH_HOST_<名称>` 定义，工具里写 `target: "@<名称>"`；也支持工具调用参数里的 `password`/`key`。
+`.env` 规则（与 CLI 完全一致，完整见 [`docs/setup.md`](docs/setup.md)）：一行一个 `KEY=VALUE`，`#` 开头为注释，值可用引号包裹（`KEY="a # b"`），**已存在的环境变量优先**（`.env` 不覆盖真实环境变量）；主机别名用 `PYAISSH_HOST_<名称>` 定义，工具里写 `target: "@<名称>"`；也支持工具调用参数里的 `password`/`key`。
 
 **只读脚本目录的 `.env`（即 `pyaissh-mcp/.env`）**：工作目录的 `.env` 默认**不**加载（供应链防护——防恶意仓库自带 `.env` 把 AI 的 SSH 连接导向攻击者主机，需显式 `PYAISSH_ALLOW_CWD_ENV=1` 才启用并会打 WARN）。因此**无需给 MCP 客户端配置 `cwd`**，`.env` 位置与启动目录无关。
 

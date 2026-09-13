@@ -1,0 +1,369 @@
+# pyaissh 更新日志（CHANGELOG）
+
+> **维护约定（每次更新必须遵守）**：
+> 1. 每次更新/修改/修复 pyaissh，必须在本文件**末尾追加一条记录**——**最新在最后**，文件只增不减，历史条目一律保留、**禁止覆盖或删除**。
+> 2. 为什么"最新在最后"而不是"最新在顶部"：**末尾追加是对 AI 最安全的操作**——天然支持 `>>`、编辑器定位到文件末尾、或 edit 工具以文件最后一行作锚点；不存在"往文件开头插入"这种容易误伤标题/维护约定/历史条目的高风险操作，也符合"追加"的字面语义。
+> 3. **禁止整文件重写覆盖**。若确实用整文件写入方式更新（如 write 工具），只允许在末尾新增并保留全部历史内容；推荐优先用追加式写入。
+> 4. 条目版本号与 `pyaissh.py` 的 `VERSION` 常量保持一致；条目含日期，按「新增 / 修改 / 修复 / 文档」分类，说明改了什么、为什么改、影响什么（行为/参数/JSON 字段/错误语义变化要写清，AI 靠 `version` 字段与这些说明判断行为差异）。
+> 5. 技能目录（`skills/pyaissh/`）与根目录（`D:\工作目录\Leopold\pyssh\`）各有一份 `pyaissh.py` / `CHANGELOG.md`，改完**两份同步**（新增条目同样追加到两份的末尾）。
+
+---
+
+## 1.5.0 之前（未系统记录）
+
+本文档自 1.5.0 起开始维护，更早版本未逐一记录。从代码/文档可考的部分里程碑（非完整）：
+- v1.4.8：known_hosts 写盘原子化（Linux flock + 临时文件 + os.replace，Windows 原子替换，并发首次连接不丢记录）；极早期信号窗口 handler 提前到模块顶层注册（import 阶段的信号输出结构化 `interrupted` JSON + 退出码 130）。
+- v1.4.9：跳板机未配置专属凭据时密码自动回退使用 `PYAISSH_PASSWORD`（密钥不回落）；多级超时防挂死细化。
+- v1.3：远端路径 `~` 自动展开。
+- 更早功能（分片下载 `--parallel`、`.part` 原子传输、`--cmd-file -`、错误类型化等）的引入版本待补。
+
+## [1.5.0] - 2026-08-23
+
+### 新增
+- exec 新参数 **`--spill-dir <目录>`**：输出被截断时把**完整原始输出**（含内存层丢弃的中间字节——读线程边收边写、排空阶段也写）落盘，JSON 回传 `stdout_spill_file` / `stderr_spill_file` 路径，AI 需要中间内容时直接读文件，无需重跑 `sed -n` 或调大 `--max-output`；未截断自动删除、异常路径 `finally` 兜底清理，不留垃圾。默认目录为系统临时目录，文件命名 `pyaissh-<stdout|stderr>-<随机>.spill`。
+- exec 新参数 **`--no-credential-warn`**：关闭"命令含疑似凭据"的启发式 WARN（误报时用；关闭后命令里真实凭据不再被提示，`cmd` 字段仍原样回显，脱敏责任回到调用方）。
+
+### 修改
+- **凭据 WARN 启发式修复误报**：`-p` 紧贴形态正则加 `(?<!-)` 前缀——`--profile` / `--parallel` / `--progress` 等双横线长选项不再被当成 `-psecret` 误报；`-psecret`、`-p secret`、`--password=x`、`mysql -u root -p`、`curl -u user:pass` 等真实凭据形态仍正常告警（10 组正反例验证）。
+- `warn_sensitive_cmd()` 增加 `enabled` 参数（由 `--no-credential-warn` 控制）。
+
+### 文档
+- `docs/edge-cases.md`：新增**远程命令自杀伤**边界条目——`pkill -f "dsh web"` 这类按自身 cmdline 模式匹配的杀进程命令会把自己（承载 SSH 会话的 bash）一起杀掉 → `connection_lost`、结果不可信；规避方法：`pkill -f '[d]sh web'` 括号转义 / `pgrep -f` 先核对 PID / 模式避开自身文本。
+- `SKILL.md`：已知边界列表新增 pkill 自杀伤短条目；其他边界枚举补上该项。
+- `docs/exec.md`：补充 `--no-credential-warn`、`--spill-dir` 与 spill 字段（`stdout_spill_file` / `stderr_spill_file`）说明。
+
+## [1.5.1] - 2026-08-23
+
+### 修复
+- **stderr/stdout 中文乱码（Windows 管道/import 路径）**：`_setup_console_utf8()` 原先只在 `main()` 里调用，`python -c "import pyaissh"`、AI 嵌入、测试 harness 等 **import 路径**下输出流保持系统区域编码（GBK/cp936），中文日志（WARN 等）经 UTF-8 解码成乱码。改为**模块级立即调用**（`main()` 保留原调用作幂等兜底），脚本与 import 两条入口路径的 stdout/stderr/stdin 恒为 UTF-8（errors=replace）。
+
+## [1.5.2] - 2026-08-23
+
+### 修改（内部重构，无行为变化；先建 git 基线再动手，可随时回滚）
+- **魔数集中到文件顶部 `_CONSTANTS` 区**：约 20 个常量统一收口——`MAX_TIME_CAP=1200`（原散落 ~10 处）、`SFTP_IO_TIMEOUT=30`、`PARALLEL_MIN_SIZE=8MB`、`PARALLEL_IO_TIMEOUT=120`、`RECV_CHUNK=64KB`、`DEFAULT_MAX_OUTPUT=262144`、`PARALLEL_READ_CHUNK=262144`（与前者同值不同义、分开命名）、`RESPONDER_GRACE=0.2`、`WATCHDOG_TICK=5`、`POLL_TICK=0.05`、`BUF_ALIGN_WINDOW=4096`、`MIN_BUF_FLOOR=4096`、`MAX_PORT=65535`、`DRAIN_WINDOW`/`STATUS_GRACE`/`STDERR_EOF_WINDOW`/`SILENCE_GRACE`/`JOIN_GRACE`/`RETRY_SLEEP`/`PUT_RETRY_SLEEP` 等。逻辑与动态错误消息统一引用常量，调参只改一处；静态 help/epilog 文本保持字面量（属文档范畴，随文档走）。
+- **正则集中与片段化**：`parse_target` 的 3 个内联 `re.fullmatch` 与 `_win_safe_rel_path` 的字符类清洗上提为模块级编译常量（`_RE_IPV4` / `_RE_IPV6_SEG` / `_RE_IPV6_ZONE` / `_RE_WIN_ILLEGAL`）；`_SENSITIVE_CMD_RE` 巨型 alternation 拆为带注释的命名片段（`_P_SENS_*`）再拼接，每个分支可独立注释/测试。
+- **验证（零行为变化证明）**：`_SENSITIVE_CMD_RE` / `_ANSI_RE` 的 `.pattern` 与重构前 git 基线逐字节一致；L4 正反例 38 例匹配行为一致；本地单元回归 `verify_r3` 54/54（含 L4 矩阵 40 例）、极早期信号单元 3/3、进程内复用 40/40 全过；双机冒烟（exec/test）通过。顺带修正：测试脚本里硬编码的旧版本号断言改为合法版本模式匹配（不再随版本漂移）。
+- **补漏（同轮收口）**：复审发现 4 处"同值但违背调参只改一处"的遗漏并修正——`cmd_test` 一处 16 空格缩进的 `recv_stderr(65536)`（replace_all 只覆盖了 20 空格版本）；`parse_target`/`resolve_conn`/`_port` 三处错误消息里的 `(1-65535)` 字面量改为 `(1-%d) % MAX_PORT`；`_fix_msys_local_path` 的 `timeout=5`（cygpath 子进程超时）收口为新常量 `CYGPATH_TIMEOUT=5`。docstring/help/epilog 文本保持字面量（属文档范畴）。
+- **代码地图（AI 可维护性）**：文件顶部 `VERSION` 下新增"代码地图"——按区域列出关键函数与对应 docs 子文档（函数名作锚点、不写死行号），AI 改代码路径 = 文档导航 → 地图定位 → grep 函数名，无需理解包结构。
+- **凭据正则验收案例表（使用者 AI 自查护栏）**：`_SENSITIVE_CMD_RE` 定义处新增 29 条正反例注释（含历史回归点：`--profile`/`--parallel`/`--progress` 双横线误报、`-p 22`/`-p'22'` 纯数字端口、`mysql -u root -p`、工具 `-p` 排除表）——使用者 AI 修正则后对照注释自查，无需测试框架（已逐条验证与真实行为一致）。
+- `docs/errors.md`：文末新增"凭据 WARN"注记，指向 `pyaissh.py` 中 `_SENSITIVE_CMD_RE` 定义处的判定形态与已测案例。
+
+## [1.5.3] - 2026-08-23
+
+### 新增
+- **断点续传 `--resume`（upload/download，仅单文件）**：中断/失败后保留续传点（上传=远端 `.part`，下载=本地 `.part`），重试加 `--resume` 从断点继续，不重传已传部分。**默认不启用**（不加时行为与旧版完全一致）；单文件 ≥ 50MB（常量 `RESUME_MIN_SIZE` 可调）且未启用时，stderr `[TIP]` + 结果 `warnings` 提示建议启用。要点：
+  - 基于**大小**的续传：`.part` 已有 N 字节就从 N 继续；**`.part` ≥ 源大小视为损坏/过时 → 覆盖重传**（绝不续坏尾巴）；完成后大小校验 + 原子改名
+  - `.part` 用**固定名**（`<目标>.part`）而非进程唯一名——`--resume` 模式**禁止并发写同一目标**（文档明示）
+  - 下载分片（`--parallel`）续传：每分片完成后写 `<目标>.part.done.<i>` 标记，重试时**跳过已完成分片**省传输量，全部完成清理标记
+  - 目录传输忽略 `--resume`（WARN 提示）；中断保留续传点时 warnings 明示（"续传点已保留"），放弃续传手动删除 `.part` 即可
+- **真机验证 20 例全过**（新机器二 103.79.186.77）：50MB 上传/串行下载/分片下载的 中断→`--resume` 重试→md5 一致 + stderr `[RESUME]` 证明真续传 + 分片 done 跳过后 md5 仍一致 + 大文件 TIP 提示 + 目录 `--resume` 忽略；双机普通往返（非 resume）md5 一致，默认行为零变化。**另以 100MB 文件补测 15 例全过**（含真实中断命中"部分分片完成"场景：5s 已收 75.2MB → done 跳过后续传 md5 一致）。
+
+## [1.5.4] - 2026-08-23
+
+### 修改
+- **`cmd` 字段回显截断（防撑爆调用方上下文）**：结果 JSON 的 `cmd` 超过 `CMD_ECHO_LIMIT`（8KB 常量）时保留头尾 + 中间省略标记，新增恒有键 **`cmd_truncated`**（false=完整），warnings 提示"cmd 字段已截断（完整命令在 --cmd-file 本地文件可重读）"。`--cmd-file -` 读入 100KB 大脚本时单行 JSON 不再到 MB 级（实测 118901 字节脚本 → cmd 字段 8256 字节）；成功与失败路径（`_partial_extra`）都截断；凭据检测用完整 cmd 不受影响。**真机验证**：大脚本成功/失败路径 `cmd_truncated: true` + 头尾保留 + 输出/退出码正常，小命令 `false`。
+- **`cmd` 截断改字节级（补漏）**：判断与计数改用 `len(cmd.encode("utf-8"))` 而非字符数——多字节内容（中文）下旧实现低估 2-3 倍（marker 报错字节数），且字符数 < 8192 但字节数超限的"该截断没截断"（3000 中文字符 = 9000 字节）。截断边界用 `_utf8_boundary_cut` 对齐合法字符不切半字；marker 措辞改"完整命令见原始调用（--cmd-file 时为本地文件可重读）"（--cmd 来源无本地文件）。单元 5 例 + 真机 36028 字节中文脚本验证（marker 精确报字节数、头尾中文保留）。
+
+### 文档
+- `docs/exec.md` / `docs/contract.md`：`cmd_truncated` 字段与截断语义。
+- `docs/transfer.md`：`--skip-existing` 仅比大小（原子传输保证 pyaissh 自产最终文件完整；外部损坏可 md5 抽查）。
+- `docs/errors.md`：退出码 254 歧义提示（区分远程真实 254 vs 远程 255 映射，看 JSON 双字段）。
+
+## [1.5.5] - 2026-08-23
+
+### 修改
+- **paramiko 惰性 import（启动提速）**：`import paramiko` 从模块顶部挪进 `_do_connect`（唯一建连入口），`_AtomicAutoAddPolicy` 类改为 `_atomic_auto_add_policy()` 工厂（首次调用时 import + 定义 + 缓存单例）。**不需要连接的路径提速 ~2.7 倍**：`--version`/`--help`/`bad_args`/缺用户名/别名未配置 从 ~296ms 降到 ~110ms（纯解释器+标准库基线 59ms，剩余为模块解析冷启动）；极早期信号窗口更短（handler 注册后只剩标准库 import，paramiko 的 ~190ms 不再落在窗口内）。真实连接路径不受影响（paramiko 照常在建连时加载，实测 1766ms 连接正常）。实测依据：paramiko import 188ms（其中 `paramiko.config → invoke` 可选依赖链 ~120ms，pyaissh 不用 SSHConfig，但 invoke 是否加载取决于环境安装，代码侧无法卸载；惰性只优化错误路径，真实路径提速需环境侧卸载 invoke）。
+- **惰性 import 回归修复（第 5 轮审查抓出）**：函数内 `import paramiko` 默认绑定**局部**名，而 `cmd_download`/`cmd_ls`/`_sftp_put_atomic` 引用的是**模块全局** `paramiko`——顶部 import 删除后，这三处的 `getattr(paramiko, "SFTP_NO_SUCH_FILE", 2)`（"路径不存在"错误分类路径）抛 `NameError` 被误归类为 `download_failed`/`ls_failed`（实测"下载不存在远程 → download_failed/1"而非 `bad_args/2`）。修复：惰性 import 处加 `global paramiko` 绑定全局（`_do_connect` 与 `_atomic_auto_add_policy` 两处）。成功路径测试（verify_r3/双机 test/s2_*）均测不到此缺陷，冒烟矩阵的"下载不存在"用例抓出——验证了错误路径用例的价值。修复后双机 download/ls 不存在路径全部 `bad_args/2`。
+- **MSYS 路径转换补漏（`--cmd-file` / `--spill-dir`）**：`_fix_msys_local_path`（v1.5.1 起用于 `--local`）漏了两个新参数——Git Bash 经 `./pyaissh` 包装器（MSYS_NO_PATHCONV=1）运行时，`--cmd-file /tmp/x.sh` 被 Windows Python 解析成盘根而报 `read_cmd_failed`（Errno 2），`--spill-dir /tmp` 的 spill 落错位置（D:\tmp 而非 Git Bash 的 /tmp）且无提示。修复：两处均套用 `_fix_msys_local_path`（内部含 `~` 展开；非 Windows / 无 MSYSTEM / 相对路径原样返回，不影响 Linux 与普通终端）。验证：单元 5 分支全过；真实 Git Bash（MSYS_NO_PATHCONV=1）集成——`--cmd-file /tmp/gb_test.sh` 成功执行、`--spill-dir /tmp` 的 spill 文件落在 cygpath 转换后的真实位置（D:\DSH\temp）且存在。
+
+## [1.5.6] - 2026-08-23
+
+### 新增
+- **错误 JSON 新增 `retryable` 字段（机器可读的重试决策）**：所有错误 JSON（含 argparse 层 `bad_args`）恒带 `retryable`（bool）——AI 自动重试策略直接读它，不必解析 message 文本。映射表集中定义（常量区 `_RETRYABLE_ERRORS`）：**true** = 网络/传输/中断类（`connection_timeout`/`connection_refused`/`connection_failed`/`dns_failed`/`connection_lost`/`interrupted`/`upload_failed`/`download_failed`/`upload_timeout`/`download_timeout`/`exec_idle_timeout`/`exec_total_timeout`/`exec_timeout`）；**false** = 凭据/参数/本地文件/命令失败类（`auth_failed`/`host_key_rejected`/`bad_args`/`read_cmd_failed`/`exec_failed`/`jump_failed`）。语义边界：exec 超时类 true 仅表示"值得一试"——远程进程可能仍在运行/命令可能有副作用，重试前必须读 message 的"远程进程可能仍在运行"提示并先 pgrep 确认（bool 给机器"值不值得试"，message 给"怎么试才安全"）。成功结果无此字段。**真机验证 11 例全过**（逐类错误触发确认 retryable 值：auth_failed=false、connection_timeout=true、bad_args=false（argparse 层修复后）、exec_idle_timeout=true、interrupted=true、成功结果无字段等）。
+- **单文件上传自动建父目录的可见性（新发现，真机抓的）**：`upload --remote /x/y/z.bin` 本就自动 mkdir -p 父目录（与 scp 预期不同、且文档未记载单文件场景、无任何提示——拼写错误（如 `/usr/loca/bin/x`）会静默造垃圾目录树，与尾斜杠"绝不静默创建"的严格语义不对称）。修复：`sftp_makedirs` 改为返回**本次新建的目录列表**（外层→内层，已存在不算），单文件上传分支新建父目录时 `warnings` + stderr `[MKDIR]` 提示创建了哪些（AI 可见可发现）；父目录已存在不提示；目录上传的自动创建是文档明示行为保持静默；尾斜杠语义不变（bad_args）。docs/transfer.md 补"单文件上传自动创建远端父目录"条目（与尾斜杠语义的区别一并说明）。**真机验证 4 例全过**：新建父目录提示+远端建出、已存在无提示、尾斜杠 bad_args 不变、目录上传静默。
+- **依赖缺失独立分类 `dependency_missing`**：环境未装 paramiko 时（`import paramiko` 在 `_do_connect` 抛 ModuleNotFoundError），此前实测误归 `connection_failed` 且 **`retryable: true`**——误导 AI 查网络、且白白重试。修复：`_do_connect` 的 import 包 try/except，转 `SshError("依赖缺失: ...与目标主机/网络无关，重试前请先安装依赖", "dependency_missing")`；不在 `_RETRYABLE_ERRORS` → retryable=false。exec/test/download 三条路径实测全部正确分类（`python -S` 模拟无 paramiko 环境）；正常环境无回归。docs/errors.md 错误表新增该行。
+
+## [1.5.7] - 2026-08-24
+
+### 修改
+- **retryable 映射哲学统一（补 ls_failed/ls_timeout/test_failed）**：v1.5.6 初版映射漏了三个同性质类型——`ls_failed`/`ls_timeout` 与 upload/download 的 `_failed/_timeout` 完全同性质（SFTP 网络/通道问题），`test_failed` 是连接成功后的通道/传输异常兜底（test 只跑系统查询，命令本身几乎不会失败；信号中断已单独归 interrupted）。三者挪入 true 集，统一原则："**所有 SFTP 传输/超时类 + test_failed → true**；凭据/参数/本地文件/命令失败类 → false"。验证：静态映射确认 + emit_error 单元输出（ls_failed/ls_timeout/test_failed → true，auth_failed/bad_args → false）；真机 ls 权限拒绝触发因 root 忽略权限位不可行（环境限制，映射逻辑由单元覆盖）。
+
+### 文档
+- **零 token 传输卖点文档化**：pyaissh 从设计上就不把文件内容回传 JSON（upload/download 结果只含 `files`/`bytes`/`file_list` 元数据）——对比 MCP SSH 生态普遍把传输内容塞进 LLM 上下文的通病，这是天然卖点。SKILL.md（description + 定位段）与 `--help` epilog 新增"传输零 token 消耗"说明（实测：1MB 随机文件传输后结果 JSON 仅 410 字节纯元数据）。
+- **品牌与命名统一为 pyaissh（开源发布准备）**：仓库/命令/文件名/文档全量统一为一个名字——`pyaissh.py`、`pyaissh.cmd`、bash 包装 `pyaissh`、`--help` 的 prog、输出标记（`[pyaissh: 已截断]`、seam/`[pyaissh]` 前缀）、spill 文件前缀（`pyaissh-stdout-`）、SKILL.md 与全部 docs 的调用示例与描述。环境变量 `PYAISSH_*`、内部属性 `_pyaissh_*`、技能目录 `skills/pyaissh/` 与 `SKILL.md name: pyaissh` 全项目一致。
+- **环境变量与内部属性统一为 PYAISSH 前缀（破坏性变更）**：环境变量统一 `PYAISSH_*`（`PYAISSH_PASSWORD`/`PYAISSH_KEY`/`PYAISSH_USER`/`PYAISSH_PORT`/`PYAISSH_JUMP_KEY`/`PYAISSH_JUMP_PASSWORD`/`PYAISSH_HOST_<名称>`（含 `_PASSWORD`/`_KEY` 专属凭据）/`PYAISSH_ALLOW_CWD_ENV`，小写示例 `pyaissh_host_prod`）；内部属性统一 `_pyaissh_*`（`_pyaissh_home`/`_pyaissh_last_activity`/`_pyaissh_io_timeout`/`_pyaissh_watchdog`/`_pyaissh_watchdog_killed`/`_pyaissh_posix_rename_warned`）；测试 harness 的 `PYAISSH_PY`、测试脚本 env 全量同步；技能目录 `pyaissh`（`SKILL.md name: pyaissh`）。**注意**：部署/CI/.env 需使用 `PYAISSH_*` 前缀配置（发布前完成，无既有用户受影响）。验证：verify_r3 54/54、v3_sig_unit 3/3、s2_stale 通过、双机 test 正常。
+
+## [1.5.8] - 2026-08-25
+
+### 新增
+- **上传分片 `--parallel`（dogfood 实测痛点修复）**：`upload` 新增 `--parallel 1-8`（对称下载分片）——高丢包/慢链路大文件上传提速（实测 318KB 单连接 22.7s 的痛点）。新函数 `_parallel_put`：k 条独立 SSH 连接各上传本地文件一段到远端同一 `.part`（主连接预创建空文件，worker r+b seek 写；共享跳板隧道；信号中断秒级退出；完成大小校验），原子改名单抽取 `_sftp_atomic_rename` 供串行/分片共用（posix-rename + 回退 + 双丢防护语义不变）。**默认行为零变化**（仅显式 `--parallel` 且 ≥64KB 才分片，无自动档）；与 `--resume` 互斥（同时给 WARN 忽略 `--resume`）；中断清理远端 `.part`（keep_part 双丢防护保留）。真机验证：50MB 分片 4 连接成功 + 远端 md5 一致 + 1MB 分片 + 互斥 WARN + 中断 130 且远端零残留。
+
+### 修改
+- **复杂命令失败提示 shell 转义（dogfood ①）**：`exec` 的 `--cmd` 来源命令含 shell 特殊字符（`$()`/反引号/换行/管道等）且执行失败时，错误 message 附加"建议改用 --cmd-file - 从 stdin 读脚本，绕过所有转义"（`_shell_escape_hint`；`--cmd-file` 来源与简单命令不加）。单元 6 例验证。
+
+### 文档
+- **凭据安全实践强化（dogfood ③）**：SKILL.md 快速开始与 docs/setup.md 新增"不要把 token/密码内联进 `--cmd` 或脚本内容——cmd 字段会原样回显，触发凭据 WARN；凭据走参数/env/.env 或脚本从文件读取"。发布类操作（git push token URL）同理。
+
+## [1.5.9] - 2026-08-25
+
+### 修改
+- **shell 转义提示覆盖范围扩展（v1.5.8 修正）**：v1.5.8 的 hint 只在工具异常路径（exec_failed/超时）出现，但**最常见的"命令失败"（退出码非零，ok:true + exit_success:false）没有 hint**——而 PowerShell 吃 `\$` 的真实场景正是"命令行为诡异且退出码非零"。v1.5.9 起：退出码非零且 `--cmd` 含 shell 特殊字符时，warnings 附加 hint（不破坏 ok:true 语义，AI 照常按 exit_success 判断）。真机验证：`echo $(whoami) && exit 1` → warnings 含提示；`--cmd-file` 来源/无特殊字符/成功命令均不加。
+- **上传分片"提速"声称诚实化（v1.5.8 修正）**：对照实测（10MB，同链路同文件）单连接 17.1s vs `--parallel 4` 15.9s = **1.08x，收益在噪声内**。诚实结论：分片收益原理上来自高丢包/长 RTT 链路（与下载分片相同）；B2（低丢包短 RTT）无显著加速属预期。功能正确性不受影响（md5 一致、中断清理、互斥 WARN 全部保持）。README/epilog 的"慢链路大文件上传分片提速"改为"高丢包/长 RTT 链路分片上传（收益随链路而定）"。
+
+### 测试
+- v60_verify 11 例：T1 分片对照（md5 双一致 + 提速数据）+ T2 hint 五场景 + T3 cmd 字段回显两模式。回归 verify_r3 54/54。
+
+## [1.5.10] - 2026-08-25
+
+### 修改
+- **upload 结果补 `parallel_used` 字段（契约对称性修复）**：此前 `_parallel_put` 分支虽赋值 `parallel_used`（局部变量）但未放进结果 JSON——AI 上传后无法确认实际分片档位，与下载不对称，SKILL.md/transfer.md 的"实际档位见结果 `parallel_used` 字段"指引在上传方向落空。修复：cmd_upload 函数开头初始化 `parallel_used = 1`（单连接默认，非分片路径不再 NameError），分片分支赋值保留，结果 dict 新增 `"parallel_used": parallel_used`——下载与上传结果字段完全对称。真机验证：`--parallel 4` 上传 → `parallel_used: 4`，默认单连接 → `parallel_used: 1`；回归 verify_r3 54/54。
+- **文档同步**：SKILL.md 速查第 7 条与 docs/transfer.md 改为"大文件传输慢或超时：加 --parallel 8"（覆盖上传，v1.5.8 起），并注明 `parallel_used` 字段下载与上传结果都有。
+
+## [1.5.11] - 2026-08-25
+
+### 修改
+- **`_parallel_put` 失败清理窄缝补提示（P3 卫生修复）**：并行分片上传失败且所有 worker 连接已死（如传输中网络整体断开）、主连接兜底 remove 也失败时，远端 `.part` 会残留且此前 warnings 无清理提示（串行路径有 `_PUT_RESIDUE_WARNINGS` 兜底，并行路径漏了）。修复：清理循环全失败时记入 `_PUT_RESIDUE_WARNINGS`（"并行分片上传中断，远端临时文件可能残留: <part>（清理：rm -f ...）"），兑现 SKILL.md 第 7 条"warnings 会提示清理命令"的承诺。`.part` 名带 pid 下次不撞名，纯卫生问题不影响正确性。
+- **contract.md 补 `parallel_used` 字段（契约文档权威性）**：docs/contract.md 第 9 行 upload/download 字段枚举补 `parallel_used`（v1.5.8 起，单连接=1，分片=--parallel 值，下载与上传都有）——此前 SKILL.md 指引"见结果 parallel_used 字段"在字段契约文档查不到。
+- **README 版本号占位符化**：输出示例 `"version": "1.5.8"` → `"x.y.z"`、安装提示词版本号改为"随发布更新"——硬编码版本号每次发布都过时（上轮已提过），占位符一劳永逸。
+
+### 测试
+- 编译 + 回归 verify_r3 54/54；清理窄缝为代码审查 + 逻辑验证（真机需断网场景，不可行）。
+- **（v1.5.11 文档修订）SKILL.md 速查第 8 条改为按调用环境选**：bash/常规 shell 下 `--cmd '...'` 完全可靠（标准引号规则），**仅 Windows PowerShell 调用时**复杂命令务必 `--cmd-file -`（PowerShell 会先解析 `$`/`\`）——此前"含特殊字符一律 --cmd-file -"的措辞对 Linux agent（部署主体）过度保守会误导；新增第 9 条 `file_list.path` 语义预警（upload=本地，download=远端，勿混用——transfer.md 有完整版，速查层补齐）；exec.md 示例注释同步。回归 54/54，SKILL.md 13961B。
+
+## [1.5.12] - 2026-08-25
+
+### 新增
+- **`exec --encoding`（非 UTF-8 远端输出逃生口）**：远端 stdout/stderr 解码编码可指定（默认 utf-8，如 `--encoding gbk` / `shift_jis`；非法字节仍以 U+FFFD 替换不中断）。GBK/Shift-JIS 系统日志此前一律按 UTF-8 解码成乱码（AI 误判"执行失败"），现在按系统编码可正确读出。真机验证：远端 GBK 字节 `\xc4\xe3\xba\xc3` 默认 utf-8 → `���`，`--encoding gbk` → `你好`。成功与错误路径解码（`_partial_extra`）都生效。
+- **超时错误 JSON 新增 `remote_may_be_running`（124 幽灵进程机器可读化）**：`exec_idle_timeout`/`exec_total_timeout`/`exec_timeout` 错误 JSON 恒带 `"remote_may_be_running": true`——AI 重试循环直接读该字段决定是否先 pgrep 确认（不再依赖记住文字提示），避免在额外负载下盲目起第二个重试实例。真机验证：`sleep 5 --idle-timeout 1` → 超时 JSON 含该字段。
+
+### 文档
+- **"stdout 恒单行 JSON"声明加例外**：SKILL.md 速查第 1 条、README（中文头条 + 能力表）补"（`--help` 纯文本除外）"——防止盲目 `json.loads(stdout)` 的 AI 代理在 `--help` 上 break（contract.md 原已标注例外，头条声明层补齐）。
+
+## [1.5.13] - 2026-08-25
+
+### 新增
+- **`--encoding` 解析期校验（拼错立即 bad_args/2，不连远端）**：新增 `_encoding_type`（codecs.lookup 校验）接入 exec/test——此前 `--encoding utf-9`（拼错）能过 argparse、连上远端后才在解码期 LookupError，被通用 except 误归 exec_failed/255 误导 AI 查网络；现在拼错立刻 `bad_args` + `retryable:false` + 自纠提示（"未知编码 'utf-9'（如 utf-8 / gbk / shift_jis / latin-1）"）。真机验证：exec/test 的 `--encoding utf-9` → bad_args。
+- **`test` 支持 `--encoding`**：服务器信息输出（hostname/os-release 等）解码编码可指定（默认 utf-8）——与 exec 一致，GBK 系统 os-release 不再乱码。
+
+### 边界（诚实记录）
+- **ls 的 GBK 文件名暂不支持（paramiko 层限制）**：曾实现 ls `--encoding`（surrogateescape 还原原始字节再按指定编码解码），实测发现 paramiko 5.0 已按 **UTF-8+replace** 解码 SFTP 文件名（`e.filename` 中是 U+FFFD，原始字节不可还原）——`--encoding gbk` 得到"锟斤拷"（U+FFFD 再解码的乱码），功能无效，**回滚**并在代码注释记录边界。非 UTF-8 文件名建议保持 UTF-8，或经 exec `ls -b`/base64 自行取原始字节。
+
+### 修复
+- **SKILL.md 标题"速查（先读这 8 条）"→ 9 条**：v1.5.11 加第 9 条时标题漏改（小笔误）。
+
+### 测试
+- 真机：exec `--encoding gbk` → "你好"（回归有效）、test `--encoding utf-9` → bad_args、回归 verify_r3 54/54、双份 md5 一致。
+- **（v1.5.13 文档修订 + Linux 双平台验证）**：① SKILL.md 快速开始调用方式收敛为主路径 `python3 <pyaissh_dir>/pyaissh.py ...`（Windows cmd / Git Bash 折叠到 docs/setup.md）——Linux 智能体看主路径零犹豫；② 审查建议"file_list.path 预警"为 v1.5.11 第 9 条既有内容（无需重复）；③ 审查建议"--cmd 只用于 df -h、其余一律 --cmd-file"**不采纳**——与 v1.5.11"按调用环境选"决定相反（会使 Linux agent 过度保守，bash 下 --cmd 完全可靠）；④ **首次 Linux 平台回归**：服务器（Debian 13, Python 3.13.5, paramiko 5.0.0）跑 verify_r3 54/54 + SIG_UNIT + `test root@localhost` 全过——此前测试全程 Windows 开发机执行，双平台验证补齐。以后发布流程含 Linux 回归步骤。
+
+## [1.5.14] - 2026-08-26
+
+### 修复
+- **`--remote ~/...` 被 MSYS 误判为 Windows home（远端目录污染 bug）**：Git Bash（MSYS）在参数传递前把 `~` 展开为 `/c/Users/<user>` 再 pathconv 成 `C:/Users/<user>/...`——`_fix_msys_remote_path` 只逆转了 TEMP 与 MSYS 根两种模式，Windows home 形态漏掉，导致 `--remote ~/x` 在远端创建 `/C:/Users/<user>/x` 垃圾目录树（含顶层 `C:`）+ 自动 mkdir -p 建一串垃圾父目录。修复：新增模式 3——`C:/Users/<本地用户名>/rest` 逆转回 `~/rest`（`--remote` 的 `~` 语义是远端用户 home，由 `_normalize_remote_path` 在远端展开）+ WARN（建议给 `~` 加引号或设 `MSYS_NO_PATHCONV=1`）；仅本地用户名匹配时逆转（远端 Windows 服务器上的 `C:/Users/<其他名>/...` 不受影响）。真机验证：Git Bash 真实复现 `--remote ~/pyaissh_ft_tilde.txt` → JSON `remote: /root/...`（远端 home）+ 远端无 `C:` 目录；单元 5 例（本机 home 逆转 / 非本机用户不动 / 无子路径不动）。回归 verify_r3 54/54，双份 md5 一致。
+
+## [1.5.15] - 2026-08-28
+
+### 新增
+- **`exec --sudo` 提权执行（普通用户 sudo 提权，密码受控注入）**：登录普通用户、操作需 sudo 提权（如 Ubuntu 物理机）时的标准姿势。
+  - 用法：`--sudo --cmd "apt update"` + 密码来源 `--sudo-password`（空串视为未设置）或 `PYAISSH_SUDO_PASSWORD` 环境变量（env 优先性：参数 > env）。
+  - 组装：**简单命令**（无 shell 元字符）直连 `sudo -S -p '' <cmd>`——保留 sudoers NOPASSWD 按命令路径匹配（`NOPASSWD: /usr/bin/apt` 对 `sudo apt update` 生效）；**复合命令**（含 `&&`/`||`/`;`/管道/重定向/`$()`/反引号/换行）→ `sudo -S -p '' bash -c '<单引号转义>'` 整链提权（`&&` 第二段同样 root，防 sudo 只提权首命令）。`--cmd` 与 `--cmd-file` 两条路径统一处理。
+  - 密码只经 SSH stdin 注入（写完即 close）：命令文本/cmd 字段/日志/远端磁盘均无密码；`-p ''` 压掉 `[sudo] password for ...` 提示符（成功路径 stderr 干净）；`--sudo` 与 `--pty` 互斥（bad_args）。
+  - 无密码 `--sudo` → `sudo -n` 免密探测：免密命令直接跑；需密码立即失败不挂，且 exit 非零时 warnings 附密码配置提示（`--sudo-password` / `PYAISSH_SUDO_PASSWORD` / NOPASSWD）。
+- **真机验证 10 例全过**（B2 建 tester/tester_np 用户 + sudoers）：T1 有密码提权 uid=0 / T2 `id && whoami && echo $UID` 三段全 root / T3 stderr 无 password for / T4 密码错失败 / T5 无密码简单命令 NOPASSWD 免密成功 / T6 无密码复合命令 sudo -n 失败 + warnings 提示 / T7 空密码视为未设置 / T8 --pty 互斥 bad_args / T9 cmd 字段无密码 / T10 --cmd-file 整链提权。回归 verify_r3 54/54（Win + Linux 双平台）。
+
+### 设计说明
+- **bash -c 包裹的取舍**：初版"所有 --sudo 一律 bash -c 包裹"实测暴露冲突——`NOPASSWD: /usr/bin/apt` 这类按命令配的免密规则匹配不上（sudo 看到的是 /usr/bin/bash）。改为**智能组装**：仅复合命令包裹（保证整链提权），简单命令直连（保留 NOPASSWD 按命令匹配）——两者兼得。
+- **（v1.5.15 测试修复，测试 AI 反馈 3 项）**：① 凭据启发式改用**原命令**（`orig_cmd`）检测——组装后的 `sudo -S -p ''` 前缀命中 `_SENSITIVE_CMD_RE` 的 `-p` 模式导致 100% 误报"疑似凭据"，对"密码不进命令"的功能是自我打脸（T11 回归：无误报）；② **过时边界文档更新**——SKILL.md 已知边界与 docs/edge-cases.md 原写"sudo 密码无法用 stdin 管道（sudo -S 不适用）"，与 v1.5.15 功能矛盾，改为指向 `--sudo`（v1.5.15 起 sudo -S 经 SSH stdin 注入）；③ **sudo -n 失败提示收窄**——触发条件加 `stderr 含 password`（原只看 exit_code != 0：sudo 免密成功但命令本身失败如 `id 不存在用户` 会误报"需要密码"误导 AI 去配密码）（T12 回归：命令失败不误报）。另 docs/exec.md 补注：sudo 无法执行 shell 内建命令（`exit` 非可执行文件），内建请外套 `bash -c`。套件扩至 12 例全过 + 回归 54/54（Win + Linux）。
+- **（v1.5.15 测试修复，C 门控二次收窄）**：③ 的门控"stderr 含 password"仍有理论缝——NOPASSWD 命令自身 stderr 恰好含 "password" 一词（如 "using password: YES" 后失败）仍误报。收窄为匹配 **sudo 报错特征**（`a password is required` / `no password was provided` / `password required`）——命令自身输出 "using password: YES" 等不再触发。单元 7 例（sudo 特征 3 类 True / 命令含 password 2 类 False / 无关空 False）+ 套件 12/12（T6/T7 仍触发）。
+- **（v1.5.15 测试修复，E：sudo 失败混入误导性转义提示）**：`--sudo` + 密码错 + 复合命令时 warnings 只有"命令退出码非零且含特殊字符…改用 --cmd-file -"的转义提示（stderr 却是 `sudo: incorrect password`）——AI 被引向"改用 --cmd-file"而非正确动作"改 sudo 密码"。根因：`_shell_escape_hint` 不排除 sudo 上下文（--sudo 场景命令由工具组装，用户输入的转义问题已由 bash -c 包裹解决，hint 只会误导）；且 sudo 专用提示只在 -n 探测路径（无密码）触发，**密码错误的 -S 路径没有提示**。修复：① `--sudo` 场景成功/异常路径都**抑制转义 hint**；② -S 路径新增密码错误提示（stderr 匹配 `incorrect password`/`Sorry, try again`/`password mismatch` → warnings "sudo 密码错误：检查 --sudo-password / PYAISSH_SUDO_PASSWORD 是否与登录密码一致"）。真机验证：`--sudo --sudo-password WrongPass --cmd "id && whoami"` → warnings 只含"sudo 密码错误"；非 sudo 场景转义 hint 保留（`echo $(whoami) && exit 1` → 仍提示）。套件 12/12 + 回归 54/54。
+- **（v1.5.15 测试修复，R7/R8：-S 密码错提示门控收窄到 sudo 专属报错）**：E 修复的 -S 门控正则（`incorrect password`/`Sorry, try again`/`password mismatch` 宽泛子串）与 C 门控同类——sudo 与命令的 stderr 同一 channel 无法区分来源，命令自己往 stderr 打 "Sorry, try again" 或 "password mismatch" 后失败会误报"sudo 密码错误"（R7/R8 实测复现）。收窄为匹配 **sudo 专属报错**（带 `sudo:` 前缀：`sudo: no password was provided` / `sudo: 1 incorrect password attempt` / `sudo: authentication failure` 等）——命令自身输出不再触发；漏报风险（sudo 报错文本不匹配）是"不误导"方向。单元 9 例（sudo 专属 3 类 True / 命令含词 3 类 False / 无关 False / -n 路径回归 2 例）+ 真机 R7（密码正确+命令打 Sorry try again → warnings 空）与 E（密码错 → 仍提示）双验证。套件 12/12 + 回归 54/54。
+- **（v1.5.15 测试修复，配置入口与文档同步）**：① `.env.example` 补 `PYAISSH_SUDO_PASSWORD`（凭据配置第一入口此前漏了该变量——SKILL.md/exec.md 都写了，走 .env 路径的用户不知道存在，与 v1.5.11 "contract.md 缺 parallel_used" 同类问题）；② docs/setup.md 凭据段补 sudo 提权密码说明；③ docs/exec.md 的 -n 门控描述从"stderr 含 password"更新为"stderr 命中 sudo 报错特征（如 a password is required）"（二次收窄后文档滞后一轮，教 AI 依赖已收紧的判据）。
+- **（v1.5.15 文档瘦身）**：SKILL.md 14882B → **12697B**（接近 15KB 上限，密集/低频内容下放子文档）：退出码表精简为一行粗筛（完整版 errors.md 已有）、子命令示例压缩（--parallel/--resume/--encoding 等低频细节指向对应 docs）、删除"参数默认值"段（`--help` 与文档导航覆盖）、安全规则与快速开始去重、已知边界保留 3 条核心（pty 交互/sudo、host key、pkill 自杀伤）其余指向 edge-cases.md。结构与速查 10 条完整保留。
+- **（v1.5.15 测试修复，-n 门控与 -S 对称统一）**：`-n` 路径（无密码探测）提示正则补 `sudo:` 前缀要求，与 `-S` 路径同构——统一规则"sudo 提示只认 `sudo:` 前缀的报错行"（实测 sudo -n 报错恒带前缀，无漏报；命令自身 stderr 打出 "a password is required" 等不再误触发）。维护收益：两个门控行为一致，不再有"一处收窄一处宽"的隐蔽不对称（R7/R8 误报的根源模式）。单元 9 例 + 套件 12/12（T6/T7 的 -n 真机失败仍触发）。
+
+## [1.5.16] - 2026-09-05
+
+### 新增
+- **`--field` 消费端字段提取（免 json.loads 样板）**：真实使用反馈——AI 会话中手写 `| python -c "import json,sys; print(json.load(sys.stdin)['stdout'])"` 样板 15+ 次，且曾因展示脚本只打印 stdout 字段把 stderr 报错吞掉。`--field` 直接打印结果字段裸值：`--field stdout` 打印 stdout 内容；**`-` 前缀字段打到进程 stderr**（`--field stdout,-stderr`——stderr 内容经进程 stderr 返回，不被 stdout 展示吞掉）；多字段逗号分隔每行一个；dict/list 值 JSON 序列化（ls entries 等）；字段不存在打 stderr 提示（拼错可发现）；与 `--text` 互斥（bad_args）；**仅作用于成功路径**——工具错误仍输出完整 JSON（AI 需要 retryable/message）；命令非零退出是成功路径结果（--field 提取结果字段，`-stderr` 能拿到报错）；**不用 --field 时 stdout 恒 JSON 契约零变化**。实现：`add_conn` 统一注册（5 个目标类子命令通用）→ `_emit_result` 封装（有 field 走 `_emit_fields`，否则原 emit）→ 5 处成功路径 emit 改调 `_emit_result`。真机验证 10 例全过（裸值/分流/失败 stderr 可见/工具错误完整 JSON/多字段/字段不存在提示/ls entries/互斥/默认契约不变）。回归 verify_r3 54/54。
+### 文档
+- docs/exec.md 补"**写远程脚本文件的推荐姿势**"：脚本写远端文件用 `--cmd-file -` heredoc（引住定界符零展开），不要 `--cmd 'cat > x << "EOF"'` 引号走钢丝（实测教训：`$`/反引号被本地 shell 展开）；含 `$` 的远程脚本 bash/Git Bash 下 `--cmd-file -` 同样是首选（不改速查第 8 条推荐，尊重 v1.5.11 决定，仅补场景指引）。SKILL.md 输出约定段 + docs/contract.md 补 `--field` 说明。
+
+## [1.5.17] - 2026-09-06
+
+### 修复
+- **凭据 WARN 误报：`--no-pager` 命中"-p + 密码"形态（给开发 AI 的数据）**：`git log --no-pager` / `systemctl --no-pager` / `apt-get --no-pager` 等**高频合法命令**被误报"疑似凭据"——`no-pager` 中间的 `-pager`（`-p` 前是 `o` 非 `-`）绕过 v1.5.0 的 `(?<!-)` 防线（只挡双横线开头选项），命中紧贴形态。修复：**统一防线 `(?<![A-Za-z0-9-])`**——`-p` 作为密码选项时前字符必为空白/行首/引号，绝不可能是字母/数字/连字符，复合词中间的 `-p`（`--no-pager`、`a-px`）全部排除；三处形态（紧贴 `_P_SENS_P_ATTACH` / 引号 `_P_SENS_P_QUOTED` / 空格 `_P_SENS_P_SPACE`）统一改为引用 `_P_LOOKBEHIND_P`（一处定义防未来漂移）。验证：补充矩阵 41 例（15 真凭据全命中 + 26 不应命中含 --no-pager 全家 8 例）全过；原 L4 矩阵（verify_r3）54/54 无破坏；真机 `git log --no-pager` 零告警。
+
+## [1.5.18] - 2026-09-06
+
+### 修复/新增（真实长程任务反馈——40+ 调用跨 5 机含 332M 传输后沉淀）
+- **A. `--field` stderr 盲区自动提示（根治，第三次教训代价最大）**：使用 AI 用 `--field stdout` 漏掉 `-stderr`，传输失败（188→145）的真实原因（服务商镜像禁用公钥认证 → `Permission denied (password)`）在 stderr 里被吞，多烧一轮排查。修复：`--field` 模式下若结果 `stderr` 非空且本次未提取 stderr，**自动在进程 stderr 打提示**（`[pyaissh: 结果含非空 stderr（N 字节）——用 -stderr 字段查看]`）——提示走进程 stderr 不污染 stdout 裸值，只读 stdout 的消费者也能察觉有 stderr 值得看；已请求 stderr/-stderr 则不重复提示。SKILL.md 标准示例改为 `--field stdout,-stderr`（不再把单字段当示例）。真机验证：`--field stdout` + stderr 非空 → 提示出现；`--field stdout,-stderr` → 无提示 + stderr 内容可见。
+- **B. pkill 自杀伤条目补强（新形态）**：括号转义 `pkill -f '[d]ocker compose'` 只保护 pkill 自己那行——**同复合命令后面的 setsid 行合法包含字面量 `docker compose` 时 pkill 匹配整段 bash -c cmdline 照样炸会话**（863ms connection_lost，第二次踩雷）。edge-cases.md/SKILL.md 补：模式不得出现在自己命令行任何位置（含同脚本其他命令）；无法避免用**变量拼接**（`DC='docker'; pkill -f 'docker compose'; $DC compose up`——pkill 时无字面量，之后 `$DC` 展开）或**拆两次独立调用**。
+- **C. exec.md 新增"长任务配方"小节**：apt 安装/332M 传输/镜像拉取等 2-10 分钟零输出操作**必然撞 idle-timeout（默认 60s）**——三次踩雷后形成的稳定模式：①先估时长调大 `--idle-timeout`（上限 1200s）+ 同步调大 `--max-time`；②传输类靠并行分片 + `.part` 原子性（中断安全）+ `--resume`/重跑 + 轮询远端大小对账；③循环类命令自己加**心跳输出**（周期 `echo` 让 idle-timeout 不触发）；④超 20min 上限 → 后台化 `nohup ... &` + 轮询日志；⑤中断后先 pgrep/tail 确认（`remote_may_be_running` 字段）再决定续传/重跑。
+### 测试
+- field 套件 10/10 + sudo 12/12 + verify_r3 54/54（含 A 代码改动的回归）。
+
+## [1.5.19] - 2026-09-06
+
+### 修复（--field 模式 stderr 信号/噪音死结）
+- **`--field` 模式静音进度日志，stderr 只剩信号（使用 AI 设计洞察）**：v1.5.18 的 stderr 盲区提示存在**结构死结**——提示有效性依赖"消费者不屏蔽 stderr"，而消费者屏蔽（`2>/dev/null`）的动机恰是 stderr 上的进度噪音（`[SSH]`/`[OK]`/`[EXEC]` 对 --field 消费者零价值）：消费者用 `--field stdout 2>/dev/null` 时把提示和真实报错一起静音，盲区提示对"最有需要的那批调用"失效。修复：**不是教育用户别屏蔽，而是让屏蔽动机消失**——`--field` 模式下 log() 静音（模块级 `_QUIET`，main 解析出 `args.field` 后置位），`[WARN]` 级保留（凭据警告等信号），进度行丢弃。效果：`--field` 的 stderr 只可能出现 `[WARN]` + `_emit_fields` 提示（字段缺失/stderr 非空盲区）——全是信号，无噪音；错误路径不受影响（emit_error 走 stdout 完整 JSON，诊断本来就在 JSON 里）；非 `--field` 模式进度日志照旧。真机验证：`--field stdout` 成功 → stderr 空；stderr 非空 → stderr 只剩盲区提示；含凭据命令 → WARN 保留；非 field → `[SSH]`/`[OK]` 照旧。field 套件 10/10 + 回归 54/54。
+### 文档
+- contract.md `--field` 章节 + SKILL.md 输出约定同步："`--field` 模式 stderr 无进度日志、仅含信号（WARN/提示）——**不要再 `2>/dev/null`**"。
+
+## [2.0.0] - 2026-09-06
+
+### 重构（行为零变化——v1.5.19 的代码结构重组，非功能变更）
+- **背景**：pyaissh.py 单文件 4460 行、cmd_exec 682 行巨函数、5 子命令连接样板重复——维护性到临界。方案经架构审查采纳四条护栏（①可变全局禁 from-import ②构建顺序用显式 MANIFEST ③先证构建器再搬 ④确定性构建+双形态测试）+ 用户决策"开发态多文件、发布态合成单文件"。
+- **开发态 = 12 域文件**（`pyaissh-dev/domains/`，独立 git 可回滚）：`00_head`(文件头/极早期信号/VERSION) `01_globals`(常量/错误分类/可变全局) `02_cred_regex`(凭据启发式) `03_env_paths`(.env/MSYS 路径) `04_console_out`(log/emit 系) `05_util`(截断/hint/spill) `06_conn`(连接) `07_sftp_transfer`(传输原语) `08_cmd_exec` `09_cmd_transfer` `10_cmd_test_ls` `11_cli_main`(parser/main)——每个域文件带模块 docstring 代码地图（内容/关键符号/被谁引用）。
+- **cmd_exec 彻底分段**：682 行 → 编排 `cmd_exec`(16 行) + `_prepare_exec_command`(组装/哨兵化) + `_connect_exec`(连接) + `_exec_session`(执行会话，内嵌闭包 `_partial_extra`/`_read`/`_drain_rest`)。语句零改动机械等价搬移。
+- **构建器**（`pyaissh-dev/build_single.py`）：域 MANIFEST 显式顺序（护栏 2）+ 往返逐字节一致 + 确定性（护栏 4）。发布物 = join 单文件（分发形态不变）。
+- **验证（重构前后行为一致性）**：金标往返逐字节一致 → 搬移期 12 域 join = 原文件；改码期 A 机 15/15 + B2 机 18/18 用例 JSON 逐字段一致（exec 各形态/pty/超时/截断/sudo/cmd-file/传输往返）+ 回归 54/54 + sudo 12/12 + field 10/10。
+- **代码地图**：每个域文件带模块 docstring（内容/关键符号/被谁引用）；`pyaissh-dev/` 独立 git 全程可回滚。
+- **构建器自动生成域边界横幅**：join 时在每个域拼接处插入 `# ===== [域 NN/12] <标题> =====`（标题从域 docstring 首行自动提取）——成品单文件与 12 域文档视觉对应，使用 AI 滚到任意位置知道在哪个域；纯注释、行为零变化、确定性构建。曾评估"函数行号索引"（文件尾跳转表）后**回退**：使用 AI 改文件后行号漂移会成为错误导航（横幅/docstring 是内容标记不依赖行号，稳定可用）。
+
+## [2.1.0] - 2026-09-07
+
+### 新增/修复（来自真实使用 AI 反馈，按烦人程度排序）
+1. **`--field` 命令失败直接给 stderr 尾巴**（修复"多跑一轮真金白银"）：`--field stdout` + exit≠0 + stderr 未提取时，stderr 通道直接打**截断尾巴（1KB 封顶）**，不再只给"结果含非空 stderr"提示让 AI 再跑一次取 stderr；命令成功但 stderr 非空仍保持原提示（内容非报错不塞）。实测：pip 装依赖失败一次往返拿到真实报错。
+2. **`host add` 子命令（多主机不同密码闭环）**：`pyaissh host add prod root@1.2.3.4 --password xxx` 把别名写进脚本同目录 .env（幂等更新；含 #/空格的密码自动引号包裹）→ 之后 `pyaissh exec @prod` 直接用别名专属凭据，不再逐条 `--password`（进程列表可见 + WARN 刷屏）。KEY 专属私钥同支持。
+3. **upload `--exclude GLOB[,GLOB...]`**（部署排除）：目录递归时排除匹配项——目录整树剪枝、文件不上传不计数（命中文件名或相对路径的 fnmatch glob）；`--exclude node_modules,.git` 部署不再白传 11MB。
+4. **凭据扫描豁免从文件读值**：命令含 `$(cat f)` / `$(<f)` 整条不报 WARN（值来自文件、不进命令行文本、无明文泄漏——DB_PASS=$(cat /srv/x) 类实测误报消除）；真凭据字面（-psecret 等）仍命中。
+5. **exec `--progress [SECS]`（长任务心跳）**：命令静默/持续运行每 N 秒（默认 30）往 stderr 打 `[PROGRESS] 仍在运行，已 Xs`——AI 知道进程活着不是挂死；**不重置静默计时**（idle-timeout 仍按真实输出判定，心跳不防超时）。
+### 变更
+- 凭据 WARN 的 `$(cat` 豁免在 warn_sensitive_cmd 内实现（_READ_FROM_FILE_RE，05/02 域）
+- host add 实现于 06_conn 域（_env_write_value/cmd_host_add）；.env 写入与 load_env 同路径（脚本同目录）
+### 测试
+- 测试体系扩至 152 断言：unit 58+47+6 + live 12+22+7（$(cat 豁免 6 / exclude 匹配 4+真机 1 / field 失败尾巴 2 / progress 心跳 1），B2 真机全绿
+- host add 手动验证：副本 .env 写入（含引号密码/幂等更新/别名调用 @prod 解析正确）
+### 文档
+- SKILL/docs 同步见仓库文档更新（transfer.md --exclude / exec.md --progress + field 尾巴 / setup.md host add / .env.example）
+
+## [2.1.1] - 2026-09-07
+
+### 修复
+- **`--progress` 心跳在 `--field` 模式下被静音（v2.1.0 缺陷）**：心跳走 log() 被 v1.5.19 的 `--field` 噪音静音机制吞掉——而**长任务恰恰最常用 `--field stdout`**（消费端只等字段，静默期最需要"还在跑"的信号）。修复：log() 加 force 参数，心跳 `force=True` 绕过 `_QUIET`（显式请求 = 信号不是噪音；`[WARN]` 同理本就例外）。实测：`--field stdout` + `--progress 1` 心跳行正常输出，其余进度行仍静音。
+### 测试
+- live_exec_field +1：`--field` 下 `--progress` 心跳可见（且无 [SSH] 进度噪音、stdout 裸值纯净）——exec_field 22→23，全量 153 断言
+### 文档
+- contract.md `--field` stderr 契约补例外（v2.1.1）：`[PROGRESS]`/`[WARN]` 绕过静音，其他进度行仍静音
+
+## [2.1.2] - 2026-09-07
+
+### 改进（使用注意实测反馈）
+1. **host add 接入 `--field`**（子命令统一消费端模式）：`pyaissh host add prod root@1.2.3.4 --password x --field alias` → 裸值 `@prod`（--field target/tips 等同理）；默认 JSON 输出不变。此前 host 是唯一没接 field 机制的子命令（--field 报 bad_args）。
+2. **dry-run 消费姿势文档化**：`--dry-run` 默认完整 JSON 里 file_list 是清单全集（stdout 字段为空属预期）——正确姿势 `--dry-run --field file_list` 只取清单。transfer.md 示例行补此姿势（v2.1.2 提示）。
+### 待办（backlog）
+- host `remove`/`list`（add 已实现；错误提示已带指引）——见 pyaissh-dev/README.md backlog
+### 测试
+- host --field 手动副本验证（alias/target 裸值 + 默认 JSON 不回归）；全量 153 断言不受影响（纯输出路径调整，回归已绿）
+### 文档
+- transfer.md dry-run field 姿势；pyaissh-dev/README backlog 节
+
+## [2.1.3] - 2026-09-07
+
+### 新增（backlog 兑现）
+1. **`host remove NAME`**：从 .env 删除别名——连同其专属 `_PASSWORD`/`_KEY` 行（`已删除 N 行` 明示）；别名不存在报 bad_args 并提示 `host list` 查看。支持 `--field removed`。
+2. **`host list`**：列出 .env 已配置别名——`entries[{name,target}]`（**只读 host 行，绝不回显密码/密钥**）；`--field entries` 只取清单。add/remove/list 三者闭环，别名管理不再需要手改 .env。
+### 测试
+- 副本手动验证：add×3 → list(3，无密码) → list --field entries → remove test(删 2 行) → remove 不存在(明确 bad_args) → 再 list(剩 2)；.env 行级核对干净
+### 文档
+- SKILL host 节 + setup.md 补 remove/list；pyaissh-dev/README backlog 标记已实现
+
+## [2.1.4] - 2026-09-08
+
+### 修复（P0：凭据 WARN 误报 6/20→收敛，逐条实测）
+1. **-p 系列区分大小写**（(?-i:-p)）：-P 不再命中（grep -P 'a+b' 误报）
+2. **ATTACH 排除 ffmpeg/ffprobe**：-pix_fmt 误报修复
+3. **SPACE 排除 grep/egrep/fgrep**：grep -p foo 误报修复
+4. **空引号值排除**（-p '' / password='' / DB_PASS=''）：useradd -p '' 类空值无秘密不报
+5. **赋值形态排除 - 开头参数**（(?!-)）：java -D…password= -jar 误报修复（= 后空、-jar 是下个参数）
+6. **echo/printf 打印段豁免**（warn 按 shell 分隔拆段）：echo 'PASSWORD=' 字符串打印无执行语义不报；&&/| 后真命令段独立保留（echo x && mysql -u r -psecret 照报）
+### 修复（P1：PowerShell @别名被吞——PS 层行为，文档注记）
+- SKILL host 节加注：PowerShell 下 `@名称` 需加引号（`pyaissh test "@prod"`）
+### 修复（P2：测试与文档漂移）
+- run_tests 描述去硬编码例数（54/19/3 等旧数字漂移根因）——例数以运行输出为准；README 同步去数字化
+- 修 4 处 `\$` 无效转义（SyntaxWarning，未来 Python 会变错误）
+- **host add/remove/list 自动化集**（unit_host，7 断言）：被测复制到临时副本 importlib 加载 → host 写副本 .env（此前 CHANGELOG 自述"手动验证"的缺口）；覆盖 add 写入（含 # 密码引号包裹）/幂等更新/list 条目与不回显凭据/remove 及不存在报错/非法名
+### 测试
+- unit 扩至 126（58+55+6+7，新增 P0 六误报 + 2 真命中边界 + host 7）
+### 文档
+- SKILL（PS 注）；tests README/CHANGELOG 同步
+
+## [2.2.0] - 2026-09-13
+
+### 新增：后台作业（--detach + log 子命令）——长任务"边跑边看"
+- **`exec --detach`**：远端 `setsid+nohup` 起作业，**立即返回** `job_id/pid/status/log/rc/job_dir/next_action`；
+  作业脚本落 `/tmp/pyaissh-jobs/<job_id>/`（`job.sh` = 命令原文、`run.sh` = 运行器），
+  输出合并 `job.log`、退出码写 `job.rc`——**SSH 断开/宿主单次调用超时都不影响作业**
+- **`log`（别名 `tail`）子命令**：`--list` 列作业；默认回传尾部 100 行（`--lines N`）；
+  `--offset N` **增量读**（返回 `next_offset`，轮询不重复）；`--wait-rc SECS` 等结束拿退出码（≤600s）；
+  `--cleanup` 清理远端作业目录；支持 `--field content/exit_code/next_offset/jobs`
+- 状态判定以 `job.rc` 存在为准（存在=finished+exit_code；被 kill 的作业恒 running）
+- 互斥与安全：与 `--sudo`/`--pty` 互斥（bad_args）；`--job-id` 严格校验防路径穿越；
+  命令原文会落远端 `job.sh`（凭据 WARN 会额外提示此事）
+- 新错误类型：`detach_failed`（255）/ `job_not_found`（2）/ `log_failed`（255）
+### 变更：默认输出保留量 256KB → 64KB（防宿主裁掉工具结果中段）
+- 根因：结果 JSON 过大时宿主裁剪工具结果中段（`[... tool result middle pruned ...]`），
+  连 spill 路径都可能一起丢——使用者只看到"丢了一段"又得重跑
+- 完整输出本来就落 spill 文件；**截断时新增 `next_action` 字段**直接写明"完整输出在哪个文件、
+  读文件不要重跑"（不用自己拼线索）
+### 新增：`exec --help` 末尾"场景 → 参数"表
+- systemctl restart → `--idle-timeout 120`；apt/docker pull → `--idle-timeout 120 --max-time 900`；
+  编译构建 → `--idle-timeout 300 --max-time 1200`；要边跑边看 → `--detach`；
+  静默确认活着 → `--progress 30`；大输出 → 读 spill；含 `$` 特殊字符 → `--cmd-file -`
+- 同时 `log --help` 给出典型用法与状态判定说明
+### 测试
+- unit_regression +8（作业脚本生成/单引号转义/job-id 穿越拦截/默认 64KB）；live_exec_field +10
+  （detach 启动→wait-rc 拿退出码→增量读不重复→cleanup→清理后 job_not_found→--list→互斥校验）
+
+## [2.2.1] - 2026-09-13
+
+> 针对 v2.2.0 后台作业（--detach/log）的使用反馈修复四项 + 新增 --kill。v2.2.0 未发布，
+> 本版即后台作业的首次发布形态（可只发 2.2.1）。
+
+### 修复
+- **log 载荷字段 content → stdout**（与 exec 的 stdout 命名对齐，消费端不再猜错字段）：
+  旧名移除；新增 `stream:"stdout+stderr"` 声明它是 2>&1 **合并流**；`log --help` 明确列出
+  载荷字段名（此前 help 只列了 omitted_bytes 之类的元数据，AI 按 stdout 解析连续拿到 null）
+- **远端落盘权限从严**：作业目录与作业根目录 0700、`job.sh`(命令原文)/`job.log`/`job.rc`/
+  `job.pid` 0600、`run.sh` 0700（此前只有 run.sh 是 0700，job.sh 0644、目录 0755——同机其他
+  用户可读到命令正文与完整输出）；`run.sh` 首行加 `umask 077` 管住 shell 创建的文件；
+  detach 结果新增 `permissions` 字段声明这套权限
+- **kill 语义收敛**：新增 `job.pid` 落盘 + 存活探测（`kill -0`），状态机由二级
+  （finished/running）改为**三级（finished/dead/running）**——被 kill/OOM/崩溃的作业不再
+  永久 running，`--wait-rc` 以"状态不再是 running"为收敛条件（此前只能等满超时）；
+  `dead` 时带 `hint` 说明"无退出码、退出码不可知"
+- **尾部截断提示**：`--lines` 模式回传内容又被 `--max-output` 截中段时（`truncated:true` +
+  `omitted_bytes` 但 `has_more:false`/`next_offset`=EOF，看着像读完了）→ `next_action`
+  明确提示"用 `--offset 0` 顺序读补齐"
+
+### 新增
+- **`log --kill`**：读 `job.pid` 对**进程组**（setsid 后 pid==pgid）`TERM` → 宽限 5s → `KILL`；
+  Linux 上先校验 `/proc/<pid>/cmdline` 确属本作业（防 pid 复用误杀，不匹配则拒绝）；
+  可与 `--wait-rc` 连用（kill 后立即收敛 dead）；新错误类型 `kill_failed`（255，带 reason：
+  no_pid/already_gone/pid_mismatch/kill_failed）
+- **`log --list` 状态也三级**：无 rc 的条目做一次批量存活探测（单条 exec，避免 N 次往返），dead 可见
+
+### 测试
+- unit_regression +1（run.sh umask 077；job 路径表含 job.pid）
+- live_exec_field +7（远端权限 0700/0600 实测、log 载荷字段 stdout 且无 content、
+  `--kill` 整组停掉并收敛 dead、kill 后 wait-rc 快速收敛（waited_ms < 20s）、dead 带 hint、
+  尾读截断给 `--offset 0` 提示、`--offset 0` 顺序读拿全文、`--kill` 缺 job-id 拦截）
+
+## [2.2.2] - 2026-09-13
+
+### 修复：`log --cleanup` 对运行中作业是脚枪（自断追踪 + 留孤儿）
+
+- **现象**：`log --job-id X --cleanup` 在作业仍 `running` 时照删目录（结果里明明写着 status=running）：
+  `job.pid`/`job.log`/`job.rc` 一并消失 → `--list` 归零 → **工具彻底失去对该作业的追踪**，
+  而 `ps` 里 `run.sh`/`job.sh`/子进程仍在跑（只剩人工 pgrep/kill 一条路）
+- **修法**：`--cleanup` 加**状态守卫**——只在作业已结束（`finished`/`dead`）时执行；仍 `running` 时
+  拒绝并报 `job_running`（退出码 2），消息给出 pid、两条正路（`--kill` / `--wait-rc`）与
+  `hint`（`--kill --cleanup` 一步到位）；新增 `--force` 作为唯一的"明知在跑也要删"出口，
+  照删但留痕：结果带 `forced_cleanup:true` + `warnings` 明示"已失去追踪、远端进程可能仍在跑"。
+  `--force` 只允许配合 `--cleanup`（否则 bad_args）
+- **配套澄清（整组杀）**：只杀 `run.sh`（`kill -9 <pid>`）会让 `job.sh` 与它的子进程被 reparent
+  成孤儿继续跑——`--kill` 走**进程组**（setsid 后 pid==pgid，`kill -TERM -<pgid>`）正是为此；
+  本次补真机断言卡住"kill 后无孤儿进程"
+- **测试**：live_exec_field +7（运行中 `--cleanup` 被拒且目录保留、`--cleanup --force` 强制清理且留痕、
+  force 后进程确实仍在跑（代价可见）、外部 pkill 收尾、`--kill` 收敛 dead + 快速收敛 + hint、
+  **`--kill` 后无孤儿进程**（`pgrep -af '[s]leep 300'` 为空）、`--force` 缺 `--cleanup` → bad_args）
+- 真机验证数据（B2）：47/47 PASS
