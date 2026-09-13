@@ -132,7 +132,7 @@ except (ValueError, OSError, ImportError):
 被 00_head（信号区）、各 cmd_*（超时/常量）引用；拼接后与本包其余域同模块共享命名空间。
 """
 
-VERSION = "2.2.1"
+VERSION = "2.2.2"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -4026,8 +4026,27 @@ def _log_read(sftp, client, args, job_dir, conn, start):
     if kill_info is not None:
         result["kill"] = kill_info
     if args.cleanup and paths:
+        # v2.2.2 守卫：作业还在跑就删目录 = 自断追踪（job.pid/job.log 一并没了，--list 归零，
+        # 而 run.sh/job.sh 的子进程仍在远端跑）。默认拒绝，给出两条正路：先停或先等。
+        if status == "running" and not getattr(args, "force", False):
+            emit_error(args.json, "job_running",
+                       "作业仍在运行（pid %s），拒绝 --cleanup：删掉作业目录会让本工具彻底失去"
+                       "追踪（job.pid/job.log/job.rc 都没了），而远端进程仍在跑。"
+                       "先停掉（--kill）或等结束（--wait-rc），再 --cleanup；"
+                       "确要放弃追踪：--cleanup --force" % (pid if pid is not None else "?"),
+                       extra={"job_id": job_id, "pid": pid, "status": status,
+                              "log": log_path,
+                              "hint": "一步到位：pyaissh log <target> --job-id %s --kill --cleanup"
+                                      % (job_id or "<id>")})
+            return None
         result["cleaned_paths"] = _detach_cleanup(sftp, paths)
         result["cleaned"] = True
+        if status == "running":
+            result["forced_cleanup"] = True
+            result["warnings"].append(
+                "作业仍在运行（pid %s）时被强制清理：本工具已失去该作业的追踪，"
+                "远端进程可能仍在跑（要停掉请人工 pgrep/kill 或下次改用 --kill --cleanup）"
+                % (pid if pid is not None else "?"))
     if status == "finished":
         result["next_action"] = ("作业已结束（exit_code=%s）。%s"
                                  % (rc_val, "已清理远端作业目录"
@@ -4088,6 +4107,9 @@ def cmd_log(args):
         return 2
     if args.kill and args.list_jobs:
         emit_error(args.json, "bad_args", "--kill 不与 --list 同用")
+        return 2
+    if args.force and not args.cleanup:
+        emit_error(args.json, "bad_args", "--force 只配合 --cleanup（强制清理运行中的作业目录）")
         return 2
 
     conn, client, conn_ec = _connect_exec(args)
@@ -5437,7 +5459,9 @@ def build_parser():
   pyaissh log h --job-id <id> --offset <next_offset>     # 接着上次读（轮询不重复）
   pyaissh log h --job-id <id> --wait-rc 30               # 等结束（≤600s）并拿退出码
   pyaissh log h --job-id <id> --kill                     # 整组停掉（TERM→宽限 5s→KILL）
-  pyaissh log h --job-id <id> --cleanup                  # 清理远端作业目录
+  pyaissh log h --job-id <id> --kill --cleanup           # 停掉并清理（推荐收尾方式）
+  pyaissh log h --job-id <id> --cleanup                  # 清理远端作业目录（运行中会被拒绝）
+  pyaissh log h --job-id <id> --cleanup --force          # 明知在跑也要删（放弃追踪，进程可能仍在跑）
 
 载荷字段（别猜错，v2.2.1 起与 exec 对齐）:
   stdout       日志内容（**合并流**：job.log 是 2>&1，stdout 与 stderr 都在这；stream 字段声明）
@@ -5449,6 +5473,8 @@ def build_parser():
   finished = job.rc 存在（内容即退出码）；被 kill/OOM/崩溃的作业永不产出 rc，
   此时由 job.pid 的存活探测判定 **dead** —— 所以 --wait-rc 不会永久卡在 running。
   truncated=true 且非 --offset 模式时，中段被省略（omitted_bytes）→ 用 --offset 0 顺序读补齐
+  --cleanup 只在作业已结束（finished/dead）时执行：运行中会拒绝并报 job_running——
+  删掉 job.pid/job.log 会让本工具彻底失去追踪，而进程仍在远端跑（要停用 --kill 整组停）
 """)
     add_conn(p)
     p.add_argument("--job-id", dest="job_id",
@@ -5469,7 +5495,11 @@ def build_parser():
                         "被 kill 的作业随后判定为 dead（无退出码），状态机可收敛；需 --job-id"
                         % JOB_KILL_GRACE)
     p.add_argument("--cleanup", action="store_true",
-                   help="读完后删除远端作业目录（job.sh/run.sh/job.log/job.rc）；需 --job-id")
+                   help="读完后删除远端作业目录（job.sh/run.sh/job.log/job.rc/job.pid）；需 --job-id；"
+                        "作业仍在运行时拒绝（会自断追踪），先 --kill 或 --wait-rc，或用 --force 放弃追踪")
+    p.add_argument("--force", action="store_true",
+                   help="配合 --cleanup：作业仍在运行时也强制清理（本工具不再追踪该作业，"
+                        "远端进程可能仍在跑——正常应先 --kill）")
     p.add_argument("--limit", type=_positive_int, default=50, help="--list 最多返回条数（默认 50）")
     p.add_argument("--max-output", dest="max_output", type=_positive_int, default=DEFAULT_MAX_OUTPUT,
                    help="单次回传内容上限字节（默认 64KB；截断时看 omitted_bytes，"

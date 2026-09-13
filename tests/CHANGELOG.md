@@ -154,3 +154,16 @@
 ### 说明
 - 两条最初写成 FAIL 的用例是**测试自身写法错误**（用了 `_live_run` 取 `--field` 裸输出→拿到 None；
   小 `--lines` 时回传内容本身就小、不会触发截断）——产品行为经手工复核正确后修正测试
+
+## [2026-09-13] v2.2.2 `--cleanup` 状态守卫 + 无孤儿断言
+
+### 新增用例
+- live_exec_field +7：运行中 `--cleanup` → `job_running`(exit 2) 且 `pid` 在；拒绝后目录仍在（可继续追踪）；
+  `--cleanup --force` → cleaned + `forced_cleanup:true` + warnings 含"仍在运行"；force 后进程确实仍在跑
+  （代价可见，`pgrep -af '[s]leep 120'` 命中）；外部 pkill 收尾；`--kill --wait-rc` 收敛 dead + 快速收敛
+  （waited_ms<20s）+ hint；**`--kill` 后无孤儿**（`pgrep -af '[s]leep 300'` 无输出）；
+  `--force` 缺 `--cleanup` → bad_args
+### 说明
+- 三条用例最初报 FAIL 是**测试自身写法错误**（`--field` 模式 stdout 是裸值，`_live_run` 的 last_json 为 None）
+  ——改用 `_live_sub` 取裸 stdout 后修正，产品行为经手工复核正确
+- 孤儿检查用 `[s]leep` 技巧避免 pgrep/pkill **自匹配**（自匹配会把自己的包装 shell 也算进去/杀掉）

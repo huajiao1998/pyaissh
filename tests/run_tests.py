@@ -669,18 +669,62 @@ def suite_live_exec_field(s):
     rc, jk, _ = _live_run(["exec", tgt, "--detach", "--cmd", "sleep 120"], timeout=90)
     kjob = (jk or {}).get("job_id")
     if kjob:
-        rc, kk, _ = _live_run(["log", tgt, "--job-id", kjob, "--kill", "--wait-rc", "30"],
-                              timeout=120)
-        s.check("log --kill 整组停掉并收敛为 dead",
-                bool(kk) and kk.get("status") == "dead" and kk.get("exit_code") is None
-                and kk.get("kill", {}).get("ok") is True and kk.get("pid"), repr(kk)[:220])
-        s.check("kill 后 wait-rc 快速收敛（未等满 30s）",
-                bool(kk) and kk.get("waited_ms", 99999) < 20000, repr(kk)[:160])
-        s.check("dead 状态带 hint 指引", bool(kk) and "job.rc" in (kk.get("hint") or ""),
-                repr(kk.get("hint"))[:120])
-        _live_run(["log", tgt, "--job-id", kjob, "--cleanup"], timeout=60)
+        # v2.2.2 守卫：运行中 --cleanup 必须被拒（否则自断追踪 + 进程仍在跑）
+        rc, jc, _ = _live_run(["log", tgt, "--job-id", kjob, "--cleanup"], timeout=60)
+        s.check("运行中 --cleanup 被拒（job_running, exit 2）",
+                bool(jc) and jc.get("error") == "job_running" and rc == 2
+                and jc.get("pid"), repr(jc)[:200])
+        rc, still, _ = _live_run(["log", tgt, "--job-id", kjob], timeout=60)
+        s.check("拒绝后目录仍在（可继续追踪）", bool(still) and still.get("status") == "running"
+                and bool(still.get("pid")), repr(still)[:160])
+        # v2.2.2：--force 放弃追踪（允许删，但要留痕）
+        rc, jf, _ = _live_run(["log", tgt, "--job-id", kjob, "--cleanup", "--force"], timeout=60)
+        s.check("--cleanup --force 强制清理且留痕",
+                bool(jf) and jf.get("cleaned") is True and jf.get("forced_cleanup") is True
+                and any("仍在运行" in w for w in (jf.get("warnings") or [])), repr(jf)[:200])
+        # 该作业的进程此刻仍在跑（正是 force 的代价），用 kill 收尾并验证整组被杀
+        p = _live_sub(["exec", tgt, "--cmd",
+                       "pgrep -af '[s]leep 120' >/dev/null && echo ORPHAN_ALIVE "
+                       "|| echo NO_ORPHAN", "--field", "stdout"], timeout=60)
+        s.check("force 清理后进程确实仍在跑（代价可见）", "ORPHAN_ALIVE" in (p.stdout or ""),
+                repr(p.stdout)[:120])
+        p = _live_sub(["exec", tgt, "--cmd",
+                       "pkill -f '[s]leep 120'; sleep 0.3; "
+                       "pgrep -af '[s]leep 120' >/dev/null && echo STILL_ALIVE "
+                       "|| echo KILLED", "--field", "stdout"], timeout=60)
+        s.check("外部 pkill 收尾（测试环境不留孤儿）", "KILLED" in (p.stdout or ""),
+                repr(p.stdout)[:120])
     else:
-        s.check("log --kill 整组停掉并收敛为 dead", False, "detach 未返回 job_id")
+        s.check("运行中 --cleanup 被拒（job_running, exit 2）", False, "detach 未返回 job_id")
+
+    # v2.2.2 kill 整组：--kill 必须连子进程一起杀（否则 job.sh/sleep 被 reparent 成孤儿）
+    rc, jg, _ = _live_run(["exec", tgt, "--detach", "--cmd",
+                           "sleep 300 # pyaissh_orphan_probe"], timeout=90)
+    gjob = (jg or {}).get("job_id")
+    if gjob:
+        rc, gk, _ = _live_run(["log", tgt, "--job-id", gjob, "--kill", "--wait-rc", "30"],
+                              timeout=120)
+        s.check("--kill 收敛 dead（整组停掉）",
+                bool(gk) and gk.get("status") == "dead" and gk.get("exit_code") is None
+                and gk.get("kill", {}).get("ok") is True and bool(gk.get("pid")),
+                repr(gk)[:220])
+        s.check("kill 后 wait-rc 快速收敛（未等满 30s）",
+                bool(gk) and gk.get("waited_ms", 99999) < 20000, repr(gk)[:160])
+        s.check("dead 状态带 hint 指引", bool(gk) and "job.rc" in (gk.get("hint") or ""),
+                repr(gk.get("hint"))[:120])
+        p = _live_sub(["exec", tgt, "--cmd",
+                       "pgrep -af '[s]leep 300' >/dev/null && echo ORPHAN_ALIVE "
+                       "|| echo NO_ORPHAN", "--field", "stdout"], timeout=60)
+        s.check("--kill 杀掉整组：无孤儿进程", "NO_ORPHAN" in (p.stdout or ""),
+                repr(p.stdout)[:120])
+        _live_run(["log", tgt, "--job-id", gjob, "--cleanup"], timeout=60)
+    else:
+        s.check("--kill 杀掉整组：无孤儿进程", False, "detach 未返回 job_id")
+
+    # v2.2.2 参数校验：--force 只配合 --cleanup
+    rc, jb5, _ = _live_run(["log", tgt, "--job-id", "x", "--force"], timeout=60)
+    s.check("--force 缺 --cleanup → bad_args", bool(jb5) and jb5.get("error") == "bad_args"
+            and rc == 2, repr(jb5)[:160])
 
     # v2.2.1 尾部截断：truncated 时给 --offset 0 顺序读的 next_action
     rc, jt, _ = _live_run(["exec", tgt, "--detach", "--cmd",

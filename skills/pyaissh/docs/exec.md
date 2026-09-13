@@ -64,7 +64,8 @@ python3 pyaissh.py log root@1.2.3.4 --job-id <id> --cleanup                  # �
 - **机制**：作业脚本落远端 `/tmp/pyaissh-jobs/<job_id>/`（`job.sh` = 你的命令原文、`run.sh` = 运行器），`setsid nohup` 启动 → **SSH 断开、宿主单次调用超时都不影响作业**；输出合并进 `job.log`，结束时退出码写入 `job.rc`，进程组 leader pid 写入 `job.pid`
 - **状态机（v2.2.1 三级）**：`finished`（`job.rc` 存在 = 退出码）/ **`dead`**（无 rc 且 `job.pid` 存活探测判定进程已消失——被 kill / OOM / 崩溃，退出码不可知）/ `running`。被 kill 的作业**不再永远 running**，`--wait-rc` 与轮询都能收敛；`dead` 时结果带 `hint` 说明
 - **`log` 载荷字段是 `stdout`**（v2.2.1 起，与 `exec` 对齐；它是 `2>&1` **合并流**，`stream:"stdout+stderr"` 声明）：`pyaissh log h --job-id <id> --field stdout` 直接取裸内容
-- **停掉作业**：`log --job-id <id> --kill` → 读 `job.pid` 对**进程组** `TERM`（setsid 后 pid==pgid）→ 宽限 5s → `KILL`；Linux 上先校验 `/proc/<pid>/cmdline` 确属本作业（防 pid 复用误杀，不匹配即 `kill_failed` 拒绝）。可与 `--wait-rc` 连用（kill 后立刻收敛为 `dead`）
+- **停掉作业**：`log --job-id <id> --kill` → 读 `job.pid` 对**进程组** `TERM`（setsid 后 pid==pgid）→ 宽限 5s → `KILL`；Linux 上先校验 `/proc/<pid>/cmdline` 确属本作业（防 pid 复用误杀，不匹配即 `kill_failed` 拒绝）。可与 `--wait-rc` 连用（kill 后立刻收敛为 `dead`）。**整组杀是必须的**：只杀 `run.sh` 会让 `job.sh` 的子进程被 reparent 成孤儿继续跑
+- **清理守卫（v2.2.2）**：`--cleanup` 只在作业已结束（finished/dead）时执行——作业还在跑时**拒绝**并报 `job_running`（退出码 2），因为删掉 `job.pid`/`job.log` 会让工具**彻底失去追踪**，而远端进程仍在跑（`--list` 也归零）。收尾推荐 `--kill --cleanup`（一步到位：先整组停掉，再清理）；确要放弃追踪用 `--cleanup --force`（照删但留痕：`forced_cleanup:true` + warnings 提示进程可能仍在跑）
 - **落盘权限（v2.2.1 从严）**：目录 0700、`job.sh`/`job.log`/`job.rc`/`job.pid` 0600、`run.sh` 0700（`run.sh` 首行 `umask 077` 管住 shell 创建的文件）——命令原文与完整输出都在盘上，同机其他用户不可读；`exec --detach` 结果里 `permissions` 字段声明这套权限
 - **为什么值得用**：`exec` 前台受**宿主单次调用时长**限制（约 600s，pyaissh 自身可到 1200）；4-5 分钟的更新监控在前台只能结束时一次看到，而 `--detach` + `log --offset` 让"正在发生什么"变成可轮询的小 payload
 - **尾部截断的坑**：`--lines N` 模式下若回传内容又超 `--max-output`，中段会被省略（`truncated:true` + `omitted_bytes`），而此时 `has_more=false`、`next_offset` 指向 EOF——**看起来像"读完了"**。v2.2.1 起这种情况 `next_action` 会明确提示"用 `--offset 0` 顺序读补齐"

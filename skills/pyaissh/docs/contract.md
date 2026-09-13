@@ -42,7 +42,8 @@
 - **增量读语义**：`--offset N` 读 `[N, N+max_output)` 字节并给 `next_offset`——轮询不会重复读同一段（`--field stdout` 或 `--field next_offset` 都很轻）；`--offset` 与 `--lines` 互斥
 - **`--field` 同样适用**：`--field exit_code`、`--field stdout`、`--field next_offset`、`--field jobs`（JSON 序列化）
 - **截断时的 `next_action`**（v2.2，exec 前台输出）：任一流超 `--max-output`（默认 64KB）被截断时，结果直接给"完整输出落盘路径 + 读文件不要重跑"的下一步提示，无需自己拼线索
-- **`log --kill`**（v2.2.1）：读 `job.pid` → 对**进程组**（setsid 后 pid==pgid）`TERM` → 宽限 5s → `KILL`；Linux 上先用 `/proc/<pid>/cmdline` 校验 pid 确属本作业（防 pid 复用误杀），不匹配则拒绝并报 `kill_failed`。与 `--wait-rc` 可同用（kill 后立即收敛为 `dead`）；需 `--job-id`
+- **`log --kill`**（v2.2.1）：读 `job.pid` → 对**进程组**（setsid 后 pid==pgid）`TERM` → 宽限 5s → `KILL`；Linux 上先用 `/proc/<pid>/cmdline` 校验 pid 确属本作业（防 pid 复用误杀），不匹配则拒绝并报 `kill_failed`。与 `--wait-rc` 可同用（kill 后立即收敛为 `dead`）；需 `--job-id`。**整组杀**是必须的：只杀 run.sh 会让 job.sh 的子进程被 reparent 成孤儿继续跑
+- **`--cleanup` 状态守卫**（v2.2.2）：只在作业**已结束**（`finished`/`dead`）时删目录；作业仍 `running` 时**拒绝**并报 `job_running`（退出码 2，附 `pid` 与 `hint`）——删掉 `job.pid`/`job.log` 会让工具彻底失去追踪，而远端进程仍在跑。正路是 `--kill --cleanup`（一步到位）或 `--wait-rc` 后清理；确要放弃追踪用 `--cleanup --force`（照删，但结果带 `forced_cleanup:true` + `warnings` 明示"已失去追踪、进程可能仍在跑"）。`--force` 只允许配合 `--cleanup`（否则 bad_args）
 - **远端落盘与权限**（v2.2.1）：`job.sh`（命令原文）/`job.log`（完整输出）/`job.rc`/`job.pid` 均 **0600**，作业目录与作业根目录 **0700**，`run.sh` 0700（`run.sh` 首行 `umask 077` 保证 shell 创建的日志/rc 也是 0600）
-- **退出码**：`exec --detach` 成功启动 = 0（作业自身的退出码在 `log` 的 `exit_code`）；启动失败 = 255（`detach_failed`）；`log` 读不到作业 = 2（`job_not_found`）；`--kill` 拒绝/失败 = 255（`kill_failed`）
+- **退出码**：`exec --detach` 成功启动 = 0（作业自身的退出码在 `log` 的 `exit_code`）；启动失败 = 255（`detach_failed`）；`log` 读不到作业 = 2（`job_not_found`）、运行中拒绝清理 = 2（`job_running`）；`--kill` 拒绝/失败 = 255（`kill_failed`）
 - **默认契约零变化**：不用 `--field` 时 stdout 恒单行 JSON

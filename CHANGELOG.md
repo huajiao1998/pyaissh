@@ -347,3 +347,23 @@
 - live_exec_field +7（远端权限 0700/0600 实测、log 载荷字段 stdout 且无 content、
   `--kill` 整组停掉并收敛 dead、kill 后 wait-rc 快速收敛（waited_ms < 20s）、dead 带 hint、
   尾读截断给 `--offset 0` 提示、`--offset 0` 顺序读拿全文、`--kill` 缺 job-id 拦截）
+
+## [2.2.2] - 2026-09-13
+
+### 修复：`log --cleanup` 对运行中作业是脚枪（自断追踪 + 留孤儿）
+
+- **现象**：`log --job-id X --cleanup` 在作业仍 `running` 时照删目录（结果里明明写着 status=running）：
+  `job.pid`/`job.log`/`job.rc` 一并消失 → `--list` 归零 → **工具彻底失去对该作业的追踪**，
+  而 `ps` 里 `run.sh`/`job.sh`/子进程仍在跑（只剩人工 pgrep/kill 一条路）
+- **修法**：`--cleanup` 加**状态守卫**——只在作业已结束（`finished`/`dead`）时执行；仍 `running` 时
+  拒绝并报 `job_running`（退出码 2），消息给出 pid、两条正路（`--kill` / `--wait-rc`）与
+  `hint`（`--kill --cleanup` 一步到位）；新增 `--force` 作为唯一的"明知在跑也要删"出口，
+  照删但留痕：结果带 `forced_cleanup:true` + `warnings` 明示"已失去追踪、远端进程可能仍在跑"。
+  `--force` 只允许配合 `--cleanup`（否则 bad_args）
+- **配套澄清（整组杀）**：只杀 `run.sh`（`kill -9 <pid>`）会让 `job.sh` 与它的子进程被 reparent
+  成孤儿继续跑——`--kill` 走**进程组**（setsid 后 pid==pgid，`kill -TERM -<pgid>`）正是为此；
+  本次补真机断言卡住"kill 后无孤儿进程"
+- **测试**：live_exec_field +7（运行中 `--cleanup` 被拒且目录保留、`--cleanup --force` 强制清理且留痕、
+  force 后进程确实仍在跑（代价可见）、外部 pkill 收尾、`--kill` 收敛 dead + 快速收敛 + hint、
+  **`--kill` 后无孤儿进程**（`pgrep -af '[s]leep 300'` 为空）、`--force` 缺 `--cleanup` → bad_args）
+- 真机验证数据（B2）：47/47 PASS

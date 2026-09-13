@@ -1350,8 +1350,27 @@ def _log_read(sftp, client, args, job_dir, conn, start):
     if kill_info is not None:
         result["kill"] = kill_info
     if args.cleanup and paths:
+        # v2.2.2 守卫：作业还在跑就删目录 = 自断追踪（job.pid/job.log 一并没了，--list 归零，
+        # 而 run.sh/job.sh 的子进程仍在远端跑）。默认拒绝，给出两条正路：先停或先等。
+        if status == "running" and not getattr(args, "force", False):
+            emit_error(args.json, "job_running",
+                       "作业仍在运行（pid %s），拒绝 --cleanup：删掉作业目录会让本工具彻底失去"
+                       "追踪（job.pid/job.log/job.rc 都没了），而远端进程仍在跑。"
+                       "先停掉（--kill）或等结束（--wait-rc），再 --cleanup；"
+                       "确要放弃追踪：--cleanup --force" % (pid if pid is not None else "?"),
+                       extra={"job_id": job_id, "pid": pid, "status": status,
+                              "log": log_path,
+                              "hint": "一步到位：pyaissh log <target> --job-id %s --kill --cleanup"
+                                      % (job_id or "<id>")})
+            return None
         result["cleaned_paths"] = _detach_cleanup(sftp, paths)
         result["cleaned"] = True
+        if status == "running":
+            result["forced_cleanup"] = True
+            result["warnings"].append(
+                "作业仍在运行（pid %s）时被强制清理：本工具已失去该作业的追踪，"
+                "远端进程可能仍在跑（要停掉请人工 pgrep/kill 或下次改用 --kill --cleanup）"
+                % (pid if pid is not None else "?"))
     if status == "finished":
         result["next_action"] = ("作业已结束（exit_code=%s）。%s"
                                  % (rc_val, "已清理远端作业目录"
@@ -1412,6 +1431,9 @@ def cmd_log(args):
         return 2
     if args.kill and args.list_jobs:
         emit_error(args.json, "bad_args", "--kill 不与 --list 同用")
+        return 2
+    if args.force and not args.cleanup:
+        emit_error(args.json, "bad_args", "--force 只配合 --cleanup（强制清理运行中的作业目录）")
         return 2
 
     conn, client, conn_ec = _connect_exec(args)

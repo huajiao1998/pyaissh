@@ -45,6 +45,7 @@
 | `ssh_error` | SSH 协商/协议错误（`--strict` 下新主机不在 known_hosts 时常见） | 查看 `message`；`--strict` 场景先确认主机或清理 known_hosts |
 | `detach_failed` | `exec --detach` 启动后台作业失败（退出码 255）：启动命令非零退出，或启动后 0.3s 内进程即死且未写 rc | 消息带日志尾巴定位（命令不可执行/语法错/作业目录不可写）；远端可能残留作业目录，`log --list` 可见或手工删除 |
 | `job_not_found` | `log` 读不到作业日志（退出码 2） | 作业 id 拼错、已被 `--cleanup` 清理，或 `--job-dir` 不一致；用 `log --list` 看现有作业 |
+| `job_running` | `log --cleanup` 时作业**仍在运行**（退出码 2） | 防自断追踪：删掉 `job.pid`/`job.log` 后工具再也看不到该作业，而进程仍在远端跑。正路：`--kill --cleanup`（整组停掉再清理）或 `--wait-rc` 等结束后清理；确要放弃追踪：`--cleanup --force`（留痕 `forced_cleanup`+warnings）|
 | `log_failed` | `log` 读取期错误（退出码 255） | 看 `message`（多为 SFTP 权限/路径问题）；修正后重读 |
 | `kill_failed` | `log --kill` 拒绝或失败（退出码 255） | 看 `message` 与 `reason`：`no_pid`（无 job.pid：作业可能已结束/被清理）、`already_gone`（进程已不在）、`pid_mismatch`（pid 已复用给别的进程——为防误杀而拒绝，需人工确认）、`kill_failed`（TERM 未发出，多为权限）|
 | `internal_error` | 工具内部未预期异常（理论不可达，兜底分支） | 属于 pyaissh 自身缺陷：把 stderr 的 traceback 与复现命令反馈给维护者；可安全重试 |
