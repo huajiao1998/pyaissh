@@ -131,6 +131,14 @@ Full skill docs: `skills/pyaissh/SKILL.md` + `skills/pyaissh/docs/`. Changelog: 
 
 `skills/pyaissh/` is a standard skill package: `SKILL.md` (frontmatter + full docs) + `docs/` + platform entry points + `.env.example`. **Install into your agent**: copy its contents into your agent's skill directory — the skill works regardless of path, any agent that loads `SKILL.md` can use it. You can also grab the **`pyaissh-skill-vX.Y.Z.zip` from [Releases](https://github.com/huajiao1998/pyaissh/releases)** (full skill package, unzip to a `pyaissh/` folder and copy it in).
 
+## MCP 适配层 / MCP adapter (`pyaissh-mcp/`)
+
+给支持 MCP 的智能体（Claude Desktop / Cursor / DSH 等）用：把 pyaissh 暴露为 6 个 MCP 工具——`pyaissh_test` / `exec` / `log` / `ls` / `upload` / `download`。JSON 传参彻底消灭 shell 引号问题；**会话式连接池**（exec/ls/log 复用连接，空闲 300s 自动淘汰）；**后台作业准流式**（`exec(detach=true)` → 循环 `log(offset=next_offset)` → `log(wait_rc)` → `log(kill,cleanup)`，长任务边跑边看）。
+
+它是 pyaissh 的**薄适配层**：进程内直接调用与 CLI 逐字节一致的固定副本（`sync_check.py` 校验），对副本的全部干预只有两个 monkey-patch 点（`connect`/`close_all`），CLI 的超时/截断/错误分类/retryable 契约**零旁路零复制**；不实现任何 CLI 没有的 SSH 逻辑。凭据走同目录 `.env`（由 CLI 每次调用时读取；**不要**写进 MCP 客户端配置的 `env`——那会在 spawn 时把密码放进进程环境）。详见 [`pyaissh-mcp/README.md`](pyaissh-mcp/README.md)。
+
+**Adapter for MCP-capable agents** — exposes pyaissh as 6 MCP tools with JSON arguments (no shell-quoting bugs), a session-scoped connection pool, and quasi-streaming background jobs (`exec(detach=true)` + incremental `log`). It is a **thin adapter**: it calls a byte-identical pinned copy of the CLI in-process (two monkey-patch seams only) and duplicates no SSH logic. Credentials belong in `pyaissh-mcp/.env`, not in the client's `env` block.
+
 ## 工程可信度 / Engineering rigor
 
 每个版本都经**真实服务器**验证（真机执行 + md5 校验 + 中断/超时/信号测试）；v2.0.0 重构经**双机行为一致性对比**（33 用例 JSON 逐字段一致）。验证记录见 `CHANGELOG.md`。

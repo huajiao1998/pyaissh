@@ -1,0 +1,8 @@
+# 本地测试产物与凭据（绝不提交）
+test/local_creds.json
+test/_tmp*/
+__pycache__/
+*.pyc
+
+# pyaissh 凭据体系（.env 由仓库根 .gitignore 同样覆盖，这里双保险）
+.env

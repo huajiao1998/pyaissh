@@ -27,6 +27,11 @@ Thumbs.db
 reasonix.toml
 
 ft_local_tmp/
-pyaissh-mcp/
+# pyaissh-mcp 已入仓；只忽略其本地凭据与测试产物（双保险：目录内另有 .gitignore）
+pyaissh-mcp/.env
+pyaissh-mcp/test/local_creds.json
+pyaissh-mcp/test/_tmp*/
+pyaissh-mcp/__pycache__/
+pyaissh-mcp/test/__pycache__/
 tests/live/.env
 tests/live/_tmp_*
