@@ -751,9 +751,11 @@ JOB_SCRIPT = "job.sh"      # 作业本体（用户命令原文）
 JOB_RUNNER = "run.sh"      # 运行器（跑作业 + 落日志 + 写 rc）
 JOB_LOG_NAME = "job.log"   # 输出日志（stdout+stderr 合并）
 JOB_RC_NAME = "job.rc"     # 退出码文件（存在 = 作业已结束）
+JOB_PID_NAME = "job.pid"   # 进程组 leader pid（setsid 后 pid == pgid == sid，供 --kill / 存活探测）
 JOB_POLL_TICK = 1.0        # --wait-rc 轮询间隔（秒）
 JOB_TAIL_LINES = 100       # 不给 --lines/--offset 时默认回传的尾部行数
 JOB_ERR_TAIL = 2048        # 启动失败时回传的日志尾巴字节数
+JOB_KILL_GRACE = 5         # --kill：TERM 后宽限秒数，超时补 KILL
 
 
 def _sh_quote(s):
@@ -767,13 +769,14 @@ def _job_dir_path(job_dir, job_id):
 
 
 def _job_files(job_dir, job_id):
-    """作业文件路径表：dir / job / run / log / rc。"""
+    """作业文件路径表：dir / job / run / log / rc / pid。"""
     d = _job_dir_path(job_dir, job_id)
     return {"dir": d,
             "job": "%s/%s" % (d, JOB_SCRIPT),
             "run": "%s/%s" % (d, JOB_RUNNER),
             "log": "%s/%s" % (d, JOB_LOG_NAME),
-            "rc": "%s/%s" % (d, JOB_RC_NAME)}
+            "rc": "%s/%s" % (d, JOB_RC_NAME),
+            "pid": "%s/%s" % (d, JOB_PID_NAME)}
 
 
 def _detach_scripts(paths, cmd):
@@ -781,13 +784,17 @@ def _detach_scripts(paths, cmd):
 
     job.sh = 用户命令**原文**（不转义/不拼接：多行脚本天然支持，无二次解析坑）
     run.sh = 跑 job.sh，stdout+stderr 合并进 job.log，随后退出码写入 job.rc
-             （rc 是"作业已结束"的唯一可靠标记；被 kill 则永不出现）
+             （rc 是"作业已结束"的可靠标记；被 kill 则永不出现——此时靠 job.pid
+              的存活探测判定 dead）
+    v2.2.1 起 run.sh 首行 umask 077：job.log/job.rc 由 shell 创建，若按默认 umask
+    会是 0644（同机其他用户可读命令输出/日志），收严到 0600。
     """
     body = cmd if cmd.endswith("\n") else cmd + "\n"
     job_sh = ("#!/bin/bash\n"
               "# pyaissh 后台作业本体（用户命令原文；自动生成，勿手改）\n" + body)
     run_sh = ("#!/bin/bash\n"
               "# pyaissh 后台作业运行器（自动生成，勿手改）\n"
+              "umask 077\n"
               "bash %s > %s 2>&1\n"
               "echo $? > %s\n"
               % (_sh_quote(paths["job"]), _sh_quote(paths["log"]), _sh_quote(paths["rc"])))
@@ -813,7 +820,7 @@ def _sftp_write_bytes(sftp, path, data):
 
 
 def _sftp_read_rc(sftp, rc_path):
-    """读 rc 文件取退出码；文件不存在/内容非法 → None（None = 作业仍在运行）。"""
+    """读 rc 文件取退出码；文件不存在/内容非法 → None（None = 作业未正常结束）。"""
     if not rc_path:
         return None
     try:
@@ -827,10 +834,116 @@ def _sftp_read_rc(sftp, rc_path):
         return None
 
 
+def _sftp_read_pid(sftp, pid_path):
+    """读作业进程组 leader pid；缺失/非法 → None。"""
+    if not pid_path:
+        return None
+    try:
+        with sftp.open(pid_path, "rb") as f:
+            raw = f.read(64)
+    except Exception:
+        return None
+    try:
+        return int(raw.decode("utf-8", errors="replace").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _sftp_chmod(sftp, path, mode):
+    """远端 chmod（尽力而为：不支持/权限不足不报错，不影响主流程）。"""
+    if not path:
+        return
+    try:
+        sftp.chmod(path, mode)
+    except Exception:
+        pass
+
+
+def _pid_alive(client, pid):
+    """远端存活探测（kill -0）。返回 True/False；探测不可用时 None。
+
+    v2.2.1：作业被 kill/OOM/崩溃时 job.rc 永不出现——只认 rc 会让状态机
+    永远停在 running（--wait-rc 轮询不收敛）。存活探测是唯一通用的收敛依据
+    （比"我们自己 kill 时写合成 rc"通用：外部 kill 同样能判死）。
+    """
+    if not pid:
+        return None
+    try:
+        cmd = "kill -0 %d 2>/dev/null && echo pyaissh_alive=1 || echo pyaissh_alive=0" % int(pid)
+        _in, out, _err = client.exec_command(cmd, timeout=10)
+        try:
+            _in.close()
+        except Exception:
+            pass
+        txt = out.read().decode("utf-8", errors="replace")
+        try:
+            out.channel.recv_exit_status()
+        except Exception:
+            pass
+        if "pyaissh_alive=1" in txt:
+            return True
+        if "pyaissh_alive=0" in txt:
+            return False
+        return None
+    except Exception:
+        return None
+
+
+def _alive_map(client, pids):
+    """一次远端调用批量探测多个 pid（--list 场景避免 N 次 exec）。返回 {pid: bool}。"""
+    pids = sorted({int(p) for p in pids if p})
+    if not pids:
+        return {}
+    loop = ("for p in %s; do if kill -0 $p 2>/dev/null; then echo \"$p=1\"; "
+            "else echo \"$p=0\"; fi; done" % " ".join(str(p) for p in pids))
+    out = {}
+    try:
+        _in, so, _err = client.exec_command(loop, timeout=10)
+        try:
+            _in.close()
+        except Exception:
+            pass
+        txt = so.read().decode("utf-8", errors="replace")
+        try:
+            so.channel.recv_exit_status()
+        except Exception:
+            pass
+        for line in txt.splitlines():
+            if "=" in line:
+                k, _, v = line.strip().partition("=")
+                try:
+                    out[int(k)] = (v.strip() == "1")
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    return out
+
+
+def _job_status(sftp, client, files):
+    """作业状态三级判定 → (status, rc_val, pid)。
+
+    finished：job.rc 存在（内容即退出码）
+    dead    ：无 rc 且 pid 已消失（被 kill / OOM / 崩溃——不会再产出 rc）
+    running ：无 rc 且进程仍在（或探测不可用，保守判 running）
+
+    "dead" 的存在意义：让 --wait-rc 与消费端轮询**收敛**——否则被 kill 的作业
+    永远是 running，AI 只能靠超时放弃（v2.2.1 修复）。
+    """
+    files = files or {}
+    rc_val = _sftp_read_rc(sftp, files.get("rc"))
+    pid = _sftp_read_pid(sftp, files.get("pid"))
+    if rc_val is not None:
+        return "finished", rc_val, pid
+    if _pid_alive(client, pid) is False:
+        return "dead", None, pid
+    return "running", None, pid
+
+
 def _detach_cleanup(sftp, paths):
     """删除作业目录及其中文件；返回成功删除的路径列表（尽力而为，不抛错）。"""
     removed = []
-    for key in ("job", "run", "log", "rc"):
+    for key in ("job", "run", "log", "rc", "pid"):
         p = paths.get(key)
         if not p:
             continue
@@ -844,6 +957,75 @@ def _detach_cleanup(sftp, paths):
     except Exception:
         pass
     return removed
+
+
+def _job_kill(client, sftp, files, grace=JOB_KILL_GRACE):
+    """杀掉整个作业进程组：TERM → 宽限 grace 秒 → KILL。
+
+    setsid 起的作业是独立会话/进程组，leader pid == pgid，故用负 pid 整组杀
+    （否则只杀 run.sh，它派生的子进程会变孤儿继续跑）。
+
+    返回 (ok, info_dict)：ok=False 时 info 里有 reason（如无 pid / 进程不在）。
+    pid 校验：pid 文件只在作业目录内、且作业结束后会被读到"不在"，但 pid 复用
+    理论上可能撞上无关进程——Linux 上额外校验 /proc/<pid>/cmdline 是否提到本作业
+    的 run.sh 路径；非 Linux（无 /proc）跳过校验（此时按 pid 直杀，风险由用户知悉）。
+    """
+    pid = _sftp_read_pid(sftp, files.get("pid"))
+    if not pid:
+        return False, {"reason": "no_pid", "message": "没有 job.pid（作业可能已结束或被清理）"}
+    if _pid_alive(client, pid) is False:
+        return False, {"reason": "already_gone", "pid": pid,
+                       "message": "进程 %d 已不存在（作业已结束/被 kill）" % pid}
+    run_path = files.get("run") or ""
+    guard = ("P=%d; "
+             "if [ -r /proc/$P/cmdline ] && ! tr '\\0' ' ' < /proc/$P/cmdline | grep -qF %s; "
+             "then echo pyaissh_kill=mismatch; exit 3; fi; "
+             "kill -TERM -$P 2>/dev/null || kill -TERM $P 2>/dev/null; echo pyaissh_kill=term"
+             % (pid, _sh_quote(run_path)))
+    try:
+        _in, so, se = client.exec_command(guard, timeout=max(10, grace + 5))
+        try:
+            _in.close()
+        except Exception:
+            pass
+        txt = so.read().decode("utf-8", errors="replace")
+        err = se.read().decode("utf-8", errors="replace")
+        try:
+            rc = so.channel.recv_exit_status()
+        except Exception:
+            rc = None
+        if "pyaissh_kill=mismatch" in txt:
+            return False, {"reason": "pid_mismatch", "pid": pid,
+                           "message": "pid %d 的进程与作业脚本不匹配（pid 复用？）——拒绝杀，"
+                                      "请人工确认" % pid}
+        if "pyaissh_kill=term" not in txt:
+            return False, {"reason": "kill_failed", "pid": pid,
+                           "message": "TERM 未发出（rc=%s）：%s" % (rc, (err or txt).strip()[:200])}
+    except Exception as e:
+        return False, {"reason": "kill_failed", "pid": pid, "message": "TERM 失败：%s" % e}
+
+    # 宽限等待：进程消失即算成功；仍在则 KILL
+    deadline = time.time() + max(1, int(grace))
+    while time.time() < deadline:
+        time.sleep(JOB_POLL_TICK)
+        if _pid_alive(client, pid) is False:
+            return True, {"pid": pid, "signal": "TERM", "escalated": False}
+    try:
+        _in, so, _se = client.exec_command(
+            "kill -KILL -%d 2>/dev/null || kill -KILL %d 2>/dev/null; echo done" % (pid, pid),
+            timeout=15)
+        try:
+            _in.close()
+        except Exception:
+            pass
+        so.read()
+        try:
+            so.channel.recv_exit_status()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return True, {"pid": pid, "signal": "KILL", "escalated": True}
 
 
 def _cmd_exec_detach(args):
@@ -886,23 +1068,29 @@ def _cmd_exec_detach(args):
         sftp = open_sftp(client)
         _sftp_mkdirs(sftp, paths["dir"])
         dir_made = True
+        # 权限从严（v2.2.1）：目录 0700、job.sh 0600——命令正文与完整输出都落盘，
+        # 同机其他用户不得读取；job.log/job.rc 由 run.sh 首行 umask 077 保证 0600
+        _sftp_chmod(sftp, job_dir, 0o700)
+        _sftp_chmod(sftp, paths["dir"], 0o700)
         _sftp_write_bytes(sftp, paths["job"], job_sh.encode("utf-8"))
         _sftp_write_bytes(sftp, paths["run"], run_sh.encode("utf-8"))
-        try:
-            sftp.chmod(paths["run"], 0o700)
-        except Exception:
-            pass
-        # 启动：setsid+nohup 完全脱离会话；同一条命令里 sleep 0.3 探一次状态——
+        _sftp_chmod(sftp, paths["job"], 0o600)
+        _sftp_chmod(sftp, paths["run"], 0o700)
+        # 启动：setsid+nohup 完全脱离会话；同一条命令里落 pid、sleep 0.3 探一次状态——
         # 短作业直接给 finished+exit_code，长作业给 running，立即死掉给 dead
+        # （umask 077：这里创建的 job.pid 也是 0600）
         launch = (
+            "umask 077\n"
             "setsid nohup bash %s >/dev/null 2>&1 </dev/null &\n"
             "P=$!\n"
+            "echo \"$P\" > %s\n"
             "sleep 0.3\n"
             "if [ -f %s ]; then echo \"pyaissh_rc=$(cat %s)\";\n"
             "elif kill -0 $P 2>/dev/null; then echo pyaissh_state=running;\n"
             "else echo pyaissh_state=dead; fi\n"
             "echo \"pyaissh_pid=$P\"\n"
-            % (_sh_quote(paths["run"]), _sh_quote(paths["rc"]), _sh_quote(paths["rc"]))
+            % (_sh_quote(paths["run"]), _sh_quote(paths["pid"]),
+               _sh_quote(paths["rc"]), _sh_quote(paths["rc"]))
         )
         stdin, stdout, stderr = client.exec_command(launch, timeout=args.exec_timeout)
         try:
@@ -955,12 +1143,15 @@ def _cmd_exec_detach(args):
             "job_dir": paths["dir"],
             "log": paths["log"],
             "rc": paths["rc"],
+            "pid_file": paths["pid"],
             "host": conn["host"],
             "user": conn["user"],
             "port": conn["port"],
             "cmd": cmd_echo,
             "cmd_truncated": cmd_cut,
             "cmd_written_to": paths["job"],
+            "permissions": {"job_dir": "0700", "job.sh": "0600", "run.sh": "0700",
+                            "job.log": "0600", "job.rc": "0600", "job.pid": "0600"},
             "warnings": warnings,
             "duration_ms": int((time.time() - start) * 1000),
         }
@@ -968,13 +1159,13 @@ def _cmd_exec_detach(args):
             result["exit_code"] = rc_val
             result["exit_success"] = rc_val == 0
             result["next_action"] = (
-                "作业已结束（exit_code=%d）。用 pyaissh log %s --job-id %s 读日志；"
+                "作业已结束（exit_code=%d）。用 pyaissh log %s --job-id %s 读日志（载荷字段 stdout）；"
                 "--cleanup 清理远端作业目录" % (rc_val, target_hint, job_id))
         else:
             result["next_action"] = (
                 "作业在远端后台运行（SSH 断开不影响）。读日志：pyaissh log %s --job-id %s"
-                "（增量：--offset <next_offset>）；等结束拿退出码：--wait-rc 300；"
-                "清理：--cleanup" % (target_hint, job_id))
+                "（载荷字段 stdout；增量：--offset <next_offset>）；等结束拿退出码：--wait-rc 30；"
+                "停掉：--kill；清理：--cleanup" % (target_hint, job_id))
         header = "[DETACHED %s] job_id=%s pid=%s log=%s" % (
             status, job_id, pid if pid is not None else "?", paths["log"])
         _emit_result(args, result, header=header)
@@ -994,13 +1185,18 @@ def _cmd_exec_detach(args):
         close_all(client)
 
 
-def _log_list(sftp, job_dir, args, start):
-    """列出作业目录下的所有作业（状态/日志大小/退出码/时间）。"""
+def _log_list(sftp, client, job_dir, args, start):
+    """列出作业目录下的所有作业（状态/日志大小/退出码/时间）。
+
+    状态三级（v2.2.1）：finished（有 rc）/ dead（无 rc 且进程已消失）/ running；
+    无 rc 的条目会做一次批量存活探测（单条 exec，避免 N 次往返）。
+    """
     jobs = []
     try:
         attrs = sftp.listdir_attr(job_dir)
     except Exception:
         attrs = []
+    pending = []           # 无 rc 的作业：待批量存活探测
     for a in attrs:
         try:
             if not stat.S_ISDIR(a.st_mode):
@@ -1009,14 +1205,26 @@ def _log_list(sftp, job_dir, args, start):
             continue
         d = "%s/%s" % (str(job_dir).rstrip("/"), a.filename)
         log_p, rc_p = "%s/%s" % (d, JOB_LOG_NAME), "%s/%s" % (d, JOB_RC_NAME)
+        pid_p = "%s/%s" % (d, JOB_PID_NAME)
         try:
             log_bytes = sftp.stat(log_p).st_size
         except Exception:
             log_bytes = None
         rc_val = _sftp_read_rc(sftp, rc_p)
-        jobs.append({"job_id": a.filename, "log": log_p, "log_bytes": log_bytes,
-                     "status": "finished" if rc_val is not None else "running",
-                     "exit_code": rc_val, "mtime": int(getattr(a, "st_mtime", 0))})
+        entry = {"job_id": a.filename, "log": log_p, "log_bytes": log_bytes,
+                 "status": "finished" if rc_val is not None else "running",
+                 "exit_code": rc_val, "mtime": int(getattr(a, "st_mtime", 0))}
+        if rc_val is None:
+            entry["_pid"] = _sftp_read_pid(sftp, pid_p)
+            pending.append(entry)
+        jobs.append(entry)
+    if pending:
+        # 一次 exec 批量探测（list 可能几十条，逐个 exec 太贵）
+        amap = _alive_map(client, [e.get("_pid") for e in pending])
+        for e in pending:
+            pid = e.pop("_pid", None)
+            if pid and amap.get(pid) is False:
+                e["status"] = "dead"     # 无 rc 且进程已消失：被 kill / OOM / 崩溃
     jobs.sort(key=lambda e: e["mtime"], reverse=True)
     result = {"ok": True, "action": "log", "version": VERSION,
               "job_dir": job_dir, "count": len(jobs),
@@ -1027,34 +1235,61 @@ def _log_list(sftp, job_dir, args, start):
     return result
 
 
-def _log_read(sftp, args, job_dir, conn, start):
-    """读单个作业日志：--offset 增量 / 默认尾部 N 行；带结束状态与清理。
+def _log_read(sftp, client, args, job_dir, conn, start):
+    """读单个作业日志：--offset 增量 / 默认尾部 N 行；带结束状态、--kill 与清理。
 
     返回结果 dict；读不到日志时 emit_error 并返回 None（调用方返回 2）。
+
+    v2.2.1 两处语义修订：
+    - 载荷字段 `content` → **`stdout`**（与 exec 的 stdout/stderr 命名一致，
+      消费端不用猜；合并流用 `stream: "stdout+stderr"` 声明）
+    - 状态三级：finished（有 rc）/ **dead**（无 rc 且进程已消失）/ running
+      ——被 kill 的作业不再永远 running，--wait-rc 与轮询都能收敛
     """
     paths = _job_files(job_dir, args.job_id) if args.job_id else None
     if args.path:
         log_path = _normalize_remote_path(sftp, args.path)
         d = log_path.rsplit("/", 1)[0] if "/" in log_path else "."
-        rc_path = ("%s/%s" % (d, JOB_RC_NAME)) if log_path.endswith("/" + JOB_LOG_NAME) else None
+        if log_path.endswith("/" + JOB_LOG_NAME):
+            rc_path = "%s/%s" % (d, JOB_RC_NAME)
+            pid_path = "%s/%s" % (d, JOB_PID_NAME)
+        else:
+            rc_path = pid_path = None
         job_id = args.job_id or (d.rsplit("/", 1)[-1] if rc_path else None)
         job_dir_out = d
+        files = {"dir": d, "log": log_path, "rc": rc_path, "pid": pid_path}
     else:
-        log_path, rc_path, job_id = paths["log"], paths["rc"], args.job_id
-        job_dir_out = paths["dir"]
+        log_path, job_id = paths["log"], args.job_id
+        job_dir_out, files = paths["dir"], paths
+        rc_path, pid_path = paths["rc"], paths["pid"]
 
-    # --wait-rc：轮询到 rc 出现（作业结束）或超时；期间响应中断
-    rc_val = _sftp_read_rc(sftp, rc_path)
+    # --kill：先整组停掉（TERM → 宽限 → KILL），随后照常读状态/等收敛
+    kill_info = None
+    if getattr(args, "kill", False):
+        if not paths:
+            emit_error(args.json, "bad_args", "--kill 需配合 --job-id（要靠作业目录里的 job.pid）")
+            return None
+        ok, info = _job_kill(client, sftp, paths)
+        kill_info = dict(info)
+        kill_info["ok"] = ok
+        if not ok and info.get("reason") not in ("already_gone",):
+            emit_error(args.json, "kill_failed", info.get("message") or "杀作业失败",
+                       extra={"job_id": job_id, "pid": info.get("pid"),
+                              "reason": info.get("reason")})
+            return None
+
+    # --wait-rc：轮询到状态不再是 running（rc 出现 或 进程消失）或超时
+    status, rc_val, pid = _job_status(sftp, client, files)
     waited_ms = 0
-    if args.wait_rc and rc_val is None:
+    if args.wait_rc and status == "running":
         t0 = time.time()
         deadline = t0 + args.wait_rc
         while time.time() < deadline:
             if _SIGTERM_RECEIVED:
                 raise KeyboardInterrupt("SIGTERM")
             time.sleep(JOB_POLL_TICK)
-            rc_val = _sftp_read_rc(sftp, rc_path)
-            if rc_val is not None:
+            status, rc_val, pid = _job_status(sftp, client, files)
+            if status != "running":
                 break
         waited_ms = int((time.time() - t0) * 1000)
 
@@ -1095,14 +1330,15 @@ def _log_read(sftp, args, job_dir, conn, start):
         next_offset = size
 
     cut, truncated, omitted = _truncate_output(content_raw, args.max_output, "log")
-    status = "finished" if rc_val is not None else "running"
     result = {
         "ok": True, "action": "log", "version": VERSION,
-        "job_id": job_id, "log": log_path, "rc": rc_path, "status": status,
+        "job_id": job_id, "log": log_path, "rc": rc_path, "pid_file": pid_path,
+        "pid": pid, "status": status,
         "exit_code": rc_val,
         "exit_success": (rc_val == 0) if rc_val is not None else None,
         "log_bytes": size,
-        "content": cut.decode(args.encoding, errors="replace"),
+        "stdout": cut.decode(args.encoding, errors="replace"),
+        "stream": "stdout+stderr",     # job.log 是 2>&1 合并流，别误以为只有 stdout
         "bytes_returned": len(cut),
         "next_offset": next_offset, "has_more": has_more,
         "tail_window_truncated": tail_window_cut,
@@ -1111,6 +1347,8 @@ def _log_read(sftp, args, job_dir, conn, start):
         "host": conn["host"], "user": conn["user"], "port": conn["port"],
         "warnings": [], "duration_ms": int((time.time() - start) * 1000),
     }
+    if kill_info is not None:
+        result["kill"] = kill_info
     if args.cleanup and paths:
         result["cleaned_paths"] = _detach_cleanup(sftp, paths)
         result["cleaned"] = True
@@ -1119,10 +1357,21 @@ def _log_read(sftp, args, job_dir, conn, start):
                                  % (rc_val, "已清理远端作业目录"
                                     if result.get("cleaned") else
                                     "如需清理：加 --cleanup"))
+    elif status == "dead":
+        result["hint"] = ("无 job.rc 且进程已消失（被 kill / OOM / 崩溃）：退出码不可知，"
+                          "状态机按 dead 收敛，不要再用 --wait-rc 等")
+        result["next_action"] = ("作业已死（无退出码）。看日志尾部确认原因；%s"
+                                 % ("已清理远端作业目录" if result.get("cleaned")
+                                    else "清理：加 --cleanup"))
     else:
         result["next_action"] = ("作业仍在运行。继续增量读：--offset %s（或稍后重读）；"
-                                 "等结束拿退出码：--wait-rc 300"
+                                 "等结束：--wait-rc 30；停掉：--kill"
                                  % (next_offset if next_offset is not None else 0))
+    if truncated and args.offset is None:
+        # 尾部模式被 _truncate_output 截中段：has_more=false + next_offset=EOF 会让人
+        # 以为"读完了"，其实中段缺失（省略 omitted 字节）——明确给出补齐路径
+        result["next_action"] = ("内容被截断（省略 %d 字节）；完整读取请用 --offset 0 顺序读"
+                                 "（按 next_offset 续读）。" % omitted) + result["next_action"]
     return result
 
 
@@ -1158,6 +1407,12 @@ def cmd_log(args):
     if args.cleanup and args.wait_rc:
         emit_error(args.json, "bad_args", "--cleanup 与 --wait-rc 互斥（先等结束再清理，分两次调用）")
         return 2
+    if args.kill and not args.job_id:
+        emit_error(args.json, "bad_args", "--kill 需配合 --job-id（要靠作业目录里的 job.pid 整组停掉）")
+        return 2
+    if args.kill and args.list_jobs:
+        emit_error(args.json, "bad_args", "--kill 不与 --list 同用")
+        return 2
 
     conn, client, conn_ec = _connect_exec(args)
     if conn_ec is not None:
@@ -1165,17 +1420,18 @@ def cmd_log(args):
     try:
         sftp = open_sftp(client)
         if args.list_jobs:
-            result = _log_list(sftp, job_dir, args, start)
+            result = _log_list(sftp, client, job_dir, args, start)
             _emit_result(args, result, header="[JOBS] %d in %s" % (result["count"], job_dir))
             return 0
-        result = _log_read(sftp, args, job_dir, conn, start)
+        result = _log_read(sftp, client, args, job_dir, conn, start)
         if result is None:
             return 2
         head = ("[FINISHED exit_code=%s]" % result["exit_code"]
-                if result["status"] == "finished" else "[RUNNING]")
+                if result["status"] == "finished" else
+                "[DEAD 无退出码]" if result["status"] == "dead" else "[RUNNING]")
         _emit_result(args, result, header="%s job_id=%s log=%s"
                      % (head, result.get("job_id"), result["log"]),
-                     sections=[("LOG", result["content"])])
+                     sections=[("LOG", result["stdout"])])
         return 0
     except KeyboardInterrupt:
         emit_error(args.json, "interrupted", _interrupt_msg())

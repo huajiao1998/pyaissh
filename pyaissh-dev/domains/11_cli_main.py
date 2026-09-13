@@ -177,7 +177,8 @@ def build_parser():
       stdout_bytes(原始接收字节)、stdout_truncated(该流是否截断，省略量见
       stdout_omitted_bytes)；截断时完整输出落盘，路径见 stdout_spill_file
       （并有 next_action 直接告诉你下一步）；exec --detach 返回 job_id/log/rc，
-      log 返回 content/next_offset/status/exit_code（增量轮询不重复读）；
+      log 返回 stdout（合并流，与 exec 的 stdout 命名一致）/next_offset/status/exit_code
+      （status 三级：finished/running/dead——被 kill 的作业也能收敛，不再永久 running）；
       upload/download 的 bytes=清单总大小、
       bytes_transferred=实际传输；ls 的 entries 含 mode/mtime(epoch 秒,UTC)/is_symlink
 特性: 传输零 token 消耗——upload/download 的文件内容从不回传 JSON，AI 只消费
@@ -303,10 +304,20 @@ def build_parser():
   pyaissh log h --job-id 20260911-120000-1234            # 尾部 100 行
   pyaissh log h --job-id <id> --offset 0                 # 从头增量读（返回 next_offset）
   pyaissh log h --job-id <id> --offset <next_offset>     # 接着上次读（轮询不重复）
-  pyaissh log h --job-id <id> --wait-rc 300              # 等结束（≤600s）并拿退出码
+  pyaissh log h --job-id <id> --wait-rc 30               # 等结束（≤600s）并拿退出码
+  pyaissh log h --job-id <id> --kill                     # 整组停掉（TERM→宽限 5s→KILL）
   pyaissh log h --job-id <id> --cleanup                  # 清理远端作业目录
 
-状态判定: 看 rc 文件是否存在（存在=finished，内容即退出码）；被 kill 的作业永无 rc，恒 running
+载荷字段（别猜错，v2.2.1 起与 exec 对齐）:
+  stdout       日志内容（**合并流**：job.log 是 2>&1，stdout 与 stderr 都在这；stream 字段声明）
+  next_offset  下次增量读的字节偏移；has_more 之后是否还有未读字节
+  status       finished（有 job.rc，退出码见 exit_code）/ running / **dead**（无 rc 且进程已消失）
+  --list 的载荷是 jobs[]（job_id/status/log_bytes/exit_code/mtime）
+
+状态与收敛:
+  finished = job.rc 存在（内容即退出码）；被 kill/OOM/崩溃的作业永不产出 rc，
+  此时由 job.pid 的存活探测判定 **dead** —— 所以 --wait-rc 不会永久卡在 running。
+  truncated=true 且非 --offset 模式时，中段被省略（omitted_bytes）→ 用 --offset 0 顺序读补齐
 """)
     add_conn(p)
     p.add_argument("--job-id", dest="job_id",
@@ -320,8 +331,12 @@ def build_parser():
     p.add_argument("--offset", type=_nonneg_int,
                    help="从该字节偏移增量读（配返回的 next_offset 轮询；与 --lines 互斥）")
     p.add_argument("--wait-rc", dest="wait_rc", type=_positive_int,
-                   help="阻塞等待作业结束（rc 出现）最多 N 秒（上限 %d），出现即返回退出码"
+                   help="阻塞等待作业结束（rc 出现或进程消失）最多 N 秒（上限 %d），收敛即返回"
                         % JOB_WAIT_MAX)
+    p.add_argument("--kill", action="store_true",
+                   help="整组停掉作业（读 job.pid → 对进程组 TERM → 宽限 %ds → KILL）："
+                        "被 kill 的作业随后判定为 dead（无退出码），状态机可收敛；需 --job-id"
+                        % JOB_KILL_GRACE)
     p.add_argument("--cleanup", action="store_true",
                    help="读完后删除远端作业目录（job.sh/run.sh/job.log/job.rc）；需 --job-id")
     p.add_argument("--limit", type=_positive_int, default=50, help="--list 最多返回条数（默认 50）")

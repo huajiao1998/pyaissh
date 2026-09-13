@@ -141,3 +141,16 @@
   `--list` 可用 → detach+sudo 互斥 / log 缺 job-id / job-id 穿越 三处 bad_args
 ### 变更
 - 例数不再写死在描述里（沿用 v2.1.4 去数字化约定）
+
+## [2026-09-13] v2.2.1 后台作业反馈修复（字段名/权限/kill 收敛/截断提示）
+
+### 新增用例
+- unit_regression +1：`run.sh` 含 `umask 077`；`_job_files` 含 `job.pid`
+- live_exec_field +7：远端作业权限实测（dir 700 / job.sh·job.log·job.rc·job.pid 600 / run.sh 700，
+  用 `stat -c` 经 `--field stdout` 取裸输出）；log 载荷为 `stdout` 且 `content` 已移除、
+  `stream=stdout+stderr`；`log --kill --wait-rc` 收敛为 `dead` 且 `waited_ms < 20s`（不再等满超时）；
+  `dead` 带 `hint`；尾读截断（`--lines 5000 --max-output 2000`）给 `--offset 0` 提示；
+  `--offset 0` 顺序读拿到全文尾部；`--kill` 缺 `--job-id` → bad_args
+### 说明
+- 两条最初写成 FAIL 的用例是**测试自身写法错误**（用了 `_live_run` 取 `--field` 裸输出→拿到 None；
+  小 `--lines` 时回传内容本身就小、不会触发截断）——产品行为经手工复核正确后修正测试

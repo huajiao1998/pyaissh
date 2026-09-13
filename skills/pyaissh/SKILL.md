@@ -67,12 +67,15 @@ python3 pyaissh.py exec root@1.2.3.4 --detach --cmd 'apt install -y nginx'   # �
 python3 pyaissh.py log  root@1.2.3.4 --list                                  # 列作业（状态/大小/退出码）
 python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --offset 0                # 增量读（返回 next_offset）
 python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --offset <next_offset>    # 接着读，不重复
-python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --wait-rc 300             # 等结束拿 exit_code
-python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --cleanup                 # 清理远端作业目录
+python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --wait-rc 30                    # 等结束拿 exit_code
+python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --kill                        # 整组停掉（TERM→KILL）
+python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --cleanup                     # 清理远端作业目录
 ```
-- **为什么用**：`exec` 前台受宿主单次调用时长限制（约 600s，pyaissh 自身可到 1200）；`--detach` 把作业丢到远端 `setsid+nohup` 后台（SSH 断开照跑），日志/退出码落 `/tmp/pyaissh-jobs/<job_id>/{job.log,job.rc}`，AI 用 `log` 轮询增量读——分钟级任务的"正在进行中"变得可见
-- **状态判定**：`job.rc` 存在 = 作业结束（内容即退出码，`status: finished`）；被 kill 的作业永无 rc（`status` 恒 `running`）
-- **与 `--sudo`/`--pty` 互斥**（bad_args）；作业命令原文会落远端 `job.sh`（别写明文凭据，用完 `--cleanup`）
+- **为什么用**：`exec` 前台受宿主单次调用时长限制（约 600s，pyaissh 自身可到 1200）；`--detach` 把作业丢到远端 `setsid+nohup` 后台（SSH 断开照跑），日志/退出码/pid 落 `/tmp/pyaissh-jobs/<job_id>/{job.log,job.rc,job.pid}`，AI 用 `log` 轮询增量读——分钟级任务的"正在进行中"变得可见
+- **载荷字段是 `stdout`**（v2.2.1 起与 exec 对齐，`--field stdout` 取裸内容；它是 `2>&1` 合并流）
+- **状态三级**：`finished`（有 job.rc = 退出码）/ `dead`（无 rc 且进程已消失：被 kill/OOM/崩溃，带 `hint`）/ `running`——被 kill 的作业不再永远 running，`--wait-rc` 能收敛；要主动停用 `--kill`
+- **落盘权限**：目录 0700、job.sh/job.log/job.rc/job.pid 0600（命令原文与输出都在盘上，同机他人不可读）
+- **与 `--sudo`/`--pty` 互斥**（bad_args）；命令原文会落远端 `job.sh`（别写明文凭据，用完 `--cleanup`）
 
 ### ls — 列远程目录
 ```bash

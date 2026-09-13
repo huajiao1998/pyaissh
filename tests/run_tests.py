@@ -274,13 +274,15 @@ def suite_unit_regression(s):
     s.check("默认 max-output 64KB（防宿主裁中段）", m.DEFAULT_MAX_OUTPUT == 65536,
             "got %r" % m.DEFAULT_MAX_OUTPUT)
     paths = m._job_files("/tmp/pyaissh-jobs", "j1")
-    s.check("job 路径表", paths["log"].endswith("/job.log") and paths["rc"].endswith("/job.rc")
+    s.check("job 路径表（含 job.pid）", paths["log"].endswith("/job.log")
+            and paths["rc"].endswith("/job.rc") and paths["pid"].endswith("/job.pid")
             and paths["dir"] == "/tmp/pyaissh-jobs/j1", repr(paths))
     tricky = "echo a'b\nls -l \"$HOME\"\nexit 3"
     job_sh, run_sh = m._detach_scripts(paths, tricky)
     s.check("job.sh 保留命令原文", tricky in job_sh and job_sh.startswith("#!/bin/bash"))
     s.check("run.sh 落日志+写 rc", ("bash " in run_sh and paths["log"] in run_sh
                                     and paths["rc"] in run_sh and "echo $?" in run_sh), run_sh)
+    s.check("run.sh 收严 umask（job.log/job.rc 0600）", "umask 077" in run_sh, run_sh)
     # 单引号路径注入防护：路径只做 POSIX 单引号转义后进 run.sh
     odd = m._job_files("/tmp/it's dir", "j2")
     _j2, run2 = m._detach_scripts(odd, "true")
@@ -617,15 +619,35 @@ def suite_live_exec_field(s):
     rc, j, _ = _live_run(["exec", tgt, "--detach", "--cmd", "sleep 2; echo detach_hi; exit 5"],
                          timeout=90)
     jid = (j or {}).get("job_id")
-    s.check("detach 启动返回 job_id/log/rc",
+    s.check("detach 启动返回 job_id/log/rc/pid_file",
             bool(j) and j.get("detached") is True and bool(jid)
-            and j.get("log", "").endswith("/job.log") and j.get("rc", "").endswith("/job.rc"),
-            repr(j)[:200])
+            and j.get("log", "").endswith("/job.log") and j.get("rc", "").endswith("/job.rc")
+            and j.get("pid_file", "").endswith("/job.pid"), repr(j)[:200])
     if jid:
         rc, j2, _ = _live_run(["log", tgt, "--job-id", jid, "--wait-rc", "30"], timeout=90)
-        s.check("log --wait-rc 拿退出码", bool(j2) and j2.get("status") == "finished"
-                and j2.get("exit_code") == 5 and "detach_hi" in j2.get("content", ""),
-                repr(j2)[:200])
+        s.check("log --wait-rc 拿退出码（载荷字段 stdout，无 content）",
+                bool(j2) and j2.get("status") == "finished" and j2.get("exit_code") == 5
+                and "detach_hi" in j2.get("stdout", "") and j2.get("stream") == "stdout+stderr"
+                and "content" not in j2, repr(j2)[:200])
+        # v2.2.1 权限从严：目录 0700、job.sh 0600、job.log/job.rc 0600、run.sh 0700
+        # （作业已结束，job.rc 一定存在；用 _live_sub 取 --field 的裸 stdout）
+        p = _live_sub(["exec", tgt, "--cmd",
+                       "stat -c '%%a %%n' %s %s %s %s %s %s"
+                       % (j.get("job_dir"), j.get("cmd_written_to"),
+                          j.get("job_dir", "") + "/run.sh", j.get("log"), j.get("rc"),
+                          j.get("job_dir", "") + "/job.pid"),
+                       "--field", "stdout"], timeout=60)
+        modes = {}
+        for ln in (p.stdout or "").splitlines():
+            parts = ln.split()
+            if len(parts) == 2:
+                modes[parts[1].rsplit("/", 1)[-1]] = parts[0]
+        dname = j.get("job_dir", "").rsplit("/", 1)[-1]
+        s.check("远端作业权限 0700/0600 从严",
+                modes.get(dname) == "700" and modes.get("job.sh") == "600"
+                and modes.get("run.sh") == "700" and modes.get("job.log") == "600"
+                and modes.get("job.rc") == "600" and modes.get("job.pid") == "600",
+                repr(modes))
         # 增量读：--offset 0 → next_offset 递增，两段拼起来是全文
         rc, j3, _ = _live_run(["log", tgt, "--job-id", jid, "--offset", "0"], timeout=60)
         s.check("log --offset 增量读", bool(j3) and j3.get("next_offset", 0) > 0
@@ -633,8 +655,8 @@ def suite_live_exec_field(s):
         rc, j4, _ = _live_run(["log", tgt, "--job-id", jid, "--offset",
                                str(j3.get("next_offset", 0))], timeout=60)
         s.check("log 续读不重复", bool(j4)
-                and (j3.get("content", "") + j4.get("content", "")).count("detach_hi") == 1,
-                "first=%r second=%r" % (j3.get("content"), j4.get("content")))
+                and (j3.get("stdout", "") + j4.get("stdout", "")).count("detach_hi") == 1,
+                "first=%r second=%r" % (j3.get("stdout"), j4.get("stdout")))
         rc, j5, _ = _live_run(["log", tgt, "--job-id", jid, "--cleanup"], timeout=60)
         s.check("log --cleanup 清理", bool(j5) and j5.get("cleaned") is True)
         rc, j6, _ = _live_run(["log", tgt, "--job-id", jid], timeout=60)
@@ -642,6 +664,45 @@ def suite_live_exec_field(s):
     rc, jl, _ = _live_run(["log", tgt, "--list"], timeout=60)
     s.check("log --list 可用", bool(jl) and jl.get("ok") is True
             and isinstance(jl.get("jobs"), list) and "job_dir" in jl, repr(jl)[:160])
+
+    # v2.2.1 kill：长作业整组停掉 → 状态收敛为 dead（不再永久 running）
+    rc, jk, _ = _live_run(["exec", tgt, "--detach", "--cmd", "sleep 120"], timeout=90)
+    kjob = (jk or {}).get("job_id")
+    if kjob:
+        rc, kk, _ = _live_run(["log", tgt, "--job-id", kjob, "--kill", "--wait-rc", "30"],
+                              timeout=120)
+        s.check("log --kill 整组停掉并收敛为 dead",
+                bool(kk) and kk.get("status") == "dead" and kk.get("exit_code") is None
+                and kk.get("kill", {}).get("ok") is True and kk.get("pid"), repr(kk)[:220])
+        s.check("kill 后 wait-rc 快速收敛（未等满 30s）",
+                bool(kk) and kk.get("waited_ms", 99999) < 20000, repr(kk)[:160])
+        s.check("dead 状态带 hint 指引", bool(kk) and "job.rc" in (kk.get("hint") or ""),
+                repr(kk.get("hint"))[:120])
+        _live_run(["log", tgt, "--job-id", kjob, "--cleanup"], timeout=60)
+    else:
+        s.check("log --kill 整组停掉并收敛为 dead", False, "detach 未返回 job_id")
+
+    # v2.2.1 尾部截断：truncated 时给 --offset 0 顺序读的 next_action
+    rc, jt, _ = _live_run(["exec", tgt, "--detach", "--cmd",
+                           "seq 1 3000"], timeout=90)
+    tjob = (jt or {}).get("job_id")
+    if tjob:
+        _live_run(["log", tgt, "--job-id", tjob, "--wait-rc", "20"], timeout=60)
+        # 触发尾读截断：回传内容必须大于 --max-output（--lines 5000 会把全文纳入，
+        # 再被 --max-output 2000 截中段）——小 --lines 时内容本身就小，不会截断
+        rc, tt, _ = _live_run(["log", tgt, "--job-id", tjob, "--lines", "5000",
+                               "--max-output", "2000"], timeout=60)
+        s.check("尾读截断给 --offset 0 补齐提示",
+                bool(tt) and tt.get("truncated") is True and tt.get("omitted_bytes", 0) > 0
+                and "--offset 0" in (tt.get("next_action") or ""), repr(tt)[:220])
+        rc, t2, _ = _live_run(["log", tgt, "--job-id", tjob, "--offset", "0",
+                               "--max-output", "65536"], timeout=60)
+        s.check("--offset 0 顺序读拿到全文尾部标记", bool(t2) and "3000" in t2.get("stdout", ""),
+                repr(t2)[:160])
+        _live_run(["log", tgt, "--job-id", tjob, "--cleanup"], timeout=60)
+    else:
+        s.check("尾读截断给 --offset 0 补齐提示", False, "detach 未返回 job_id")
+
     # 互斥与校验
     rc, jb, _ = _live_run(["exec", tgt, "--detach", "--sudo", "--cmd", "id"], timeout=60)
     s.check("detach+sudo 互斥", bool(jb) and jb.get("error") == "bad_args" and rc == 2)
@@ -649,6 +710,8 @@ def suite_live_exec_field(s):
     s.check("log 缺 --job-id", bool(jb2) and jb2.get("error") == "bad_args" and rc == 2)
     rc, jb3, _ = _live_run(["log", tgt, "--job-id", "../etc"], timeout=60)
     s.check("log job-id 穿越拦截", bool(jb3) and jb3.get("error") == "bad_args" and rc == 2)
+    rc, jb4, _ = _live_run(["log", tgt, "--kill"], timeout=60)
+    s.check("--kill 缺 job-id 拦截", bool(jb4) and jb4.get("error") == "bad_args" and rc == 2)
 
 
 # ============================================================

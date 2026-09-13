@@ -313,3 +313,37 @@
 ### 测试
 - unit_regression +8（作业脚本生成/单引号转义/job-id 穿越拦截/默认 64KB）；live_exec_field +10
   （detach 启动→wait-rc 拿退出码→增量读不重复→cleanup→清理后 job_not_found→--list→互斥校验）
+
+## [2.2.1] - 2026-09-13
+
+> 针对 v2.2.0 后台作业（--detach/log）的使用反馈修复四项 + 新增 --kill。v2.2.0 未发布，
+> 本版即后台作业的首次发布形态（可只发 2.2.1）。
+
+### 修复
+- **log 载荷字段 content → stdout**（与 exec 的 stdout 命名对齐，消费端不再猜错字段）：
+  旧名移除；新增 `stream:"stdout+stderr"` 声明它是 2>&1 **合并流**；`log --help` 明确列出
+  载荷字段名（此前 help 只列了 omitted_bytes 之类的元数据，AI 按 stdout 解析连续拿到 null）
+- **远端落盘权限从严**：作业目录与作业根目录 0700、`job.sh`(命令原文)/`job.log`/`job.rc`/
+  `job.pid` 0600、`run.sh` 0700（此前只有 run.sh 是 0700，job.sh 0644、目录 0755——同机其他
+  用户可读到命令正文与完整输出）；`run.sh` 首行加 `umask 077` 管住 shell 创建的文件；
+  detach 结果新增 `permissions` 字段声明这套权限
+- **kill 语义收敛**：新增 `job.pid` 落盘 + 存活探测（`kill -0`），状态机由二级
+  （finished/running）改为**三级（finished/dead/running）**——被 kill/OOM/崩溃的作业不再
+  永久 running，`--wait-rc` 以"状态不再是 running"为收敛条件（此前只能等满超时）；
+  `dead` 时带 `hint` 说明"无退出码、退出码不可知"
+- **尾部截断提示**：`--lines` 模式回传内容又被 `--max-output` 截中段时（`truncated:true` +
+  `omitted_bytes` 但 `has_more:false`/`next_offset`=EOF，看着像读完了）→ `next_action`
+  明确提示"用 `--offset 0` 顺序读补齐"
+
+### 新增
+- **`log --kill`**：读 `job.pid` 对**进程组**（setsid 后 pid==pgid）`TERM` → 宽限 5s → `KILL`；
+  Linux 上先校验 `/proc/<pid>/cmdline` 确属本作业（防 pid 复用误杀，不匹配则拒绝）；
+  可与 `--wait-rc` 连用（kill 后立即收敛 dead）；新错误类型 `kill_failed`（255，带 reason：
+  no_pid/already_gone/pid_mismatch/kill_failed）
+- **`log --list` 状态也三级**：无 rc 的条目做一次批量存活探测（单条 exec，避免 N 次往返），dead 可见
+
+### 测试
+- unit_regression +1（run.sh umask 077；job 路径表含 job.pid）
+- live_exec_field +7（远端权限 0700/0600 实测、log 载荷字段 stdout 且无 content、
+  `--kill` 整组停掉并收敛 dead、kill 后 wait-rc 快速收敛（waited_ms < 20s）、dead 带 hint、
+  尾读截断给 `--offset 0` 提示、`--offset 0` 顺序读拿全文、`--kill` 缺 job-id 拦截）

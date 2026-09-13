@@ -61,9 +61,13 @@ python3 pyaissh.py log root@1.2.3.4 --job-id <id> --offset <next_offset>     # �
 python3 pyaissh.py log root@1.2.3.4 --job-id <id> --wait-rc 300              # 等结束（≤600s）拿 exit_code
 python3 pyaissh.py log root@1.2.3.4 --job-id <id> --cleanup                  # 清理远端作业目录
 ```
-- **机制**：作业脚本落远端 `/tmp/pyaissh-jobs/<job_id>/`（`job.sh` = 你的命令原文、`run.sh` = 运行器），`setsid nohup` 启动 → **SSH 断开、宿主单次调用超时都不影响作业**；输出合并进 `job.log`，结束时退出码写入 `job.rc`
-- **状态判定**：`job.rc` 存在 = 结束（`status:"finished"` + `exit_code`）；被 kill 的作业永无 rc（恒 `running`，别死等）
+- **机制**：作业脚本落远端 `/tmp/pyaissh-jobs/<job_id>/`（`job.sh` = 你的命令原文、`run.sh` = 运行器），`setsid nohup` 启动 → **SSH 断开、宿主单次调用超时都不影响作业**；输出合并进 `job.log`，结束时退出码写入 `job.rc`，进程组 leader pid 写入 `job.pid`
+- **状态机（v2.2.1 三级）**：`finished`（`job.rc` 存在 = 退出码）/ **`dead`**（无 rc 且 `job.pid` 存活探测判定进程已消失——被 kill / OOM / 崩溃，退出码不可知）/ `running`。被 kill 的作业**不再永远 running**，`--wait-rc` 与轮询都能收敛；`dead` 时结果带 `hint` 说明
+- **`log` 载荷字段是 `stdout`**（v2.2.1 起，与 `exec` 对齐；它是 `2>&1` **合并流**，`stream:"stdout+stderr"` 声明）：`pyaissh log h --job-id <id> --field stdout` 直接取裸内容
+- **停掉作业**：`log --job-id <id> --kill` → 读 `job.pid` 对**进程组** `TERM`（setsid 后 pid==pgid）→ 宽限 5s → `KILL`；Linux 上先校验 `/proc/<pid>/cmdline` 确属本作业（防 pid 复用误杀，不匹配即 `kill_failed` 拒绝）。可与 `--wait-rc` 连用（kill 后立刻收敛为 `dead`）
+- **落盘权限（v2.2.1 从严）**：目录 0700、`job.sh`/`job.log`/`job.rc`/`job.pid` 0600、`run.sh` 0700（`run.sh` 首行 `umask 077` 管住 shell 创建的文件）——命令原文与完整输出都在盘上，同机其他用户不可读；`exec --detach` 结果里 `permissions` 字段声明这套权限
 - **为什么值得用**：`exec` 前台受**宿主单次调用时长**限制（约 600s，pyaissh 自身可到 1200）；4-5 分钟的更新监控在前台只能结束时一次看到，而 `--detach` + `log --offset` 让"正在发生什么"变成可轮询的小 payload
+- **尾部截断的坑**：`--lines N` 模式下若回传内容又超 `--max-output`，中段会被省略（`truncated:true` + `omitted_bytes`），而此时 `has_more=false`、`next_offset` 指向 EOF——**看起来像"读完了"**。v2.2.1 起这种情况 `next_action` 会明确提示"用 `--offset 0` 顺序读补齐"
 - **与前台 exec 的差异**：`--detach` 与 `--sudo`/`--pty` 互斥（bad_args）；命令**原文会落盘到远端 `job.sh`**（别写明文凭据；敏感命令用完 `--cleanup`）；`--max-output`/`--encoding` 同样作用于 `log` 的内容回传
 - **短作业**：启动后 0.3s 内已结束的作业直接返回 `status:"finished"` + `exit_code`（无需再 log）；启动即死（如命令不可执行）会报 `detach_failed` 并附日志尾巴
 

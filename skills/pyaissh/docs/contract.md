@@ -34,12 +34,15 @@
 - 与 `--text` 互斥（bad_args，退出码 2）；`--json` 兼容 no-op 不冲突
 - **仅作用于成功路径**：工具错误（emit_error：连接失败/bad_args 等）仍输出**完整 JSON**（AI 需要 `retryable`/`message`）；命令非零退出是"成功路径的结果"（ok:true + exit_success:false），此时 --field 提取的是结果字段（`--field stdout,-stderr` 能拿到报错）
 
-## 后台作业字段契约（v2.2：`exec --detach` + `log`）
+## 后台作业字段契约（v2.2：`exec --detach` + `log`；v2.2.1 修订字段名与状态机）
 
-- **`exec --detach`** 立即返回（不阻塞）：`detached:true`、`job_id`、`pid`、`status`（`running`/`finished`）、`log`、`rc`、`job_dir`、`cmd_written_to`（远端 job.sh 路径）、`next_action`（下一步命令怎么写）。启动后 0.3s 内已结束的短作业直接给 `status:"finished"` + `exit_code`/`exit_success`
-- **`log`**（别名 `tail`）：`content`（回传内容）、`bytes_returned`、`log_bytes`（远端日志总大小）、`next_offset`（**下次增量读的字节偏移**）、`has_more`、`status`、`exit_code`/`exit_success`（作业未结束时为 `null`）、`tail_window_truncated`（尾部窗口是否回看截断）、`wait_rc_secs`/`waited_ms`、`cleaned`（--cleanup）、`next_action`；`--list` 返回 `jobs[]`（job_id/log/log_bytes/status/exit_code/mtime）+ `count`
-- **增量读语义**：`--offset N` 读 `[N, N+max_output)` 字节并给 `next_offset`——轮询不会重复读同一段（`--field content` 或 `--field next_offset` 都很轻）；`--offset` 与 `--lines` 互斥
-- **`--field` 同样适用**：`--field exit_code`、`--field content`、`--field next_offset`、`--field jobs`（JSON 序列化）
+- **`exec --detach`** 立即返回（不阻塞）：`detached:true`、`job_id`、`pid`、`status`（`running`/`finished`）、`log`、`rc`、`pid_file`、`job_dir`、`cmd_written_to`（远端 job.sh 路径）、`permissions`（落盘权限声明）、`next_action`（下一步命令怎么写）。启动后 0.3s 内已结束的短作业直接给 `status:"finished"` + `exit_code`/`exit_success`
+- **`log`**（别名 `tail`）载荷字段是 **`stdout`**（v2.2.1 起，与 `exec` 的 `stdout` 命名对齐；旧名 `content` 已移除）——注意它是 **`2>&1` 合并流**（`stream:"stdout+stderr"` 声明，stderr 内容也在这个字段里）。其余：`bytes_returned`、`log_bytes`（远端日志总大小）、`next_offset`（**下次增量读的字节偏移**）、`has_more`、`status`、`exit_code`/`exit_success`（未结束为 `null`）、`pid`/`pid_file`、`tail_window_truncated`、`wait_rc_secs`/`waited_ms`、`kill`（用了 `--kill` 时：`{ok,pid,signal,escalated}`）、`cleaned`（--cleanup）、`hint`（dead 时的原因说明）、`next_action`；`--list` 返回 `jobs[]`（job_id/log/log_bytes/status/exit_code/mtime）+ `count`
+- **状态机三级**（v2.2.1）：`finished`（`job.rc` 存在，内容即 `exit_code`）/ **`dead`**（无 rc 且 `job.pid` 的存活探测判定进程已消失——被 kill / OOM / 崩溃）/ `running`。`--kill` 或外部 kill 之后状态会收敛为 `dead` 而不是永远 `running`；`--wait-rc` 也以"状态不再是 running"为收敛条件
+- **增量读语义**：`--offset N` 读 `[N, N+max_output)` 字节并给 `next_offset`——轮询不会重复读同一段（`--field stdout` 或 `--field next_offset` 都很轻）；`--offset` 与 `--lines` 互斥
+- **`--field` 同样适用**：`--field exit_code`、`--field stdout`、`--field next_offset`、`--field jobs`（JSON 序列化）
 - **截断时的 `next_action`**（v2.2，exec 前台输出）：任一流超 `--max-output`（默认 64KB）被截断时，结果直接给"完整输出落盘路径 + 读文件不要重跑"的下一步提示，无需自己拼线索
-- **退出码**：`exec --detach` 成功启动 = 0（作业自身的退出码在 `log` 的 `exit_code`）；启动失败 = 255（`detach_failed`）；`log` 读不到作业 = 2（`job_not_found`）
+- **`log --kill`**（v2.2.1）：读 `job.pid` → 对**进程组**（setsid 后 pid==pgid）`TERM` → 宽限 5s → `KILL`；Linux 上先用 `/proc/<pid>/cmdline` 校验 pid 确属本作业（防 pid 复用误杀），不匹配则拒绝并报 `kill_failed`。与 `--wait-rc` 可同用（kill 后立即收敛为 `dead`）；需 `--job-id`
+- **远端落盘与权限**（v2.2.1）：`job.sh`（命令原文）/`job.log`（完整输出）/`job.rc`/`job.pid` 均 **0600**，作业目录与作业根目录 **0700**，`run.sh` 0700（`run.sh` 首行 `umask 077` 保证 shell 创建的日志/rc 也是 0600）
+- **退出码**：`exec --detach` 成功启动 = 0（作业自身的退出码在 `log` 的 `exit_code`）；启动失败 = 255（`detach_failed`）；`log` 读不到作业 = 2（`job_not_found`）；`--kill` 拒绝/失败 = 255（`kill_failed`）
 - **默认契约零变化**：不用 `--field` 时 stdout 恒单行 JSON
