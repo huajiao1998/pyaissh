@@ -177,3 +177,18 @@
 ### 说明
 - 对照组是"负号必要性"的证据：只杀组长时 job.sh 的子进程会被 reparent 成孤儿
 - 该组用例仍全部用 `[s]leep` 技巧避免 pgrep/pkill 自匹配
+
+## [2026-09-16] v2.2.4 CRLF 行尾归一
+
+### 新增用例
+- unit_regression +6：`_normalize_cmd_newlines` 纯函数（CRLF→LF 计数、孤立 CR、混合、纯 LF 零改动、
+  转义 `\\r` 字面量不受影响、`--keep-crlf` 默认关/显式开）
+- live_exec_field +11：内联 `--cmd` CRLF 归一并回传 `crlf_normalized=2`；warnings 说明含 `--keep-crlf`；
+  `--keep-crlf` 保留 CR（`v` 值含 `\r`）且不回传计数；`--cmd-file` 与 stdin 行为不回退（各带计数）；
+  `--cmd-file + --keep-crlf` 保留 CR；纯 LF 文件零改动（无字段无警告）；heredoc 落盘默认无 CR；
+  `--keep-crlf` 时 heredoc 落盘保留 CRLF；行尾孤立 CR；detach 回传计数且 job.sh 无 CR
+### 说明
+- 新增 `_live_sub_bytes` 助手：`subprocess.run(input=str, text=True)` 在 Windows 上会把 `\n` 再翻成
+  `\r\n`（CRLF → CRCRLF，计数翻倍）——**测试助手行为，不是被测程序**；stdin 用例一律走字节
+- 实测先行的价值：原以为"`--cmd-file` 也暴露"，实测发现它早被 Python 文本模式隐式归一，
+  真正未覆盖的是**内联 `--cmd`**——修的是这一条，同时把隐式行为变显式可关

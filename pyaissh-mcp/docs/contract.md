@@ -11,7 +11,8 @@
 - **`--text` 与 `--json` 对称**：默认 JSON 模式；`--text` 显式切回可读模式（两个位置都能写：主命令前或子命令后）
 - upload/download 结果含 `file_list`（`dry-run` 时即预览清单）；exec 含 `stdout_truncated`/`stderr_truncated`（该流是否截断）、`stdout_omitted_bytes`（省略量）/`output_truncated`（任一流截断即 true）/ `warnings` / `pty` / **`cmd_truncated`**（`cmd` 回显是否被截断——超 `CMD_ECHO_LIMIT`（8KB）时 `cmd` 保留头尾 + 中间省略标记，完整命令见原始调用，`--cmd-file` 时为本地文件可重读；凭据检测不受影响）；test 含 `hostname` / `os` / `kernel` / `arch`；ls 含 `entries` / `count`（本次显示数）/ `total`（实际总数）/ `truncated`（是否因 `--limit` 截断）——`count != total` 时目录没列全；**`entries[]` 两种模式恒同构**：`name`（目录带 `/` 后缀）/ `mode` / `size`（**目录为 null**，目录项尺寸无内容意义）/ `is_dir` / `is_symlink` / `mtime`（**epoch 秒，UTC**，跨机比较无时区歧义）
 - **`ok` 与 `exit_success` 语义（必须区分）**：`ok=true` 只表示工具操作成功（连接+执行完成）；**远程命令成败看 `exit_success`**（远程退出码是否为 0）。例：命令 `exit 3` 返回 `ok=true, exit_code=3, exit_success=false`——命令失败了
-- **`warnings` 数组**：exec 成功时以下警告会进 JSON 的 `warnings` 字段——输出截断（后台进程占用/`--max-output` 截断/内存缓冲丢弃）、总时长上限被 cap 到 1200、`--cmd`/`--cmd-file` 同给、疑似凭据、远程退出码 255 特殊语义；其余日志类警告（端口配置、MSYS 路径转换）只打 stderr。**`warnings` 恒为参考信息，不代表操作失败**——疑似凭据等安全类提示不阻断执行（命令照常运行），不要因 warnings 过度保守拒绝合法命令；需要行动的警告（如上传中断的 `.part` 残留）会附具体清理命令
+- **`warnings` 数组**：exec 成功时以下警告会进 JSON 的 `warnings` 字段——输出截断（后台进程占用/`--max-output` 截断/内存缓冲丢弃）、总时长上限被 cap 到 1200、`--cmd`/`--cmd-file` 同给、疑似凭据、远程退出码 255 特殊语义、**命令文本行尾被归一（CRLF→LF，见下）**；其余日志类警告（端口配置、MSYS 路径转换）只打 stderr。**`warnings` 恒为参考信息，不代表操作失败**——疑似凭据等安全类提示不阻断执行（命令照常运行），不要因 warnings 过度保守拒绝合法命令；需要行动的警告（如上传中断的 `.part` 残留）会附具体清理命令
+- **`crlf_normalized`（v2.2.4，仅在有归一发生时出现）**：命令文本里被归一为 LF 的 CRLF/CR 行尾**处数**（exec 与 exec --detach 都会回传）。默认行为：命令文本（内联 `--cmd`、`--cmd-file`、stdin）的行尾 CRLF/CR 一律归一为 LF——远端 bash 会把 `\r` 当词的一部分（`$'\r': command not found`、关键字行语法错、heredoc 落盘文件每行带 CR）；要原样发送加 `--keep-crlf`（此时不出现本字段）。**传输通道不受影响**：upload/download 是数据面，绝不改字节，Windows 文件传上去仍是 CRLF
 - 远程命令的 stdout/stderr 已分别放入结果的 `stdout`/`stderr` 字段，无需自行拼接
 
 ## `--text` 可读模式（仅供人类速览，AI 直接用默认 JSON）

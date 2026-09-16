@@ -123,6 +123,26 @@ def _live_sub(args, input_text=None, timeout=120):
                           errors="replace", env=env, timeout=timeout)
 
 
+def _live_sub_bytes(args, payload, timeout=120):
+    """stdin 走**字节**（CRLF 用例必须）。
+
+    坑：text=True + input=str 在 Windows 上会把 \\n 再翻成 \\r\\n（CRLF → CRCRLF），
+    计数与断言都会失真——那是测试助手的行为，不是被测程序。
+    """
+    env = dict(os.environ)
+    env["PYAISSH_PASSWORD"] = os.environ.get("PYAISSH_TEST_PASSWORD", "")
+    p = subprocess.run([sys.executable, "-B", _bin()] + args, input=payload,
+                       capture_output=True, env=env, timeout=timeout)
+    j = None
+    for line in reversed(p.stdout.decode("utf-8", "replace").splitlines()):
+        try:
+            j = json.loads(line)
+            break
+        except Exception:
+            pass
+    return p.returncode, j, p.stderr.decode("utf-8", "replace")
+
+
 def _last_json(p):
     for line in reversed(p.stdout.splitlines()):
         try:
@@ -283,6 +303,20 @@ def suite_unit_regression(s):
     s.check("run.sh 落日志+写 rc", ("bash " in run_sh and paths["log"] in run_sh
                                     and paths["rc"] in run_sh and "echo $?" in run_sh), run_sh)
     s.check("run.sh 收严 umask（job.log/job.rc 0600）", "umask 077" in run_sh, run_sh)
+
+    # v2.2.4 CRLF 归一（纯函数，不连远端）
+    norm = m._normalize_cmd_newlines
+    s.check("CRLF → LF 并计数", norm("a\r\nb\r\n") == ("a\nb\n", 2), repr(norm("a\r\nb\r\n")))
+    s.check("孤立 CR → LF 并计数", norm("echo X\r") == ("echo X\n", 1), repr(norm("echo X\r")))
+    s.check("混合 CRLF/CR 一起归一", norm("a\r\nb\rc\n") == ("a\nb\nc\n", 2),
+            repr(norm("a\r\nb\rc\n")))
+    s.check("纯 LF 零改动（文本与计数都不变）", norm("a\nb\n") == ("a\nb\n", 0))
+    s.check("转义写法 \\r（反斜杠+r 字面量）不受影响",
+            norm("printf 'a\\rb'\n") == ("printf 'a\\rb'\n", 0))
+    _a = m.build_parser().parse_args(["exec", "h", "--cmd", "x"])
+    _b = m.build_parser().parse_args(["exec", "h", "--cmd", "x", "--keep-crlf"])
+    s.check("--keep-crlf 默认关、显式开（exec 参数）",
+            _a.keep_crlf is False and _b.keep_crlf is True)
     # 单引号路径注入防护：路径只做 POSIX 单引号转义后进 run.sh
     odd = m._job_files("/tmp/it's dir", "j2")
     _j2, run2 = m._detach_scripts(odd, "true")
@@ -614,6 +648,79 @@ def suite_live_exec_field(s):
                   timeout=60)
     s.check("--field 下 --progress 心跳可见", "[PROGRESS] 仍在运行" in p.stderr
             and "[SSH]" not in p.stderr and p.stdout.strip() == "")
+
+    # v2.2.4 CRLF 归一：默认归一命令文本（内联/文件/stdin），--keep-crlf 保留，结果回传计数
+    import tempfile as _tf
+    _cdir = _tf.mkdtemp(prefix="pyaissh_crlf_")
+    _probe = 'v=1\necho "A[$v]B"\n'          # CR 若到达 bash，v 里会混进 \r
+    _crlf = _probe.replace("\n", "\r\n")
+    _f_crlf = os.path.join(_cdir, "probe_crlf.sh")
+    _f_lf = os.path.join(_cdir, "probe_lf.sh")
+    io.open(_f_crlf, "w", encoding="utf-8", newline="").write(_crlf)
+    io.open(_f_lf, "w", encoding="utf-8", newline="").write(_probe)
+    try:
+        # ① 内联 --cmd（v2.2.4 修的真坑：此前 CR 直达 bash）
+        rc, j, _ = _live_run(["exec", tgt, "--cmd", _crlf], timeout=60)
+        s.check("内联 --cmd 的 CRLF 被归一 + 回传 crlf_normalized=2",
+                bool(j) and j.get("stdout") == "A[1]B\n" and j.get("crlf_normalized") == 2,
+                repr(j)[:200])
+        s.check("归一有 warnings 说明且给出 --keep-crlf 逃生阀",
+                bool(j) and any("归一为 LF" in w and "--keep-crlf" in w
+                                for w in (j.get("warnings") or [])), repr(j.get("warnings"))[:160])
+        # ② --keep-crlf：保留原样（CR 真的到达 bash）
+        rc, j, _ = _live_run(["exec", tgt, "--cmd", _crlf, "--keep-crlf"], timeout=60)
+        s.check("--keep-crlf 保留 CR（v 值含 \\r）且不回传计数",
+                bool(j) and "A[1\r]B" in (j.get("stdout") or "")
+                and not j.get("crlf_normalized"), repr(j.get("stdout"))[:120])
+        # ③ cmd-file / stdin：行为不回退（原本隐式归一）且现在带计数
+        rc, j, _ = _live_run(["exec", tgt, "--cmd-file", _f_crlf], timeout=60)
+        s.check("--cmd-file 的 CRLF 仍归一（行为不回退）+ 计数",
+                bool(j) and j.get("stdout") == "A[1]B\n" and j.get("crlf_normalized") == 2,
+                repr(j)[:180])
+        rc, j, _ = _live_sub_bytes(["exec", tgt, "--cmd-file", "-"], _crlf.encode("utf-8"),
+                                   timeout=60)
+        s.check("stdin(-) 的 CRLF 仍归一 + 计数（stdin 走字节）",
+                bool(j) and j.get("stdout") == "A[1]B\n" and j.get("crlf_normalized") == 2,
+                repr(j)[:180])
+        rc, j, _ = _live_run(["exec", tgt, "--cmd-file", _f_crlf, "--keep-crlf"], timeout=60)
+        s.check("--cmd-file + --keep-crlf 保留 CR",
+                bool(j) and "A[1\r]B" in (j.get("stdout") or ""), repr(j.get("stdout"))[:120])
+        # ④ 纯 LF 文件零改动（不能凭空多出字段/警告）
+        rc, j, _ = _live_run(["exec", tgt, "--cmd-file", _f_lf], timeout=60)
+        s.check("纯 LF 文件零改动（无 crlf_normalized、无 CRLF 警告）",
+                bool(j) and j.get("stdout") == "A[1]B\n" and "crlf_normalized" not in j
+                and not any("CRLF" in w for w in (j.get("warnings") or [])), repr(j)[:180])
+        # ⑤ heredoc 数据面：默认落盘 LF；--keep-crlf 落盘保留 CRLF（逃生阀有效）
+        _hd = ("cat > /tmp/pyaissh_hd_probe.txt <<'EOF'\nline1\nline2\nEOF\n"
+               "grep -c $'\\r' /tmp/pyaissh_hd_probe.txt || true\n")
+        _f_hd = os.path.join(_cdir, "hd_crlf.sh")
+        io.open(_f_hd, "w", encoding="utf-8", newline="").write(_hd.replace("\n", "\r\n"))
+        rc, j, _ = _live_run(["exec", tgt, "--cmd-file", _f_hd], timeout=60)
+        s.check("默认：heredoc 落盘的文件不带 CR（数据面顺带修好）",
+                bool(j) and (j.get("stdout") or "").strip() == "0", repr(j.get("stdout"))[:80])
+        rc, j, _ = _live_run(["exec", tgt, "--cmd-file", _f_hd, "--keep-crlf"], timeout=60)
+        s.check("--keep-crlf：heredoc 落盘保留 CRLF（要数据面 CRLF 时可用）",
+                bool(j) and (j.get("stdout") or "").strip() == "2", repr(j.get("stdout"))[:80])
+        # ⑥ 单行孤立 CR
+        rc, j, _ = _live_run(["exec", tgt, "--cmd", "echo X\r"], timeout=60)
+        s.check("行尾孤立 CR 被去掉", bool(j) and (j.get("stdout") or "").strip() == "X",
+                repr(j.get("stdout"))[:80])
+        # ⑦ detach：job.sh 落盘不带 CR
+        rc, jd, _ = _live_run(["exec", tgt, "--detach", "--cmd", _crlf], timeout=90)
+        if jd and jd.get("job_id"):
+            rc, jg, _ = _live_run(["exec", tgt, "--cmd",
+                                   "grep -c $'\\r' %s || true" % jd.get("cmd_written_to")],
+                                  timeout=60)
+            s.check("detach：计数回传 + job.sh 落盘无 CR",
+                    jd.get("crlf_normalized") == 2
+                    and (jg.get("stdout") or "").strip() == "0", repr(jd)[:120])
+            _live_run(["log", tgt, "--job-id", jd["job_id"], "--cleanup"], timeout=60)
+        else:
+            s.check("detach：计数回传 + job.sh 落盘无 CR", False, "detach 未返回 job_id")
+    finally:
+        import shutil as _sh
+        _sh.rmtree(_cdir, ignore_errors=True)
+        _live_run(["exec", tgt, "--cmd", "rm -f /tmp/pyaissh_hd_probe.txt"], timeout=60)
 
     # v2.2 后台作业（--detach + log）：长任务不受宿主调用上限，增量读不重复
     rc, j, _ = _live_run(["exec", tgt, "--detach", "--cmd", "sleep 2; echo detach_hi; exit 5"],

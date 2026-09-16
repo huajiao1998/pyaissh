@@ -238,11 +238,17 @@ def build_parser():
   静默但想确认还活着（不解决卡死判定）               --progress 30
   输出很大（>64KB）                                  完整输出自动落 spill，读 stdout_spill_file
   命令里有 $ 等特殊字符（PowerShell 会吃）           写脚本文件后 --cmd-file -（勿内联）
+  Windows 工具写出的脚本/命令（CRLF 行尾）          默认已归一为 LF，无需 sed -i 's/\r$//'
+                                                     （结果回传 crlf_normalized；要原样发加 --keep-crlf）
 """)
     add_conn(p)
     p.add_argument("--cmd", help="要执行的命令")
     p.add_argument("--cmd-file", dest="cmd_file",
                    help="从文件读命令 (- 表示 stdin，适合长脚本/特殊字符)")
+    p.add_argument("--keep-crlf", dest="keep_crlf", action="store_true",
+                   help="保留命令文本里的 CRLF/CR 行尾（默认归一为 LF，避免远端 bash 把 \\r 当"
+                        "词的一部分：$'\\r': command not found、heredoc 落盘文件带 CR）；"
+                        "仅在确实要输出 CRLF 数据时用")
     p.add_argument("--detach", action="store_true",
                    help="后台运行（v2.2）：远端 setsid+nohup 起作业，立即返回 job_id/log/rc；"
                         "之后用 pyaissh log 增量读日志、--wait-rc 等结束拿退出码——"

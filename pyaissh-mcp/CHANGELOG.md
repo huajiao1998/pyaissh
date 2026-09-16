@@ -133,3 +133,15 @@
 - CLI 侧同步修掉 force 后 `next_action` 的误导（此前仍提示"继续增量读 --offset"，但 `job.log` 已删）
 - 真机对照实测：照 `group_kill` 执行 → 一次干净；用正 pid `kill -9 <pid>` → 只杀组长、子进程成孤儿
 - **真机验证数据**：CLI `live_exec_field` 51/51 全绿；MCP 离线 40 + 真机后台作业 15 全绿
+
+## [0.2.6] - 2026-09-16
+
+### 跟随 CLI v2.2.4：命令文本 CRLF 自动归一
+
+- **固定副本同步至 CLI v2.2.4**（`sync_check.py` 12 文件逐一 md5 校验）
+- 经 MCP 调用 `pyaissh_exec` 时，命令文本里的 CRLF/CR 行尾默认归一为 LF（远端 bash 会把 `\r`
+  当词的一部分）；结果多出 **`crlf_normalized`** 字段（归一处的行尾数），要保留原样时 CLI 侧有
+  `--keep-crlf`。MCP 传参是 JSON 字符串，通常不带 CRLF，但模型把整段脚本塞进 `cmd` 时可能带，
+  归一同样生效
+- **传输不受影响**：`upload`/`download` 是数据面，MCP 层也不改字节
+- MCP 层代码逻辑零改动（`SERVER_VERSION` 随之标记 0.2.6）

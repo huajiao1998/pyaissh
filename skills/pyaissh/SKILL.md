@@ -80,6 +80,18 @@ python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --cleanup                    
 - **force 之后要停进程**：结果直接给 `kill -9 -<pid>`（负号=进程组；pid 即 setsid 组长，一条命令清整组含子进程，**不用先 pgrep**）
 - **与 `--sudo`/`--pty` 互斥**（bad_args）；命令原文会落远端 `job.sh`（别写明文凭据，用完 `--cleanup`）
 
+### CRLF 行尾自动归一（v2.2.4）
+
+Windows 工具（记事本 / VS Code / PowerShell 重定向 / here-string）写出的命令文本行尾是 `\r\n`，远端 bash 会把 `\r` 当词的一部分（`$'\r': command not found`、`if/then` 行语法错、heredoc 落盘文件每行带 CR）。pyaissh **默认把命令文本的 CRLF/CR 归一为 LF**——`--cmd` 内联、`--cmd-file` 文件、`--cmd-file -` stdin 三条路都覆盖，结果回传 `crlf_normalized: <处数>` + warnings 说明：
+
+```bash
+python3 pyaissh.py exec root@1.2.3.4 --cmd-file win_written.sh    # 自动归一，不必再 sed -i 's/\r$//'
+python3 pyaissh.py exec root@1.2.3.4 --cmd 'printf "a\r\nb\r\n"'  # 要真 CR 用转义写法（不受影响）
+python3 pyaissh.py exec root@1.2.3.4 --cmd-file win.sh --keep-crlf  # 确实要 CRLF 数据时保留原样
+```
+
+**`upload`/`download` 是数据通道，任何情况下不改字节**（Windows 上写好再上传的脚本在远端仍是 CRLF：要执行就用 `--cmd-file` 送脚本，或远端 `dos2unix`）。
+
 ### ls — 列远程目录
 ```bash
 python3 pyaissh.py ls root@1.2.3.4 --path /etc         # entries JSON

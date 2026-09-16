@@ -186,6 +186,24 @@ def _strip_ansi(s):
     return _ANSI_RE.sub("", s)
 
 
+def _normalize_cmd_newlines(text):
+    """命令文本行尾归一：CRLF / 孤立 CR → LF，返回 (归一后文本, 归一处的行尾数)。
+
+    v2.2.4：Windows 工具（记事本 / VS Code / PowerShell 重定向 / here-string）写出的
+    命令文件或内联命令，行尾是 \\r\\n；远端 bash 把 \\r 当词的一部分，典型症状
+    "$'\\r': command not found"、判断/关键字行报语法错、heredoc 落盘的文件每行带 CR。
+
+    注：`--cmd-file` 此前**靠 Python 文本模式的 universal newlines 隐式归一**（副作用，
+    代码里没写、也无法关闭）；本函数把它变成显式、可计数、可用 --keep-crlf 关闭的行为。
+    """
+    n_crlf = text.count("\r\n")
+    out = text.replace("\r\n", "\n")
+    n_cr = out.count("\r")
+    if n_cr:
+        out = out.replace("\r", "\n")
+    return out, n_crlf + n_cr
+
+
 def _clean_pty_text(s, args):
     """PTY 输出清洗：\r\n/\r -> \n（终端行转换），可选剥离 ANSI。"""
     if not args.pty:

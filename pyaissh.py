@@ -132,7 +132,7 @@ except (ValueError, OSError, ImportError):
 被 00_head（信号区）、各 cmd_*（超时/常量）引用；拼接后与本包其余域同模块共享命名空间。
 """
 
-VERSION = "2.2.3"
+VERSION = "2.2.4"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -998,6 +998,24 @@ def _strip_ansi(s):
     if not s:
         return s
     return _ANSI_RE.sub("", s)
+
+
+def _normalize_cmd_newlines(text):
+    """命令文本行尾归一：CRLF / 孤立 CR → LF，返回 (归一后文本, 归一处的行尾数)。
+
+    v2.2.4：Windows 工具（记事本 / VS Code / PowerShell 重定向 / here-string）写出的
+    命令文件或内联命令，行尾是 \\r\\n；远端 bash 把 \\r 当词的一部分，典型症状
+    "$'\\r': command not found"、判断/关键字行报语法错、heredoc 落盘的文件每行带 CR。
+
+    注：`--cmd-file` 此前**靠 Python 文本模式的 universal newlines 隐式归一**（副作用，
+    代码里没写、也无法关闭）；本函数把它变成显式、可计数、可用 --keep-crlf 关闭的行为。
+    """
+    n_crlf = text.count("\r\n")
+    out = text.replace("\r\n", "\n")
+    n_cr = out.count("\r")
+    if n_cr:
+        out = out.replace("\r", "\n")
+    return out, n_crlf + n_cr
 
 
 def _clean_pty_text(s, args):
@@ -2704,7 +2722,9 @@ def _prepare_exec_command(args):
             if args.cmd_file == "-":
                 if _SIGTERM_RECEIVED:
                     raise KeyboardInterrupt("SIGTERM")
-                cmd = sys.stdin.read()
+                # v2.2.4：读**字节**再显式解码（不再依赖 sys.stdin 的隐式 universal newlines），
+                # 这样行尾归一由下面 _normalize_cmd_newlines 统一负责、可计数、可 --keep-crlf 关闭
+                cmd = sys.stdin.buffer.read().decode("utf-8-sig")
                 # 读 stdin 期间可能收到信号（handler 只置标志，阻塞的 read 无法
                 # 被中断）：读到内容但信号已到 = 用户取消，不应继续执行命令
                 if _SIGTERM_RECEIVED:
@@ -2713,15 +2733,30 @@ def _prepare_exec_command(args):
                 # utf-8-sig：自动剥离 UTF-8 BOM（\ufeff）——记事本/VS Code 等
                 # Windows 工具写出的命令文件带 BOM 时，首行命令会被拼进 BOM
                 # 字符而报 "command not found"（与 .env 解析同款处理）
+                # newline=""：不做隐式 universal newlines 转换，行尾交给
+                # _normalize_cmd_newlines 显式归一（v2.2.4；此前是文本模式副作用）
                 # _fix_msys_local_path：Git Bash 下 /tmp/x.sh 等 Unix 风格本地路径
                 # 转 Windows 路径（与 --local 同款；内部含 ~ 展开），避免 Windows
                 # Python 把 /tmp 解析成盘根而报 Errno 2
-                with open(_fix_msys_local_path(args.cmd_file), encoding="utf-8-sig") as f:
+                with open(_fix_msys_local_path(args.cmd_file), encoding="utf-8-sig",
+                          newline="") as f:
                     cmd = f.read()
         except KeyboardInterrupt:
             raise  # 中断走 main 的 interrupted/130
         except Exception as e:
             return None, ("read_cmd_failed", str(e), warnings)  # 本地参数/文件问题，由 cmd_exec 输出
+    # v2.2.4 CRLF 归一（默认；--keep-crlf 保留原样）：
+    #  - 内联 --cmd 此前**完全没有**归一（argv 里的真 CR 直达 bash）——这是本版修的真坑，
+    #    也覆盖"内联 heredoc 落盘的文件带 CR"（用户此前靠 sed -i 's/\r$//' 收尾）
+    #  - --cmd-file / stdin 此前靠 Python 文本模式隐式归一（行为不变，只是变显式 + 可关闭）
+    if cmd and not getattr(args, "keep_crlf", False):
+        cmd, crlf_n = _normalize_cmd_newlines(cmd)
+        if crlf_n:
+            args._crlf_normalized = crlf_n
+            warnings.append(
+                "命令文本有 %d 处 CRLF/CR 行尾，已归一为 LF（远端 bash 会把 \\r 当词的一部分："
+                "$'\\r': command not found、关键字行语法错、heredoc 落盘文件带 CR）；"
+                "要原样发送加 --keep-crlf" % crlf_n)
     if not cmd or not cmd.strip():
         return None, ("bad_args", "未指定命令（--cmd 或 --cmd-file）", warnings)
     if args.max_time is not None and args.max_time < args.exec_timeout:
@@ -2832,6 +2867,8 @@ def _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client):
         }
         if warnings:
             extra["warnings"] = list(warnings)
+        if getattr(args, "_crlf_normalized", 0):
+            extra["crlf_normalized"] = args._crlf_normalized
         if cmd_cut:
             extra.setdefault("warnings", []).append(
                 "cmd 字段已截断（完整命令 %d 字节，见原始调用；--cmd-file 时为本地文件可重读）" % cmd_n)
@@ -3302,6 +3339,9 @@ def _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client):
             "warnings": warnings,
             "duration_ms": duration,
         }
+        if getattr(args, "_crlf_normalized", 0):
+            # 明确回传"我改了你的命令文本"（改了就说清楚；--keep-crlf 时为 0/缺省）
+            result["crlf_normalized"] = args._crlf_normalized
         # spill 收尾：截断（或 drain 不完整）时保留完整输出文件并把路径回传 JSON；
         # 未截断则删除，不留垃圾。置 _spill_handled 让 finally 跳过（成功路径自己管）。
         out_keep = stdout_truncated or drain_truncated
@@ -3831,6 +3871,8 @@ def _cmd_exec_detach(args):
             "warnings": warnings,
             "duration_ms": int((time.time() - start) * 1000),
         }
+        if getattr(args, "_crlf_normalized", 0):
+            result["crlf_normalized"] = args._crlf_normalized
         if rc_val is not None:
             result["exit_code"] = rc_val
             result["exit_success"] = rc_val == 0
@@ -5408,11 +5450,17 @@ def build_parser():
   静默但想确认还活着（不解决卡死判定）               --progress 30
   输出很大（>64KB）                                  完整输出自动落 spill，读 stdout_spill_file
   命令里有 $ 等特殊字符（PowerShell 会吃）           写脚本文件后 --cmd-file -（勿内联）
+  Windows 工具写出的脚本/命令（CRLF 行尾）          默认已归一为 LF，无需 sed -i 's/\r$//'
+                                                     （结果回传 crlf_normalized；要原样发加 --keep-crlf）
 """)
     add_conn(p)
     p.add_argument("--cmd", help="要执行的命令")
     p.add_argument("--cmd-file", dest="cmd_file",
                    help="从文件读命令 (- 表示 stdin，适合长脚本/特殊字符)")
+    p.add_argument("--keep-crlf", dest="keep_crlf", action="store_true",
+                   help="保留命令文本里的 CRLF/CR 行尾（默认归一为 LF，避免远端 bash 把 \\r 当"
+                        "词的一部分：$'\\r': command not found、heredoc 落盘文件带 CR）；"
+                        "仅在确实要输出 CRLF 数据时用")
     p.add_argument("--detach", action="store_true",
                    help="后台运行（v2.2）：远端 setsid+nohup 起作业，立即返回 job_id/log/rc；"
                         "之后用 pyaissh log 增量读日志、--wait-rc 等结束拿退出码——"

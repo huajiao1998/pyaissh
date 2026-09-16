@@ -386,3 +386,26 @@
   ——证明负号不可省
 - **测试**：live_exec_field +4（group_kill/warning/next_action 三处一致、next_action 不再误导为
   「继续增量读」、照 group_kill 执行即一次清整组、正 pid 对照组留孤儿）；真机 51/51 全绿
+
+## [2.2.4] - 2026-09-16
+
+### 新增：命令文本 CRLF 行尾自动归一（--keep-crlf 可关，结果回传 crlf_normalized）
+
+- **背景（实测先行，纠正了原来的假设）**：Windows 工具（记事本 / VS Code / PowerShell 重定向 /
+  here-string）写出的命令文本行尾是 `\r\n`，远端 bash 把 `\r` 当词的一部分。但分通路实测发现：
+  - `--cmd-file <文件>` 与 `--cmd-file -`（stdin）**早已被隐式归一**——靠 Python 文本模式的
+    universal newlines 副作用（代码注释只写了 BOM，没写 CRLF，也无法关闭）
+  - **内联 `--cmd` 完全没有归一**（argv 里的真 CR 直达 bash，`v=1\r` → 变量值混进 `\r`）——
+    这是真正还在咬人的一条，也覆盖"内联 heredoc 落盘的文件每行带 CR"（此前靠 `sed -i 's/\r$//'` 收尾）
+- **改动**：
+  - 新增 `_normalize_cmd_newlines()`（纯函数）：CRLF/孤立 CR → LF，并返回归一处的行尾数
+  - exec 命令文本三条路（`--cmd` / `--cmd-file` 文件 / stdin）**统一显式归一**：文件读取改用
+    `newline=""` 不做隐式转换，stdin 改读字节再解码（不再依赖 TextIOWrapper 的隐式行为）
+  - 新增 `--keep-crlf`：保留原样（例如确实要产出 CRLF 数据文件）；归一发生时结果回传
+    **`crlf_normalized: <处数>`**（exec 与 exec --detach 都回传），并进 `warnings` 说明 + 给出逃生阀
+  - **传输通道不动**：upload/download 是数据面，任何情况下不改字节（Windows 文件传上去仍是 CRLF）
+- **测试**：unit_regression +6（纯函数：CRLF/孤立 CR/混合/纯 LF 零改动/转义 `\\r` 字面量不受影响/
+  `--keep-crlf` 默认关）；live_exec_field +11（内联归一并回传计数、warnings 含逃生阀、
+  `--keep-crlf` 保留 CR、cmd-file 与 stdin 行为不回退且有计数、纯 LF 文件零改动、
+  heredoc 落盘默认无 CR 而 `--keep-crlf` 保留 CRLF、行尾孤立 CR、detach 计数 + job.sh 无 CR）
+- 真机验证：B2 62/62 全绿
