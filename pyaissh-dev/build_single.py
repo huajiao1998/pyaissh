@@ -12,7 +12,7 @@
 确定性（护栏 4）：同一 domains/ 两次 join 逐字节相同（MANIFEST 固定顺序、无时间戳）。
 换行（护栏 3 实测）：域文件与成品一律 CRLF——join 用 newline="" 保原样。
 
-历史：曾有的 `split`（单文件 -> 域文件，按 MANIFEST 锚切分）已于 2026-09-16 **移除**：
+历史：曾有的 `split`（单文件 -> 域文件，按 MANIFEST 锚切分）已于 2026-09-21 **移除**：
 锚是域内标识而非域边界（域文件真正起点是各自首行，单文件里的 `# ===== [域 NN/12] …`
 横幅由 join 生成），它本就无法还原域文件；且旧实现会先清空 domains/ 再切分，锚一过期
 就是"域文件被删空"。成品不需要再切回域文件，故连同锚一并删除（需要时见 git 历史）。
@@ -103,8 +103,8 @@ def check():
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "join"
     if cmd == "split":
-        # 2026-09-16 移除：成品不再切回域文件（改 domains/ 后跑 dist 即可）
-        print("SPLIT_REMOVED: split 已移除（2026-09-16）——方向是单向的：改 domains/ 后跑 "
+        # 2026-09-21 移除：成品不再切回域文件（改 domains/ 后跑 dist 即可）
+        print("SPLIT_REMOVED: split 已移除（2026-09-21）——方向是单向的：改 domains/ 后跑 "
               "build_single.py dist。若确需从成品单文件重建域文件，见 git 历史中的旧实现，"
               "并按【域文件首行】而非锚来切分。")
         sys.exit(1)
@@ -129,5 +129,5 @@ if __name__ == "__main__":
         print("DIST_OK: 双份同步 %s (%s)" % ("md5 一致 " + next(iter(digests)) if ok else "md5 不一致!", "OK" if ok else "FAIL"))
         sys.exit(0 if ok else 1)
     else:
-        print("用法: build_single.py join|check|dist（split 已于 2026-09-16 移除）")
+        print("用法: build_single.py join|check|dist（split 已于 2026-09-21 移除）")
         sys.exit(1)

@@ -410,7 +410,7 @@
   heredoc 落盘默认无 CR 而 `--keep-crlf` 保留 CRLF、行尾孤立 CR、detach 计数 + job.sh 无 CR）
 - 真机验证：B2 62/62 全绿
 
-### 开发工具与测试（同日补）
+### 开发工具与测试（2026-09-21 补）
 - **修正 MANIFEST 过期锚**：`01_globals.py` 的锚还停留在 `^VERSION = "1\.5\.19"`（源码早已 2.2.x）
   → 改为与版本无关的 `^VERSION = "`（唯一且不再随发版过期）
 - **`build_single.py split` 安全化**：旧实现**先清空 `domains/` 再切分**，锚一过期就是
@@ -420,7 +420,7 @@
   `--force` 只写 `domains.split/` 供人工比对
 - **测试兜底**：`unit_artifacts` 6 → 11 例，新增 MANIFEST 锚"全部命中 / 唯一 / 有序 / 域文件齐全"
   ——`join/dist` 不用锚，锚失效不影响构建，所以只能靠测试发现（这正是本次漏网的原因）
-- **`build_single.py split` 已彻底移除**（同日，取代上一条的"安全化"）：方向确定为单向——
+- **`build_single.py split` 已彻底移除**（2026-09-21，取代上一条的"安全化"）：方向确定为单向——
   **`domains/` 是源，成品单文件是产物**（改代码改 domains/ 后 `dist`；直接改 `pyaissh.py`
   下次 dist 会被覆盖，`check` 会报不一致）。跑 `split` 现在明确回 `SPLIT_REMOVED` 并退出 1，
   不碰磁盘。MANIFEST 的**锚列一并删除**（锚的唯一消费者就是 split，留着只会再烂一次——

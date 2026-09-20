@@ -401,7 +401,7 @@ def suite_unit_artifacts(s):
     s.check("VERSION 一致", bool(vm) and vm.group(1) == m.VERSION,
             "src=%r module=%r" % (vm.group(1) if vm else None, m.VERSION))
 
-    # MANIFEST 有效性（v2.2.4 加：此前锚悄悄过期没人发现；2026-09-16 随 split 移除一并
+    # MANIFEST 有效性（v2.2.4 加：此前锚悄悄过期没人发现；2026-09-21 随 split 移除一并
     # 去掉锚列——锚的唯一消费者是 split，留着只会再烂一次。现在只校验顺序清单本身）
     mf = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                       "pyaissh-dev", "MANIFEST_domains.txt")
