@@ -7,9 +7,18 @@
 #   01-11 常量/正则/函数定义按原顺序（模块级赋值依赖顺序）
 #
 # 域文件在 pyaissh-dev/domains/ 下：<序号>_<域名>.py
-# 每行: <序号>_<域名>.py | <起始锚正则>（Python re；锚唯一；域尾=下一域锚/EOF）
+# 每行: <序号>_<域名>.py | <锚正则>（Python re；**必须在该域内唯一命中**）
+#
+# ⚠️ 锚的语义（2026-09-16 更正）：锚是**域内标识**（用来定位"这个域在哪里"），
+# **不是域边界**——域文件真正的起点是各自的首行（域 01..11 = 域 docstring，00 = shebang），
+# 而单文件里的 `# ===== [域 NN/12] …` 横幅是 join 生成的、不在域文件里。
+# 因此 `build_single.py split`（按锚切分）**无法还原域文件**，其产物与 domains/ 不一致；
+# 该命令已加保护：比对不一致时拒绝写 domains/，只写 domains.split/ 供人工比对。
+# join/dist 不使用锚（只按本文件的行序拼接），锚失效不影响构建——但有
+# tests/run_tests.py 的 unit_artifacts 断言（锚唯一 + 有序）兜住"锚悄悄过期"。
+# 版本类锚请写成与版本无关的形式（如 ^VERSION = " ），避免每次发版都要改这里。
 00_head.py        | ^# ===== 极早期信号窗口（v1.4.8）=====
-01_globals.py     | ^VERSION = "1\.5\.19"
+01_globals.py     | ^VERSION = "
 02_cred_regex.py  | ^# --- 正则模式（模块级编译一次
 03_env_paths.py   | ^def _safe_int
 04_console_out.py | ^def _setup_console_utf8

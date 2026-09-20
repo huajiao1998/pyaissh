@@ -54,17 +54,45 @@ def _split_text(text, items):
     return [text[bounds[i]:bounds[i + 1]] for i in range(len(items))]
 
 
-def split():
+def split(force=False):
+    """按锚切分单文件（**注意语义**：锚是域内标识、不是边界，见 MANIFEST 头部）。
+
+    安全设计（2026-09-16）：
+      - 先算后写：切分/校验全部完成前**绝不碰 domains/**（旧版先 os.remove 清空目录，
+        锚一旦过期就是"域文件被删空 + 退出 1"）
+      - 与现有域文件逐块比对：不一致（锚是域内标识，通常如此）→ **拒绝覆盖 domains/**，
+        改写到 domains.split/ 供人工比对；只有逐块一致（真正的往返）才写回 domains/
+    """
     text = open(SOURCE, encoding="utf-8", newline="").read()
     items = load_manifest()
-    os.makedirs(DOMAINS_DIR, exist_ok=True)
-    for f in os.listdir(DOMAINS_DIR):
-        os.remove(os.path.join(DOMAINS_DIR, f))
-    chunks = _split_text(text, items)
+    chunks = _split_text(text, items)          # 失败在这里退出，磁盘未被触碰
+
+    mismatch = []
     for (fname, _), chunk in zip(items, chunks):
-        with open(os.path.join(DOMAINS_DIR, fname), "w", encoding="utf-8", newline="") as f:
+        p = os.path.join(DOMAINS_DIR, fname)
+        cur = open(p, encoding="utf-8", newline="").read() if os.path.exists(p) else None
+        if cur != chunk:
+            mismatch.append((fname, len(chunk), len(cur) if cur is not None else -1))
+
+    if mismatch and not force:
+        print("SPLIT_REFUSED: 切分结果与现有域文件不一致（%d/%d 域）——锚是【域内标识】而非"
+              "域边界（见 MANIFEST 头部），按锚切分无法还原域文件。" % (len(mismatch), len(items)))
+        for fname, got, cur in mismatch:
+            print("    %-20s 切分 %6d 字节 vs 现有 %6d 字节" % (fname, got, cur))
+        print("  · join/dist 不受影响（不使用锚）；要重建域文件请人工处理或改 MANIFEST 设计")
+        print("  · 确要看切分产物：build_single.py split --force（写入 domains.split/，"
+              "不覆盖 domains/）")
+        return 1
+
+    out_dir = DOMAINS_DIR if not mismatch else os.path.join(ROOT, "domains.split")
+    os.makedirs(out_dir, exist_ok=True)
+    for (fname, _), chunk in zip(items, chunks):
+        with open(os.path.join(out_dir, fname), "w", encoding="utf-8", newline="") as f:
             f.write(chunk)
-    print("SPLIT_OK: %d 域文件 -> %s" % (len(items), DOMAINS_DIR))
+    print("SPLIT_OK: %d 域文件 -> %s%s" % (len(items), out_dir,
+                                          "（逐块一致，真往返）" if not mismatch
+                                          else "（与 domains/ 不一致，仅作比对，未覆盖源）"))
+    return 0
 
 
 def _title_of(text):
@@ -122,7 +150,7 @@ def check():
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "join"
     if cmd == "split":
-        split()
+        sys.exit(split(force="--force" in sys.argv))
     elif cmd == "join":
         join()
     elif cmd == "check":

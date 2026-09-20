@@ -401,6 +401,43 @@ def suite_unit_artifacts(s):
     s.check("VERSION 一致", bool(vm) and vm.group(1) == m.VERSION,
             "src=%r module=%r" % (vm.group(1) if vm else None, m.VERSION))
 
+    # MANIFEST 锚有效性（v2.2.4 加：此前锚悄悄过期没人发现——01 的锚还写着 VERSION = "1.5.19"，
+    # 而 split 会先清空 domains/ 再切分，锚失效 = 域文件被删空。join 不用锚，所以构建照常，
+    # 更说明必须由测试兜住）
+    mf = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                      "pyaissh-dev", "MANIFEST_domains.txt")
+    if not os.path.exists(mf):
+        s.check("MANIFEST 存在", False, mf)
+    else:
+        items = []
+        for line in open(mf, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                fname, _, anchor = line.partition("|")
+                items.append((fname.strip(), anchor.strip()))
+        s.check("MANIFEST 12 域", len(items) == 12, "got %d" % len(items))
+        miss, dup, order_bad = [], [], []
+        last = -1
+        for fname, anchor in items:
+            hits = [mm.start() for mm in re.finditer(anchor, text, re.M)]
+            if not hits:
+                miss.append("%s(%s)" % (fname, anchor))
+            elif len(hits) > 1:
+                dup.append("%s×%d" % (fname, len(hits)))
+            else:
+                if hits[0] < last:
+                    order_bad.append(fname)
+                last = hits[0]
+        s.check("MANIFEST 锚全部命中（无过期锚）", not miss, "未命中: %s" % ", ".join(miss))
+        s.check("MANIFEST 锚唯一（无歧义锚）", not dup, "多命中: %s" % ", ".join(dup))
+        s.check("MANIFEST 锚顺序与域序一致", not order_bad, "乱序: %s" % ", ".join(order_bad))
+        s.check("域文件齐全（锚对应的 12 个文件都在）",
+                all(os.path.exists(os.path.join(os.path.dirname(mf), "domains", f))
+                    for f, _ in items),
+                "缺: %s" % [f for f, _ in items
+                            if not os.path.exists(os.path.join(os.path.dirname(mf),
+                                                               "domains", f))])
+
 
 # ============================================================
 # 测试集 4：unit host add/remove/list 闭环（v2.1.4 自动化）

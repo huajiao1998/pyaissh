@@ -34,10 +34,10 @@
 
 ## 构建器
 
-- `build_single.py split`：单文件 → 12 域文件（仅搬移期用）
-- `build_single.py join`：12 域文件 → 单文件（确定性，逐字节稳定）
+- `build_single.py join`：12 域文件 → 单文件（确定性，逐字节稳定）——**日常只用这条**（`dist` 会 join + 双份同步）
 - `build_single.py check`：金标对比（built vs 指定单文件）+ 编译
-- `MANIFEST_domains.txt`：域文件顺序（显式，非 import 拓扑；顺序尊重顶层执行语义——00 含极早期信号、04 含 console/emit 模块级执行点）
+- `build_single.py split`：单文件 → 12 域文件（**仅搬移期用，当前不可往返**）——锚是**域内标识**而非域边界（域文件真正的起点是各自首行，单文件里的 `# ===== [域 NN/12] …` 横幅是 join 生成的、不在域文件里），所以按锚切分的结果与 `domains/` 不一致。该命令已加保护：先算后写、逐块比对，不一致时**拒绝覆盖 `domains/`**（要看得加 `--force`，产物写进 `domains.split/`）；旧版会先清空 `domains/` 再切分，锚一过期就是"域文件被删空"
+- `MANIFEST_domains.txt`：域文件顺序（显式，非 import 拓扑；顺序尊重顶层执行语义——00 含极早期信号、04 含 console/emit 模块级执行点）+ 每域一个**域内唯一锚**。`join/dist` **不使用锚**（只按行序拼接），所以锚失效不影响构建——正因如此，`unit_artifacts` 里加了"锚全部命中 / 唯一 / 有序 / 域文件齐全"四条断言兜住锚悄悄过期（2026-09-16：01 的锚曾停留在 `VERSION = "1.5.19"`）。版本类锚请写成与版本无关的形式（`^VERSION = "`）
 
 ## 测试（统一入口 tests/run_tests.py）
 
