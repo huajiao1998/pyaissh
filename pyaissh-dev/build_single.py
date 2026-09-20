@@ -1,13 +1,21 @@
 # -*- coding: utf-8 -*-
-"""pyaissh 单文件构建器（域版）：单文件 <-> domains/ 多域文件往返（护栏 2/3/4）。
+"""pyaissh 单文件构建器（域版）：domains/ 多域文件 -> 成品单文件（护栏 2/3/4）。
 
 用法:
-  python build_single.py split   # 单文件(SOURCE)按 MANIFEST_domains 切成 domains/
   python build_single.py join    # domains/ 按 MANIFEST_domains 拼回 pyaissh.built.py
-  python build_single.py check   # 往返验证：built vs 原单文件 逐字节一致 + 编译
+  python build_single.py check   # 金标对比：built vs 原单文件 逐字节一致 + 编译
+  python build_single.py dist    # join + 双份同步（根 pyaissh.py + skills/pyaissh/pyaissh.py）
+
+方向是**单向的**：域文件是源，成品单文件是产物。改代码请改 domains/，然后 dist；
+直接改 pyaissh.py 会在下次 dist 被覆盖（check 会告诉你两边是否一致）。
 
 确定性（护栏 4）：同一 domains/ 两次 join 逐字节相同（MANIFEST 固定顺序、无时间戳）。
-换行（护栏 3 实测）：原文件 CRLF——split/join 一律 newline="" 保原样。
+换行（护栏 3 实测）：域文件与成品一律 CRLF——join 用 newline="" 保原样。
+
+历史：曾有的 `split`（单文件 -> 域文件，按 MANIFEST 锚切分）已于 2026-09-16 **移除**：
+锚是域内标识而非域边界（域文件真正起点是各自首行，单文件里的 `# ===== [域 NN/12] …`
+横幅由 join 生成），它本就无法还原域文件；且旧实现会先清空 domains/ 再切分，锚一过期
+就是"域文件被删空"。成品不需要再切回域文件，故连同锚一并删除（需要时见 git 历史）。
 """
 import os
 import re
@@ -22,77 +30,22 @@ def shutil_copy(src, dst):
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 MAIN_REPO = os.path.dirname(ROOT)
-SOURCE = os.path.join(MAIN_REPO, "pyaissh.py")      # 现行成品单文件（split 的源 / check 的对标）
+SOURCE = os.path.join(MAIN_REPO, "pyaissh.py")      # 现行成品单文件（check 的对标）
 DOMAINS_DIR = os.path.join(ROOT, "domains")
 OUTPUT = os.path.join(ROOT, "pyaissh.built.py")
 MANIFEST = os.path.join(ROOT, "MANIFEST_domains.txt")
 
 
 def load_manifest():
+    """读 MANIFEST：每行 `<序号>_<域名>.py`（顺序即拼接顺序；`#` 行与空行忽略）。"""
     items = []
     for line in open(MANIFEST, encoding="utf-8"):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        fname, _, anchor = line.partition("|")
-        items.append((fname.strip(), anchor.strip()))
+        fname = line.split("|")[0].strip()   # 兼容历史上带锚的 `文件 | 锚` 写法
+        items.append(fname)
     return items
-
-
-def _split_text(text, items):
-    """按锚把文本切成 len(items) 块（每锚=块起点；块0从文件头；末块到 EOF）。"""
-    positions = []
-    search_from = 0
-    for name, anchor in items:
-        m = re.search(anchor, text[search_from:], re.M)
-        if not m:
-            print("SPLIT_FAIL: 锚未找到 %s | %s" % (name, anchor))
-            sys.exit(1)
-        positions.append(search_from + m.start())
-        search_from = positions[-1] + 1
-    bounds = [0] + positions[1:] + [len(text)]
-    return [text[bounds[i]:bounds[i + 1]] for i in range(len(items))]
-
-
-def split(force=False):
-    """按锚切分单文件（**注意语义**：锚是域内标识、不是边界，见 MANIFEST 头部）。
-
-    安全设计（2026-09-16）：
-      - 先算后写：切分/校验全部完成前**绝不碰 domains/**（旧版先 os.remove 清空目录，
-        锚一旦过期就是"域文件被删空 + 退出 1"）
-      - 与现有域文件逐块比对：不一致（锚是域内标识，通常如此）→ **拒绝覆盖 domains/**，
-        改写到 domains.split/ 供人工比对；只有逐块一致（真正的往返）才写回 domains/
-    """
-    text = open(SOURCE, encoding="utf-8", newline="").read()
-    items = load_manifest()
-    chunks = _split_text(text, items)          # 失败在这里退出，磁盘未被触碰
-
-    mismatch = []
-    for (fname, _), chunk in zip(items, chunks):
-        p = os.path.join(DOMAINS_DIR, fname)
-        cur = open(p, encoding="utf-8", newline="").read() if os.path.exists(p) else None
-        if cur != chunk:
-            mismatch.append((fname, len(chunk), len(cur) if cur is not None else -1))
-
-    if mismatch and not force:
-        print("SPLIT_REFUSED: 切分结果与现有域文件不一致（%d/%d 域）——锚是【域内标识】而非"
-              "域边界（见 MANIFEST 头部），按锚切分无法还原域文件。" % (len(mismatch), len(items)))
-        for fname, got, cur in mismatch:
-            print("    %-20s 切分 %6d 字节 vs 现有 %6d 字节" % (fname, got, cur))
-        print("  · join/dist 不受影响（不使用锚）；要重建域文件请人工处理或改 MANIFEST 设计")
-        print("  · 确要看切分产物：build_single.py split --force（写入 domains.split/，"
-              "不覆盖 domains/）")
-        return 1
-
-    out_dir = DOMAINS_DIR if not mismatch else os.path.join(ROOT, "domains.split")
-    os.makedirs(out_dir, exist_ok=True)
-    for (fname, _), chunk in zip(items, chunks):
-        with open(os.path.join(out_dir, fname), "w", encoding="utf-8", newline="") as f:
-            f.write(chunk)
-    print("SPLIT_OK: %d 域文件 -> %s%s" % (len(items), out_dir,
-                                          "（逐块一致，真往返）" if not mismatch
-                                          else "（与 domains/ 不一致，仅作比对，未覆盖源）"))
-    return 0
 
 
 def _title_of(text):
@@ -108,7 +61,7 @@ def join():
     total = len(items)
     newline = "\r\n"
     parts = []
-    for i, (fname, _) in enumerate(items):
+    for i, fname in enumerate(items):
         p = os.path.join(DOMAINS_DIR, fname)
         if not os.path.exists(p):
             print("JOIN_FAIL: 缺域文件 %s" % p)
@@ -150,7 +103,11 @@ def check():
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "join"
     if cmd == "split":
-        sys.exit(split(force="--force" in sys.argv))
+        # 2026-09-16 移除：成品不再切回域文件（改 domains/ 后跑 dist 即可）
+        print("SPLIT_REMOVED: split 已移除（2026-09-16）——方向是单向的：改 domains/ 后跑 "
+              "build_single.py dist。若确需从成品单文件重建域文件，见 git 历史中的旧实现，"
+              "并按【域文件首行】而非锚来切分。")
+        sys.exit(1)
     elif cmd == "join":
         join()
     elif cmd == "check":
@@ -172,5 +129,5 @@ if __name__ == "__main__":
         print("DIST_OK: 双份同步 %s (%s)" % ("md5 一致 " + next(iter(digests)) if ok else "md5 不一致!", "OK" if ok else "FAIL"))
         sys.exit(0 if ok else 1)
     else:
-        print("用法: build_single.py split|join|check|dist")
+        print("用法: build_single.py join|check|dist（split 已于 2026-09-16 移除）")
         sys.exit(1)

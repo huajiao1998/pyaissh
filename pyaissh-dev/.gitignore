@@ -1,4 +1,4 @@
-# 可再生中间产物（build_single.py split/join 随时重建）
+# 可再生中间产物（build_single.py join 随时重建）
 parts/
 pyaissh.built.py
 __pycache__/

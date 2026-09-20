@@ -203,3 +203,16 @@
   构建照常，所以此前无人发现；而 `split` 会先清空 `domains/` 再切分，锚失效 = 域文件被删空
 - 已把锚改成与版本无关形式（`^VERSION = "`），并给 `split` 加"先算后写 + 不一致拒绝覆盖"保护
 - 只读审计脚本确认：其余 11 个锚唯一命中且有序；`check` 金标对比仍逐字节一致（构建管线未受影响）
+
+## [2026-09-16] v2.2.4 补二：移除 split（构建方向定为单向）
+
+### 变更
+- `build_single.py` 删除 `split` 与 `_split_text`；跑 `split` 明确回 `SPLIT_REMOVED`（exit 1，不动磁盘）；
+  用法行改为 `join|check|dist`
+- `MANIFEST_domains.txt` 删除锚列（退回纯顺序清单）；`load_manifest` 兼容旧的 `文件 | 锚` 写法
+- `pyaissh-dev/README.md` 构建器章节改写：明确"域文件是源、成品是产物"，并记录 split 移除原因
+- `pyaissh-dev/.gitignore` 注释同步（split/join → join）
+### 测试
+- unit_artifacts 11 → 9：删掉 3 条锚断言（锚已不存在），保留并加强为
+  "MANIFEST 12 域 / 域序 00..11 / 域文件齐全"
+- 回归：`dist` md5 与移除前一致（`94a7a654…`，说明移除不影响成品）、`check` 逐字节一致 + 编译 OK

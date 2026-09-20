@@ -420,3 +420,9 @@
   `--force` 只写 `domains.split/` 供人工比对
 - **测试兜底**：`unit_artifacts` 6 → 11 例，新增 MANIFEST 锚"全部命中 / 唯一 / 有序 / 域文件齐全"
   ——`join/dist` 不用锚，锚失效不影响构建，所以只能靠测试发现（这正是本次漏网的原因）
+- **`build_single.py split` 已彻底移除**（同日，取代上一条的"安全化"）：方向确定为单向——
+  **`domains/` 是源，成品单文件是产物**（改代码改 domains/ 后 `dist`；直接改 `pyaissh.py`
+  下次 dist 会被覆盖，`check` 会报不一致）。跑 `split` 现在明确回 `SPLIT_REMOVED` 并退出 1，
+  不碰磁盘。MANIFEST 的**锚列一并删除**（锚的唯一消费者就是 split，留着只会再烂一次——
+  这次的过期锚就是这么来的）；MANIFEST 退回纯顺序清单，`unit_artifacts` 仍校验
+  "12 域 / 域序 00..11 / 域文件齐全"
