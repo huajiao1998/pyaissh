@@ -481,7 +481,7 @@ def build_parser():
                                     "ctrl-c/keys/list/kill。",
                         formatter_class=argparse.RawDescriptionHelpFormatter,
                         epilog="""\
-典型流程（长任务开头写错也不用重来：改下一条继续，状态还在）:
+典型流程（打错了就改对**再发一遍**，状态还在——像人在终端里那样）:
   pyaissh session start h --name work                    # 起会话（返回 pid/pty/log）
   pyaissh session run   h --name work --cmd 'cd /opt/app && git pull'   # 跑一条并等结果（一次调用）
   pyaissh session run   h --name work --cmd 'make -j8' --wait-rc 5      # 状态还在（cwd 仍是 /opt/app）

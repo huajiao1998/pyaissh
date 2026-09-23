@@ -5226,7 +5226,8 @@ def cmd_ls(args):
 - `exec`：一条命令一次调用，**无状态**（cd/export 不跨调用保留），受宿主单次调用时长限制
 - `exec --detach`：一条长命令丢后台，**启动后不能改**，错了只能 --kill 重启
 - `session`：远端一个常驻 shell（真 PTY），**逐条喂命令**——每条独立退出码，
-  错了改下一条继续，cd/export/函数等状态都在；执行中的命令**可中断**（ctrl-c）
+  **打错了就把那条命令改对再发一遍**（同一条重试，不是换下一条）：报错 → 改名/改参数 → 重发 → 成功，
+  像人在终端里那样；cd/export/函数等状态都在，所以重发时上下文与上次完全一致；执行中的命令**可中断**（ctrl-c）
 
 实测依据（v2.3 开发期真机验证，详见 docs/session.md）：
 - util-linux `script` 给出真 PTY：`test -t 0` 为真、`tty` = /dev/pts/N，可应答 `read -p` 提示
@@ -6728,7 +6729,7 @@ def build_parser():
                                     "ctrl-c/keys/list/kill。",
                         formatter_class=argparse.RawDescriptionHelpFormatter,
                         epilog="""\
-典型流程（长任务开头写错也不用重来：改下一条继续，状态还在）:
+典型流程（打错了就改对**再发一遍**，状态还在——像人在终端里那样）:
   pyaissh session start h --name work                    # 起会话（返回 pid/pty/log）
   pyaissh session run   h --name work --cmd 'cd /opt/app && git pull'   # 跑一条并等结果（一次调用）
   pyaissh session run   h --name work --cmd 'make -j8' --wait-rc 5      # 状态还在（cwd 仍是 /opt/app）

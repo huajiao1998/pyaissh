@@ -249,3 +249,22 @@
 - MCP 侧一开始报 `invalid choice: 'run'` —— 根因是 **pyaissh-mcp/pyaissh.py 副本未同步**
   （dist 只更新根+skills），`sync_check.py --update` 后即通过：改 CLI 后别忘了同步 MCP 副本
 - 决策表依据：本会话 382 次 pyaissh 调用中 139 次 exec 仅 14% 状态敏感 → 不设全局默认
+
+## [2026-09-24] v2.3.0 补二：修正 session 用法措辞 + 固化"人类式重试"
+
+### 背景（用户指出）
+- 我此前把用法写成"错了**改下一条**继续"——说小了。真实用法是**打错了就把那条命令改对再发一遍**
+  （同一条重试，像人在终端里：文件名打错 → 报错 → 改对 → 重发 → 成功），状态（cwd/变量）与上次完全一致
+### 文档措辞修正（6 处）
+- `11_cmd_session.py` docstring、`12_cli_main.py` session epilog、根 CHANGELOG v2.3.0 条目、
+  SKILL.md（决策表 + session 小节）、docs/session.md 定位段 → 统一改为"改对再发一遍（同一条重试）"
+- docs/session.md 新增「怎么判断这条失败了」（重试循环靠它）：exit_code 遵循 POSIX 管道语义
+  （取最后一个命令）+ **stderr 合并进 stdout**，所以报错文本可直接判断"名字打错了"；
+  命令等输入时会等到超时回 running，用 ctrl-c 打断再重发
+### 新增用例
+- live_session 25 → 28：打错的命令报错（exit_code!=0 + No such file）；改对后重发同一条命令即成功
+  （用的正是会话里 export 的变量）；重试期间 cwd 保持不变
+### 说明
+- 验证过程中的两次 FAIL 都是**夹具问题**：① 拿 nginx 做样例但目标机没装 nginx（产品行为正确）；
+  ② `cat $打错的变量 | wc -c` —— 变量为空导致 `cat` 无参读 stdin 阻塞（人类会按 Ctrl-C），
+  且管道 exit_code 取末尾命令（POSIX），故断言应看输出文本而非 exit_code

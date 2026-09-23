@@ -1156,6 +1156,22 @@ def suite_live_session(s):
     s.check("--no-wait 之后 read 能取到结果",
             bool(jr5) and "NOWAIT" in (jr5.get("stdout") or ""), repr(jr5.get("stdout"))[:80])
 
+    # 人类式重试（用户描述的用法）：打错 → 报错 → **改对再发一遍同一条命令** → 成功，状态保留
+    rc, he1, _ = _live_run(["session", "run", tgt, "--name", name, "--cmd",
+                            "cd /etc && export RF=hostname && ls -l /etc/hostnam"], timeout=60)
+    s.check("打错的命令报错（exit_code!=0 且输出里有 No such file）",
+            bool(he1) and he1.get("exit_code") not in (0, None)
+            and "No such file" in (he1.get("stdout") or ""),
+            "exit=%s out=%r" % ((he1 or {}).get("exit_code"), ((he1 or {}).get("stdout") or "")[:70]))
+    rc, he2, _ = _live_run(["session", "run", tgt, "--name", name, "--cmd", "cat $RF"], timeout=60)
+    s.check("改对后重发同一条命令即成功（用的正是会话里 export 的变量）",
+            bool(he2) and he2.get("exit_code") == 0 and (he2.get("stdout") or "").strip() != "",
+            "exit=%s out=%r" % ((he2 or {}).get("exit_code"), ((he2 or {}).get("stdout") or "")[:60]))
+    rc, he3, _ = _live_run(["session", "run", tgt, "--name", name, "--cmd", "pwd"], timeout=60)
+    s.check("重试期间 cwd 保持不变（重发时上下文与上次一致）",
+            bool(he3) and (he3.get("stdout") or "").strip() == "/etc",
+            repr((he3 or {}).get("stdout"))[:40])
+
     # keys：应答交互提示（哨兵必须不被 read 吃掉——本套件的核心回归点）
     _live_run(["session", "send", tgt, "--name", name, "--cmd",
                'read -p "N? " X; echo GOT:$X'], timeout=60)

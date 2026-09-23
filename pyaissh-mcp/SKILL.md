@@ -16,7 +16,7 @@ pyaissh 是基于 paramiko 的命令行 SSH 工具，专为非交互的 AI/脚�
 |---|---|---|
 | 单条命令、不依赖上一条的状态（多数情况：`id`/`cat`/`systemctl status`/`ls`/一次性脚本） | **`exec`** | 一次调用拿到结果；**stdout/stderr 分离**；远端零残留；结果可预测（无隐式状态） |
 | 一条长命令（装包/编译/备份/大扫描），中途不需要改 | **`exec --detach` + `log`** | 立即返回 `job_id`；`log --offset` 增量看；**`log --kill` 随时中断**；抗 SSH 断开 |
-| **多步、步骤间有状态**（`cd` 到目标目录、venv/环境变量、渐进式排查）、**可能要中止**、**要应答交互提示**（`read -p`/密码/y-n） | **`session`**（首选 `session run`） | `cd`/`export` 跨命令保留；跑歪了 `ctrl-c` 中断、改下一条继续；`keys` 应答提示 |
+| **多步、步骤间有状态**（`cd` 到目标目录、venv/环境变量、渐进式排查）、**可能要中止**、**要应答交互提示**（`read -p`/密码/y-n） | **`session`**（首选 `session run`） | `cd`/`export` 跨命令保留；**打错了改对再发一遍**（同一条重试）；跑歪了 `ctrl-c` 中断；`keys` 应答提示 |
 | 传文件（含大文件/断点续传） | `upload` / `download` | 零 token、并行分片、`.part` 原子收尾 |
 | 查目录 / 探活 / 管主机别名 | `ls` / `test` / `host` | 结构化字段，无需自己解析 |
 
@@ -121,7 +121,7 @@ python3 pyaissh.py session kill  h --name work                   # 收尾（进�
 ```
 
 - **`session run` = send + 等结果，一步一次调用**（与 `exec` 同成本）；`--wait-rc N` 超时则回 `status:"running"`（带 `token`，可 `read --wait-rc` 续等或 `ctrl-c` 中断）；`--no-wait` 只发送（等价 `send`）
-- **每条命令独立退出码**（`exit_code`）；**`cd`/`export`/函数跨命令保留**——错了改下一条继续，不用重来
+- **每条命令独立退出码**（`exit_code`）；**`cd`/`export`/函数跨命令保留**——**打错了就把那条命令改对再发一遍**（同一条重试）：像人打错文件名那样，报错 → 改对 → 重发 → 成功，上下文（cwd/变量）与上次完全一致，不用重来
 - **能中断执行中的命令**：`ctrl-c`（SIGINT→自动升级 TERM；`--force` = SIGKILL），会话与状态都保住
 - **能应答交互提示**：`keys --data 'y\n'`（支持 `\n \r \t \xNN`）
 - `read` 载荷字段 `stdout`（合并流，自动清洗 CR/ANSI/哨兵行）/`next_offset`/`status`(`done`|`running`)/`exit_code`

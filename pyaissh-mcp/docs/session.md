@@ -8,7 +8,7 @@
 
 `exec` 是"一条命令一次调用、无状态"；`exec --detach` 是"一条长命令丢后台、启动后改不了"；
 **`session` 是"远端一个常驻 shell，AI 一条一条喂命令"**——每条命令有独立退出码，
-`cd`/`export`/函数等状态跨命令保留，跑错了改下一条继续，执行中的命令**可以中断**。
+`cd`/`export`/函数等状态跨命令保留——**打错了就把那条命令改对再发一遍**（同一条重试，像人在终端里那样：文件名打错 → 报错 → 改对 → 重发 → 成功），执行中的命令**可以中断**。
 
 | 场景 | 该用谁 |
 |---|---|
@@ -64,6 +64,12 @@ pyaissh session kill  h --name work                       # 收尾（进程树�
 
 ## 边界与注意
 
+- **怎么判断"这条失败了"**（重试循环靠它）：① 先看 `exit_code`（0 = 成功）——注意它遵循 **shell/POSIX
+  语义**：管道取**最后一个命令**的状态（`cat 打错的文件 | wc -c` 仍会是 0，因为 `wc` 成功了）；
+  ② 再看输出文本：会话把 **stderr 合并进 `stdout`**，所以 `cat: ...: No such file or directory`
+  这类报错**就在 `stdout` 里**——判断"名字打错了"最直接的就是它；③ 命令若在等输入（例如变量名打错
+  导致 `cat` 无参去读 stdin），`run` 会等到 `--wait-rc` 超时并回 `status:"running"`，此时用
+  `session ctrl-c` 打断再改对重发。
 - **依赖**：`bash` + `mkfifo` 是必需的；真 PTY 需要 util-linux 的 `script`（`command -v script`）。
   缺失时自动降级为**非 PTY** 常驻 shell：状态与退出码照常，但没有 tty（需要 TTY 的程序不可用），
   结果里会带 warning 且 `pty: false`。
