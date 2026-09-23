@@ -421,13 +421,13 @@ TOOLS = [
     },
     {
         "name": "pyaissh_session",
-        "description": "常驻会话（真 PTY）：多步且带状态的远端操作——逐条喂命令、cd/export 跨命令保留、每条独立退出码、可中断执行中的命令、可应答交互提示。action 取值与用法：start（起会话，返回 pid/pty/ready）→ send（喂一条命令，返回 token/offset）→ read（读输出：offset 增量 / wait_rc 等这条结束拿 exit_code；载荷字段 stdout）→ ctrl-c（中断执行中的命令，会话不死；force=true 用 SIGKILL）→ keys（注入按键文本应答提示，data 支持 \\n \\r \\t \\xNN）→ list（列会话）→ kill（结束会话，进程树全清+删目录）。典型：start → send 'cd /opt/app' → send 'git pull' → read wait_rc=45 → send 'make -j8' → （错了）ctrl-c → send 'make -j4' → kill。",
+        "description": "常驻会话（真 PTY）：多步且带状态的远端操作——逐条喂命令、cd/export 跨命令保留、每条独立退出码、可中断执行中的命令、可应答交互提示。action 取值与用法：start（起会话，返回 pid/pty/ready）→ run（跑一条并等结果，一步一次调用；--wait-rc 超时回 status=running，--no-wait 只发送）→ read（读输出：offset 增量 / wait_rc 等这条结束拿 exit_code；载荷字段 stdout）→ ctrl-c（中断执行中的命令，会话不死；force=true 用 SIGKILL）→ keys（注入按键文本应答提示，data 支持 \\n \\r \\t \\xNN）→ list（列会话）→ kill（结束会话，进程树全清+删目录）。典型：start → send 'cd /opt/app' → send 'git pull' → read wait_rc=45 → send 'make -j8' → （错了）ctrl-c → send 'make -j4' → kill。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "target": {"type": "string", "description": "[user@]host[:port]；@别名"},
-                "action": {"type": "string", "enum": ["start", "send", "read", "ctrl-c", "keys",
-                                                      "list", "kill"],
+                "action": {"type": "string", "enum": ["start", "run", "send", "read", "ctrl-c",
+                                                      "keys", "list", "kill"],
                            "description": "会话子命令（必填）"},
                 "name": {"type": "string", "description": "会话名（默认 main；字母/数字/._-，≤32）"},
                 "cmd": {"type": "string", "description": "send：要执行的命令（与 cmd_file 二选一）"},
@@ -444,6 +444,8 @@ TOOLS = [
                 "cols": {"type": "integer", "description": "start：PTY 列宽（默认 200，防折行）"},
                 "no_pty": {"type": "boolean", "description": "start：强制非 PTY（无 tty，但状态与退出码照常）"},
                 "keep_ansi": {"type": "boolean", "description": "read：保留 ANSI 颜色码（默认剥离，便于解析）"},
+                "no_wait": {"type": "boolean", "description": "run：只发送不等待（等价 send，之后自己 read）"},
+                "max_output": {"type": "integer", "description": "run/read：单次回传上限字节（默认 64KB）"},
                 "session_dir": {"type": "string", "description": "会话根目录（默认 /tmp/pyaissh-sessions）"},
                 "keep_crlf": {"type": "boolean", "description": "send：保留命令文本 CRLF（默认归一为 LF，与 exec 同规则）"},
                 **_AUTH_PROPS,
@@ -469,6 +471,7 @@ _FLAG_MAP = {
     "name": "--name", "data": "--data", "raw": "--raw", "all": "--all", "keep_dir": "--keep-dir",
     "cols": "--cols", "no_pty": "--no-pty", "keep_ansi": "--keep-ansi",
     "session_dir": "--session-dir", "keep_crlf": "--keep-crlf", "token": "--token",
+    "no_wait": "--no-wait",
 }
 _TOOL_SUB = {t["name"]: t["name"][len("pyaissh_"):] for t in TOOLS}
 
@@ -505,7 +508,7 @@ def _build_argv(tool, args):
     if tool == "pyaissh_session":
         # session 需要二级子命令：pyaissh session <action> <target> [flags]
         action = str(args.get("action") or "").strip()
-        if action not in ("start", "send", "read", "ctrl-c", "keys", "list", "kill"):
+        if action not in ("start", "run", "send", "read", "ctrl-c", "keys", "list", "kill"):
             return None, {"ok": False, "error": "bad_args", "retryable": False,
                           "message": "session 需要 action（start/send/read/ctrl-c/keys/list/kill），"
                                      "收到 %r" % (args.get("action"),)}, []

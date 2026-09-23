@@ -107,6 +107,7 @@ SESSION_WAIT_MAX = 600           # --wait-rc 上限秒数
 SESSION_READY_WAIT = 8           # start 后等会话就绪（哨兵）的默认秒数
 SESSION_DEFAULT_LINES = 100      # read 默认尾部行数
 SESSION_RC_PREFIX = "__PYAISSH_RC__"   # 每条命令的退出码哨兵前缀（<prefix><token>__<rc>）
+SESSION_RUN_WAIT = 60            # session run 默认等待秒数（send + 等结束合成一次调用）
 JOIN_GRACE = 1.5             # 读线程 join 宽限（秒）
 RETRY_SLEEP = 0.5            # Windows 句柄未释放等场景的删除重试等待
 PUT_RETRY_SLEEP = 0.3        # 远端 .part 清理重试等待

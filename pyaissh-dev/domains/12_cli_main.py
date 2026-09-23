@@ -483,17 +483,17 @@ def build_parser():
                         epilog="""\
 典型流程（长任务开头写错也不用重来：改下一条继续，状态还在）:
   pyaissh session start h --name work                    # 起会话（返回 pid/pty/log）
-  pyaissh session send  h --name work --cmd 'cd /opt/app && git pull'
-  pyaissh session read  h --name work --wait-rc 30       # 等这条跑完，拿 exit_code
-  pyaissh session send  h --name work --cmd 'make -j8'   # 状态还在（cwd 仍是 /opt/app）
+  pyaissh session run   h --name work --cmd 'cd /opt/app && git pull'   # 跑一条并等结果（一次调用）
+  pyaissh session run   h --name work --cmd 'make -j8' --wait-rc 5      # 状态还在（cwd 仍是 /opt/app）
   pyaissh session ctrl-c h --name work                   # 中断正在跑的 make（会话不死）
   pyaissh session keys  h --name work --data 'y\\n'       # 应答程序提示（y/n、密码等）
   pyaissh session kill  h --name work                    # 结束会话（按 sid 全量清理）
 
 与 exec / exec --detach 的分工:
-  exec              一次一条、无状态（cd/export 不跨调用）、受宿主单次调用时长限制
-  exec --detach     一条长命令丢后台，启动后不能改，错了只能 --kill 重启
-  session           逐条喂 + 状态保留 + 可中断（本轮次最灵活；需要 tty 的程序也能跑）
+  exec              一次一条、无状态（cd/export 不跨调用）、stdout/stderr 分离、零残留
+  exec --detach     一条长命令丢后台，启动后不能改，错了只能 --kill 重启（可中断但无状态）
+  session           多步·需状态·可能要中断·要应答提示：逐条喂 + 状态保留 + ctrl-c + keys
+                    （run = send + 等结果，一步一次调用；send/read 分离时用于增量读）
 
 载荷字段: stdout（合并流，已清洗 CR/ANSI/哨兵行）/ next_offset / status(done|running)
           / exit_code / token / session / pid / pty
@@ -516,6 +516,26 @@ def build_parser():
 
     sse = ss.add_parser("send", help="把一条命令喂进会话（自动追加退出码哨兵）",
                         description="命令 + 哨兵写入会话 FIFO；用返回的 token/offset 去 read")
+    scur = ss.add_parser("run", help="会话内跑一条命令并等它结束（send+等待，一次调用）",
+                         description="喂命令 + 等哨兵 + 回传这条命令的输出与 exit_code——"
+                                     "会话式的「一步一次调用」。--no-wait 则只发送（等价 send）")
+    add_conn(scur)
+    scur.add_argument("--name", default="main", help="会话名（默认 main）")
+    scur.add_argument("--session-dir", dest="session_dir", help="会话根目录")
+    scur.add_argument("--cmd", help="要执行的命令")
+    scur.add_argument("--cmd-file", dest="cmd_file", help="从文件读命令 (- 表示 stdin)")
+    scur.add_argument("--keep-crlf", dest="keep_crlf", action="store_true",
+                      help="保留命令文本里的 CRLF（默认归一为 LF，与 exec 同规则）")
+    scur.add_argument("--wait-rc", dest="wait_rc", type=_positive_int,
+                      default=None, help="最多等 N 秒（默认 %d，上限 %d）；超时返回 status=running"
+                      % (SESSION_RUN_WAIT, SESSION_WAIT_MAX))
+    scur.add_argument("--no-wait", dest="no_wait", action="store_true",
+                      help="只发送不等待（等价 send，之后自己 read）")
+    scur.add_argument("--max-output", dest="max_output", type=_positive_int,
+                      default=DEFAULT_MAX_OUTPUT, help="单次回传上限字节（默认 64KB）")
+    scur.add_argument("--keep-ansi", dest="keep_ansi", action="store_true",
+                      help="保留 ANSI 颜色码（默认剥离，便于 AI 解析）")
+    scur.set_defaults(func=cmd_session_run)
     add_conn(sse)
     sse.add_argument("--name", default="main", help="会话名（默认 main）")
     sse.add_argument("--session-dir", dest="session_dir", help="会话根目录")

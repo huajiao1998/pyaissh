@@ -1127,6 +1127,35 @@ def suite_live_session(s):
             bool(j3) and "ALIVE" in (j3.get("stdout") or "")
             and "/var/log" in (j3.get("stdout") or ""), repr(j3.get("stdout"))[:140])
 
+    # run：send + 等结果合成一次调用（v2.3.0 的"一步一调用"）
+    rc, jr0, _ = _live_run(["session", "run", tgt, "--name", name, "--cmd", "cd /tmp && pwd"],
+                           timeout=90)
+    s.check("session run 一次调用拿退出码+输出",
+            bool(jr0) and jr0.get("status") == "done" and jr0.get("exit_code") == 0
+            and (jr0.get("stdout") or "").strip() == "/tmp", repr(jr0)[:180])
+    rc, jr1, _ = _live_run(["session", "run", tgt, "--name", name, "--cmd", "echo RUN2"],
+                           timeout=90)
+    s.check("run 之间状态保留（每条仍一次调用）",
+            bool(jr1) and jr1.get("exit_code") == 0 and "RUN2" in (jr1.get("stdout") or ""),
+            repr(jr1.get("stdout"))[:80])
+    rc, jr2, _ = _live_run(["session", "run", tgt, "--name", name, "--cmd", "sleep 300",
+                            "--wait-rc", "2"], timeout=90)
+    s.check("run --wait-rc 超时 → status=running 且保留 token（可续等）",
+            bool(jr2) and jr2.get("status") == "running" and jr2.get("exit_code") is None
+            and re.match(r"^[0-9a-f]{4,16}$", jr2.get("token") or ""), repr(jr2)[:160])
+    _live_run(["session", "ctrl-c", tgt, "--name", name], timeout=90)
+    rc, jr3, _ = _live_run(["session", "read", tgt, "--name", name, "--wait-rc", "15"], timeout=60)
+    s.check("run 起的命令可被 ctrl-c 中断并收敛",
+            bool(jr3) and jr3.get("exit_code") is not None, repr(jr3.get("exit_code")))
+    rc, jr4, _ = _live_run(["session", "run", tgt, "--name", name, "--cmd", "echo NOWAIT",
+                            "--no-wait"], timeout=60)
+    s.check("run --no-wait 只发送（running + token）",
+            bool(jr4) and jr4.get("status") == "running" and bool(jr4.get("token")),
+            repr(jr4)[:140])
+    rc, jr5, _ = _live_run(["session", "read", tgt, "--name", name, "--wait-rc", "15"], timeout=60)
+    s.check("--no-wait 之后 read 能取到结果",
+            bool(jr5) and "NOWAIT" in (jr5.get("stdout") or ""), repr(jr5.get("stdout"))[:80])
+
     # keys：应答交互提示（哨兵必须不被 read 吃掉——本套件的核心回归点）
     _live_run(["session", "send", tgt, "--name", name, "--cmd",
                'read -p "N? " X; echo GOT:$X'], timeout=60)

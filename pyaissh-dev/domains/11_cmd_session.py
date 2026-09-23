@@ -547,6 +547,119 @@ def _session_resolve_cmd(args):
     return cmd
 
 
+def _session_write_token(sftp, f, token):
+    """记下"最近这条命令"的 token（read/run 不带 --token 时用它定位）。"""
+    try:
+        with sftp.open(f["token"], "w") as fh:
+            fh.write(token)
+        _sftp_chmod(sftp, f["token"], 0o600)
+    except Exception:
+        pass
+
+
+def cmd_session_run(args):
+    """会话内跑一条命令并等它结束——**send + 等待合成一次调用**。
+
+    这是"会话式一步一调用"的关键：没有它，每步要 send + read 两次调用，
+    会话就比 exec 贵一倍（实测 exec 一次调用即可）。返回与 read 同构：
+    `stdout`（本条命令的输出）/`exit_code`/`status`(`done`|`running`)/`next_offset`/`token`。
+    超时未结束 → `status:"running"` + `next_action` 指路（read --wait-rc 继续等 / ctrl-c 中断）。
+    `--no-wait` 只发送不等（等价 send），让调用方自己决定怎么读。
+    """
+    start = time.time()
+    root = getattr(args, "session_dir", None) or DEFAULT_SESSION_DIR
+    cmd = _session_resolve_cmd(args)
+    if cmd is None:
+        return 2
+    if args.wait_rc and args.wait_rc > SESSION_WAIT_MAX:
+        emit_error(args.json, "bad_args",
+                   "--wait-rc 上限 %d 秒（宿主单次调用约 600s；更久请稍后 read 轮询）"
+                   % SESSION_WAIT_MAX)
+        return 2
+    conn, client, f, pid, _alive, ec = _session_load(args, root, args.name or "main")
+    if ec is not None:
+        return ec
+    try:
+        sftp = open_sftp(client)
+        try:
+            try:
+                offset = _session_sftp_read(sftp, f["log"], 0, 0)[1]
+            except Exception:
+                offset = 0
+            token = _session_send_payload(client, f, cmd)
+            if token is None:
+                emit_error(args.json, "send_failed",
+                           "命令未能写入会话 FIFO（会话可能刚退出或 FIFO 无读者）",
+                           extra={"session": args.name, "fifo": f["fifo"]})
+                return 255
+            _session_write_token(sftp, f, token)
+            wait = 0 if args.no_wait else (args.wait_rc or SESSION_RUN_WAIT)
+            exit_code, waited, out_text, size = None, 0.0, "", offset
+            if wait:
+                data, size, _rc, _tok, waited = _session_poll_sentinel(
+                    sftp, f["log"], offset, token, wait)
+                text_all = data.decode("utf-8", "replace")
+                out_text, exit_code, tok_hit = _session_slice_by_sentinel(text_all, token)
+                # 超时分支 slice 会返回 None（目标哨兵还没出现）——不能拿它覆盖我们已知的 token，
+                # 否则消费者没法用 --token 继续等（实测踩到：result.token 变 None）
+                if tok_hit:
+                    token = tok_hit
+            else:
+                size = _session_sftp_read(sftp, f["log"], 0, 0)[1]
+            truncated, omitted = False, 0
+            if len(out_text.encode("utf-8")) > args.max_output:
+                cut, truncated, omitted = _truncate_output(
+                    out_text.encode("utf-8"), args.max_output, "stdout")
+                out_text = cut.decode("utf-8", "replace")
+            done = exit_code is not None
+            result = {
+                "ok": True, "action": "session", "version": VERSION, "session": args.name,
+                "token": token, "sent_bytes": len(cmd.encode("utf-8")),
+                "stdout": out_text, "stream": "stdout+stderr",
+                "bytes_returned": len(out_text.encode("utf-8")),
+                "log": f["log"], "log_bytes": size, "next_offset": size,
+                "status": "done" if done else "running",
+                "exit_code": exit_code,
+                "exit_success": (exit_code == 0) if done else None,
+                "waited_ms": int(waited * 1000),
+                "pid": int(pid) if str(pid).isdigit() else pid,
+                "host": conn["host"], "user": conn["user"], "port": conn["port"],
+                "warnings": [], "duration_ms": int((time.time() - start) * 1000),
+            }
+            if truncated:
+                result["output_truncated"] = True
+                result["omitted_bytes"] = omitted
+            if done:
+                result["next_action"] = ("命令已结束（exit_code=%s）。继续下一步：再来一条 session run；"
+                                         "收尾：session kill" % exit_code)
+            else:
+                result["next_action"] = ("命令仍在跑（等了 %d ms 未结束）。继续等：session read "
+                                         "--wait-rc 30 --token %s；中断它：session ctrl-c；"
+                                         "读增量输出：session read --offset %d"
+                                         % (result["waited_ms"], token, size))
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+        _emit_result(args, result, header="[SESSION %s run %s] exit=%s token=%s"
+                     % (args.name, "done" if result["status"] == "done" else "running",
+                        result["exit_code"], result["token"]),
+                     sections=[("OUT", result["stdout"])])
+        return 0
+    except KeyboardInterrupt:
+        emit_error(args.json, "interrupted", _interrupt_msg())
+        return 130
+    except SshError as e:
+        emit_error(args.json, e.error_type, str(e))
+        return 255
+    except Exception as e:
+        emit_error(args.json, "session_run_failed", str(e))
+        return 255
+    finally:
+        close_all(client)
+
+
 def cmd_session_read(args):
     """读会话输出：尾部 N 行 / --offset 增量读 / --wait-rc 等某条命令结束。"""
     start = time.time()

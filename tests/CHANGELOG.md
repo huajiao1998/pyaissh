@@ -235,3 +235,17 @@
   闭包 awk 另有两坑：引号写成 `root=\"$P\"`（值带引号→闭包恒空）与打印用下标而非 `pid[k]`
 - `ctrl-c` 的 SIGINT 对 setsid+nohup 起的会话树可能无效 → 自动升级 SIGTERM（`--force`=SIGKILL）
 - 测试助手坑：`time` 未导入导致套件中途崩；哨兵 fixture 用了非 hex token（正则按设计不认）
+
+## [2026-09-24] v2.3.0 补：session run（一步一次调用）+ SKILL 默认姿势决策表
+
+### 新增用例
+- live_session 19 → 25：run 一次调用拿 exit_code+输出；run 之间状态保留；run --wait-rc 超时 →
+  status=running 且 **token 保留**（可续等）；run 起的命令可 ctrl-c 中断并收敛；--no-wait 只发送；
+  随后 read 取到结果
+- MCP 真机 21 → 23：B17a（经 MCP 透传 run 拿 exit_code+输出）、B17b（run wait_rc 超时 → running
+  且 token 保留）；离线 T2a2 的 action 枚举断言同步为 8 项（含 run）+ no_wait/max_output 参数
+### 说明
+- 修复实测发现的缺陷：run 超时分支把结果里的 token 覆写成 None（消费者无法用 --token 续等）
+- MCP 侧一开始报 `invalid choice: 'run'` —— 根因是 **pyaissh-mcp/pyaissh.py 副本未同步**
+  （dist 只更新根+skills），`sync_check.py --update` 后即通过：改 CLI 后别忘了同步 MCP 副本
+- 决策表依据：本会话 382 次 pyaissh 调用中 139 次 exec 仅 14% 状态敏感 → 不设全局默认

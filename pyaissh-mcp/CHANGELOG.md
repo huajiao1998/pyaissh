@@ -163,3 +163,14 @@
   真机套件 17 → 21（`B16a` start、`B16b` send+read 拿 exit_code、`B16c` kill 无残留、
   `B16d` 非法 action 连接前拒绝）
 - **真机验证数据**：MCP 离线 41 + 真机 21 全绿；CLI 侧 `live_session` 19 例全绿（见 CLI CHANGELOG）
+
+### 补充（同日）：跟随 CLI 的 `session run`（一步一次调用）
+
+- `pyaissh_session` 的 `action` 增加 **`run`**（= send + 等结果，**一次调用**拿到 `exit_code` 与输出；
+  `--wait_rc` 超时回 `status:"running"` 且保留 `token`，`--no_wait` 只发送）；新增参数
+  `no_wait`/`max_output`；工具描述与 README 同步
+- 排障记录：MCP 侧一开始报 `invalid choice: 'run'`——根因是 **`pyaissh-mcp/pyaissh.py` 固定副本未同步**
+  （`dist` 只更新仓库根 + `skills/pyaissh/`），跑 `sync_check.py --update` 后即通过；
+  **改完 CLI 记得同步 MCP 副本**
+- **真机验证数据**：MCP 离线 41 + 真机 **23** 全绿（新增 `B17a` run 拿 exit_code+输出、
+  `B17b` run wait_rc 超时 → running 且 token 保留）

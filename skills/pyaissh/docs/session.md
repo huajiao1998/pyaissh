@@ -22,24 +22,26 @@
 
 ```bash
 pyaissh session start h --name work                      # 起会话：返回 pid/pty/log/ready
-pyaissh session send  h --name work --cmd 'cd /opt/app'
-pyaissh session send  h --name work --cmd 'git pull'
-pyaissh session read  h --name work --wait-rc 60          # 等这条跑完 → exit_code + 输出
-pyaissh session send  h --name work --cmd 'make -j8'
-pyaissh session read  h --name work --wait-rc 5           # 还在跑 → status=running
-pyaissh session ctrl-c h --name work                      # 中断 make（会话活着，cwd 还在 /opt/app）
-pyaissh session send  h --name work --cmd 'make -j4'      # 换成正确命令继续，不用重来
+pyaissh session run   h --name work --cmd 'cd /opt/app'   # 一步一次调用：跑一条并等结果
+pyaissh session run   h --name work --cmd 'git pull'      # 状态保留：cwd 仍在 /opt/app
+pyaissh session run   h --name work --cmd 'make -j8' --wait-rc 5   # 5s 没完 → status=running
+pyaissh session ctrl-c h --name work                      # 中断 make（会话活着，cwd 还在）
+pyaissh session run   h --name work --cmd 'make -j4'      # 换成正确命令继续，不用重来
 pyaissh session keys  h --name work --data 'y\n'          # 应答程序提示（y/n、密码…）
 pyaissh session kill  h --name work                       # 收尾（进程树全清 + 删目录）
 ```
+
+> 需要"边跑边看"时用 `send` + `read --offset`（增量读）；只用 `run` 是"跑完给结果"。
+> 两者可混用：`session run --no-wait` 等价 `send`。
 
 ## 子命令
 
 | 子命令 | 作用 | 关键字段/参数 |
 |---|---|---|
 | `start <target> [--name main]` | 起会话（`setsid`+`nohup`+util-linux `script` 给真 PTY）| 返回 `pid`/`pty`/`ready`/`log`/`fifo`/[`permissions`](contract.md)；`--cols`（默认 200，防折行）、`--no-pty`、`--wait-ready` |
-| `send <target> --name S (--cmd '…' \| --cmd-file -)` | 喂一条命令（自动追加退出码哨兵）| 返回 `token`/`offset`（用 `read --offset` 或 `--token` 取结果）；命令文本 CRLF 默认归一（`--keep-crlf` 保留）|
-| `read <target> --name S [--offset N] [--lines N] [--wait-rc SECS] [--token T]` | 读输出：尾部 / 增量 / **等某条命令结束** | 载荷字段 `stdout`（合并流，已清洗 CR/ANSI/哨兵行）、`next_offset`、`status`(`done`\|`running`)、`exit_code`、`token`；`--keep-ansi` 保留颜色码 |
+| **`run <target> --name S --cmd '…'`** | **跑一条并等它结束（推荐；=`send`+等待合成一次调用）** | 返回与 `read` 同构：`stdout`/`exit_code`/`status`(`done`\|`running`)/`token`/`next_offset`；`--wait-rc N`（默认 60，上限 600）超时回 `running`，`--no-wait` 只发送 |
+| `send <target> --name S (--cmd '…' \| --cmd-file -)` | 只喂命令不等（需要边跑边增量读时用）| 返回 `token`/`offset`/`next_offset`；命令文本 CRLF 默认归一（`--keep-crlf` 保留）|
+| `read <target> --name S [--offset N] [--lines N] [--wait-rc SECS] [--token T]` | 读输出：尾部 / 增量 / 等某条命令结束 | 载荷字段 `stdout`（合并流，已清洗 CR/ANSI/哨兵行）、`next_offset`、`status`(`done`\|`running`)、`exit_code`、`token`；`--keep-ansi` 保留颜色码 |
 | `ctrl-c <target> --name S [--force]` | **中断正在执行的命令**（对它的进程组发 SIGINT；`--force` → SIGKILL）| `signaled_groups`/`signaled_children`/`signaled_count`/`escalated_to_term`；会话**不死**，状态保留 |
 | `keys <target> --name S --data 'y\n'` | 注入按键/文本（应答提示、Ctrl-D）| `--data` 支持 `\n \r \t \xNN \\`；`--raw` 原样；`--cmd-file` 送原始字节 |
 | `list <target>` | 列该主机会话（存活/pty/日志大小/最后活动）| `sessions[]`：`session`/`pid`/`status`/`pty`/`log_bytes`/`mtime` |

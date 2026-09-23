@@ -8,6 +8,20 @@ whenToUse: 需要 SSH 到远程主机执行命令、跑长任务（后台作业 
 
 pyaissh 是基于 paramiko 的命令行 SSH 工具，专为非交互的 AI/脚本使用设计。需要操作远程主机（执行命令、传文件、查目录）时，用本工具而不是裸调 ssh：它的输出是结构化、可精确解析的。**传输零 token 消耗**：upload/download 文件内容从不回传 JSON——AI 只消费元数据（`files`/`bytes`/`file_list`），大文件/二进制不会烧爆 LLM 上下文。
 
+## 先选对模式（默认姿势，v2.3）
+
+**按任务类别选，不要一律用同一个子命令**——选错的代价是：要么多花一倍调用，要么丢掉 stdout/stderr 分离与"零残留"。
+
+| 任务形态 | 用哪个 | 为什么 |
+|---|---|---|
+| 单条命令、不依赖上一条的状态（多数情况：`id`/`cat`/`systemctl status`/`ls`/一次性脚本） | **`exec`** | 一次调用拿到结果；**stdout/stderr 分离**；远端零残留；结果可预测（无隐式状态） |
+| 一条长命令（装包/编译/备份/大扫描），中途不需要改 | **`exec --detach` + `log`** | 立即返回 `job_id`；`log --offset` 增量看；**`log --kill` 随时中断**；抗 SSH 断开 |
+| **多步、步骤间有状态**（`cd` 到目标目录、venv/环境变量、渐进式排查）、**可能要中止**、**要应答交互提示**（`read -p`/密码/y-n） | **`session`**（首选 `session run`） | `cd`/`export` 跨命令保留；跑歪了 `ctrl-c` 中断、改下一条继续；`keys` 应答提示 |
+| 传文件（含大文件/断点续传） | `upload` / `download` | 零 token、并行分片、`.part` 原子收尾 |
+| 查目录 / 探活 / 管主机别名 | `ls` / `test` / `host` | 结构化字段，无需自己解析 |
+
+**别做这三件事**：① 多步操作硬拼成一条 `&&` 长命令（断在中途无法续、错误定位差）；② 单条命令也起会话（多一次调用 + 远端常驻 shell + 收尾清理，纯负担）；③ 长命令用前台 `exec` 等到超时（该 `--detach` 或 `session`）。
+
 ## 速查（先读这 10 条）
 
 1. **默认输出就是整行 JSON**（无需任何 flag），直接 `json.loads` stdout（**`--help` 纯文本除外**——需要用法时先跑 `--help` 读文本，其余一律 JSON）；`--text` 切可读模式（仅供人类）；`--json` 为兼容旧用法的空操作
@@ -98,16 +112,16 @@ python3 pyaissh.py exec root@1.2.3.4 --cmd-file win.sh --keep-crlf  # 确实要 
 
 ```bash
 python3 pyaissh.py session start h --name work                   # 起会话（真 PTY；返回 pid/pty/ready）
-python3 pyaissh.py session send  h --name work --cmd 'cd /opt/app'
-python3 pyaissh.py session send  h --name work --cmd 'git pull'
-python3 pyaissh.py session read  h --name work --wait-rc 60      # 等这条跑完 → exit_code + 输出
-python3 pyaissh.py session send  h --name work --cmd 'make -j8'
+python3 pyaissh.py session run   h --name work --cmd 'cd /opt/app && git pull'   # 跑一条并等结果（一次调用）
+python3 pyaissh.py session run   h --name work --cmd 'make -j8' --wait-rc 5      # 状态还在（cwd 仍是 /opt/app）
 python3 pyaissh.py session ctrl-c h --name work                  # 中断正在跑的 make（会话不死，cwd 还在）
 python3 pyaissh.py session keys  h --name work --data 'y\n'      # 应答程序提示（y/n、密码…）
+python3 pyaissh.py session read  h --name work --offset 0        # 增量读（send/--no-wait 之后用）
 python3 pyaissh.py session kill  h --name work                   # 收尾（进程树全清 + 删目录）
 ```
 
-- **每条命令独立退出码**（`read --wait-rc` 回 `exit_code`）；**`cd`/`export`/函数跨命令保留**——错了改下一条继续，不用重来
+- **`session run` = send + 等结果，一步一次调用**（与 `exec` 同成本）；`--wait-rc N` 超时则回 `status:"running"`（带 `token`，可 `read --wait-rc` 续等或 `ctrl-c` 中断）；`--no-wait` 只发送（等价 `send`）
+- **每条命令独立退出码**（`exit_code`）；**`cd`/`export`/函数跨命令保留**——错了改下一条继续，不用重来
 - **能中断执行中的命令**：`ctrl-c`（SIGINT→自动升级 TERM；`--force` = SIGKILL），会话与状态都保住
 - **能应答交互提示**：`keys --data 'y\n'`（支持 `\n \r \t \xNN`）
 - `read` 载荷字段 `stdout`（合并流，自动清洗 CR/ANSI/哨兵行）/`next_offset`/`status`(`done`|`running`)/`exit_code`

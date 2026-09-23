@@ -457,3 +457,22 @@
   （新增 `11_cmd_session.py`，`12_cli_main.py` 顺延）
 - **文档**：新增 `docs/session.md`（定位对比/子命令/三个实测坑/边界）；SKILL.md 增章节与触发词；
   contract.md 增会话字段契约；errors.md 增 `session_*` 错误类型
+
+### 补充：`session run`（一步一次调用）+ SKILL 默认姿势决策表
+
+- **`session run <target> --name S --cmd '…'`** = `send` + 等哨兵 + 回传该命令输出与 `exit_code`，
+  **合成一次调用**：此前每步要 `send`+`read` 两次调用（比 `exec` 贵一倍），这是"会话式当不了多步任务
+  首选"的最大摩擦；现在会话式每步与 `exec` 同成本
+  - `--wait-rc N`（默认 60，上限 600）超时回 `status:"running"` 且**保留 `token`**（可
+    `read --wait-rc --token` 续等或 `ctrl-c` 中断）；`--no-wait` 只发送（等价 `send`）
+  - 顺带修一处缺陷：超时分支曾把 `token` 覆写成 `None`，消费者无法续等（实测发现）
+- **SKILL.md 顶部新增「先选对模式（默认姿势）」决策表**：按任务类别给默认——
+  `exec`（单条/无状态：stdout-stderr 分离、一次调用、零残留）/ `exec --detach`+`log`
+  （单条长命令：可 `--kill` 中断、抗断线）/ `session run`（多步·需状态·可能要中断·要应答提示）/
+  传输 / 探查；并写明三条"别做"：多步硬拼 `&&`、单条命令也起会话、长命令用前台 exec 等到超时
+  - 依据：本会话 382 次 pyaissh 调用实测——139 次 `exec` 中仅 **14%** 带 `cd`/`export`/`source`
+    （状态敏感、会话才有增益），86% 是单条无状态命令；故**不把 session 设为全局默认**，
+    而是"按任务类别给默认"
+- **测试**：`live_session` 19 → 25 例（run 一次调用拿退出码+输出、run 之间状态保留、
+  `--wait-rc` 超时回 running 且 token 保留、run 起的命令可 ctrl-c 中断收敛、`--no-wait` 只发送、
+  随后 read 取结果）；MCP 真机 21 → 23（`B17a/B17b` 经 MCP 透传 run）
