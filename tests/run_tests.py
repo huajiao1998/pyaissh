@@ -41,6 +41,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 sys.stdout.reconfigure(encoding="utf-8")
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 仓库根
@@ -317,6 +318,55 @@ def suite_unit_regression(s):
     _b = m.build_parser().parse_args(["exec", "h", "--cmd", "x", "--keep-crlf"])
     s.check("--keep-crlf 默认关、显式开（exec 参数）",
             _a.keep_crlf is False and _b.keep_crlf is True)
+
+    # v2.3 会话单元（纯函数，不连远端）
+    sf = m._session_files("/tmp/pyaissh-sessions", "demo")
+    s.check("会话路径表完整（dir/fifo/log/pid/meta/bash/token）",
+            sf["dir"] == "/tmp/pyaissh-sessions/demo" and sf["fifo"].endswith("/in")
+            and sf["log"].endswith("/out.log") and sf["pid"].endswith("/sess.pid")
+            and sf["bash"].endswith("/bash.pid") and sf["token"].endswith("/last.token"),
+            repr(sf))
+    s.check("会话名正则：接受合法、拒绝穿越/空/超长",
+            bool(m._SESSION_NAME_RE.match("work-1.x")) and not m._SESSION_NAME_RE.match("../etc")
+            and not m._SESSION_NAME_RE.match("") and not m._SESSION_NAME_RE.match("a" * 33)
+            and not m._SESSION_NAME_RE.match("-lead"))
+    # --data 转义解析
+    un = m._session_unescape
+    s.check("--data 转义：\\n/\\r/\\t/\\xNN/\\\\ 与原文",
+            un("y\\n") == "y\n" and un("a\\tb") == "a\tb" and un("\\x03") == "\x03"
+            and un("\\\\") == "\\" and un("plain") == "plain", repr((un("y\\n"), un("\\x03"))))
+    # 哨兵包裹（真 bug 的护栏：哨兵必须与命令同一行被解析，否则被 read 吃掉）
+    pl = m._session_payload_text("read -p 'x' V; echo $V", "abcd1234")
+    s.check("命令与哨兵同一行（{ ...; }; echo 哨兵）",
+            pl.startswith("{\n") and "\n}; echo \"%sabcd1234__$?\"\n" % m.SESSION_RC_PREFIX in pl,
+            repr(pl))
+    s.check("多行命令也被包裹且状态留在同一 shell（用 {} 非 ()）",
+            "(" not in pl.split("\n")[0] and "{\n" in pl)
+    # 哨兵切分：只回"这条命令"的输出
+    log = ("%saaaa__0\n/var/log\n%sbbbb__0\n"
+           "bash: nope: command not found\n%scccc__127\n" % (m.SESSION_RC_PREFIX,
+                                                             m.SESSION_RC_PREFIX,
+                                                             m.SESSION_RC_PREFIX))
+    out_a, rc_a, tok_a = m._session_slice_by_sentinel(log, "aaaa")
+    out_b, rc_b, _ = m._session_slice_by_sentinel(log, "bbbb")
+    out_c, rc_c, _ = m._session_slice_by_sentinel(log, "cccc")
+    _out_last, rc_last, tok_last = m._session_slice_by_sentinel(log)
+    s.check("按 token 切出各自输出与退出码",
+            out_a == "" and rc_a == 0 and tok_a == "aaaa" and out_b == "/var/log" and rc_b == 0
+            and rc_c == 127 and "command not found" in out_c,
+            repr((out_a, rc_a, out_b, out_c, rc_c)))
+    s.check("不带 token → 取最后一个哨兵（127 那条）",
+            rc_last == 127 and tok_last == "cccc", repr((rc_last, tok_last)))
+    _o, rc_run, tok_run = m._session_slice_by_sentinel(log + "still running\n", "zzzz")
+    s.check("目标 token 未出现 → running（rc=None）且给最后哨兵之后的输出",
+            rc_run is None and tok_run is None and "still running" in _o, repr((rc_run, _o)))
+    # 输出清洗
+    dirty = ("Script started on x [COMMAND=\"bash\"]\r\n\x1b[31mRED\x1b[0m\r\n"
+             "%sab12__0\r\n" % m.SESSION_RC_PREFIX)
+    s.check("清洗：去 CR/ANSI/哨兵行/script 头",
+            m._session_clean_text(dirty) == "RED", repr(m._session_clean_text(dirty)))
+    s.check("--keep-ansi 时保留 ANSI 码",
+            "\x1b[31m" in m._session_clean_text(dirty, strip_ansi=False))
     # 单引号路径注入防护：路径只做 POSIX 单引号转义后进 run.sh
     odd = m._job_files("/tmp/it's dir", "j2")
     _j2, run2 = m._detach_scripts(odd, "true")
@@ -375,26 +425,26 @@ def suite_unit_artifacts(s):
     text = open(src_path, encoding="utf-8", errors="replace").read()
     lines = text.splitlines()
 
-    # 域边界横幅：11 个（域 01..11，00=文件头无横幅）+ 有序 + 带标题
-    banners = re.findall(r"# =+ \[域 (\d+)/12\]", text)
-    s.check("域横幅 11 个", len(banners) == 11, "got %d: %r" % (len(banners), banners))
-    s.check("域横幅序 01..11", banners == ["%02d" % i for i in range(1, 12)],
+    # 域边界横幅：12 个（域 01..12，00=文件头无横幅）+ 有序 + 带标题
+    banners = re.findall(r"# =+ \[域 (\d+)/13\]", text)
+    s.check("域横幅 12 个", len(banners) == 12, "got %d: %r" % (len(banners), banners))
+    s.check("域横幅序 01..12", banners == ["%02d" % i for i in range(1, 13)],
             "got %r" % banners)
-    titled = re.findall(r"# =+ \[域 \d+/12\]\s+([^=]+?)\s+=+", text)
-    s.check("横幅标题非空", len(titled) == 11 and all(t.strip() for t in titled),
+    titled = re.findall(r"# =+ \[域 \d+/13\]\s+([^=]+?)\s+=+", text)
+    s.check("横幅标题非空", len(titled) == 12 and all(t.strip() for t in titled),
             "got %d 标题" % len(titled))
 
     # 域 docstring 代码地图：每个横幅后紧跟本域 docstring（""" 开头）
     ok_doc = 0
     for i, ln in enumerate(lines):
-        if re.match(r"# =+ \[域 \d+/12\]", ln):
+        if re.match(r"# =+ \[域 \d+/13\]", ln):
             nxt = lines[i + 1] if i + 1 < len(lines) else ""
             if nxt.lstrip().startswith('"""'):
                 ok_doc += 1
-    s.check("横幅后跟域 docstring", ok_doc == 11, "got %d/11" % ok_doc)
-    # 代码地图 docstring 分区总数（文件头 docstring + 11 域 docstring ≥ 12）
+    s.check("横幅后跟域 docstring", ok_doc == 12, "got %d/12" % ok_doc)
+    # 代码地图 docstring 分区总数（文件头 docstring + 12 域 docstring ≥ 13）
     heads = sum(1 for ln in lines if ln.lstrip().startswith('"""'))
-    s.check("docstring 分区 ≥12", heads >= 12, "got %d" % heads)
+    s.check("docstring 分区 ≥13", heads >= 13, "got %d" % heads)
 
     # VERSION：源码文本与模块一致（防单文件漂移）
     vm = re.search(r'VERSION = "([^"]+)"', text)
@@ -413,13 +463,13 @@ def suite_unit_artifacts(s):
             line = line.strip()
             if line and not line.startswith("#"):
                 names.append(line.split("|")[0].strip())
-        s.check("MANIFEST 12 域", len(names) == 12, "got %d: %r" % (len(names), names))
-        s.check("MANIFEST 域序 00..11",
-                [n.split("_")[0] for n in names] == ["%02d" % i for i in range(12)],
+        s.check("MANIFEST 13 域", len(names) == 13, "got %d: %r" % (len(names), names))
+        s.check("MANIFEST 域序 00..12",
+                [n.split("_")[0] for n in names] == ["%02d" % i for i in range(13)],
                 "got %r" % [n.split("_")[0] for n in names])
         missing = [n for n in names
                    if not os.path.exists(os.path.join(os.path.dirname(mf), "domains", n))]
-        s.check("域文件齐全（MANIFEST 列出的 12 个都在）", not missing, "缺: %s" % missing)
+        s.check("域文件齐全（MANIFEST 列出的 13 个都在）", not missing, "缺: %s" % missing)
 
 
 # ============================================================
@@ -1022,17 +1072,130 @@ def suite_live_transfer(s):
 
 
 # ============================================================
+# 测试集 8：live_session —— 常驻会话（v2.3，真机）
+#   真 PTY + 逐条喂命令 + 状态保留 + 每条退出码 + ctrl-c 中断执行中的命令 + keys 应答提示
+#   开发期实测出的三个坑都在这里有护栏：
+#     ① 哨兵若单列一行会被命令里的 read 吃掉 → 必须 { ...; }; echo 哨兵（同一行解析）
+#     ② kill 若只删目录/按 sid 杀 → 会话进程仍活（script 的子 shell 自己 setsid）→ 用进程树闭包
+#     ③ ctrl-c 只发 SIGINT 杀不死（setsid+nohup 起，SIGINT 处置被继承）→ 自动升级 TERM
+# ============================================================
+
+def suite_live_session(s):
+    if _missing_env(_REQ_EXEC):
+        print("SKIP: 需配置 %s" % " / ".join(_REQ_EXEC))
+        return None
+    tgt = os.environ["PYAISSH_TEST_HOST"]
+    name = "ts1"
+    _live_run(["session", "kill", tgt, "--name", name], timeout=120)
+    _live_run(["session", "kill", tgt, "--all"], timeout=120)
+
+    rc, j, _ = _live_run(["session", "start", tgt, "--name", name], timeout=120)
+    s.check("start：返回 pid/pty/ready + 0700 权限",
+            rc == 0 and bool(j) and j.get("ok") and isinstance(j.get("pid"), int)
+            and j.get("pty") is True and j.get("ready") is True
+            and j.get("permissions", {}).get("dir") == "0700", repr(j)[:200])
+
+    _live_run(["session", "send", tgt, "--name", name, "--cmd", "cd /var/log; pwd"], timeout=60)
+    rc, j, _ = _live_run(["session", "read", tgt, "--name", name, "--wait-rc", "20"], timeout=90)
+    s.check("逐条喂命令：退出码 0 + 输出 /var/log",
+            bool(j) and j.get("exit_code") == 0 and "/var/log" in (j.get("stdout") or ""),
+            repr(j)[:160])
+    _live_run(["session", "send", tgt, "--name", name, "--cmd", "this_cmd_is_missing"],
+              timeout=60)
+    rc, j, _ = _live_run(["session", "read", tgt, "--name", name, "--wait-rc", "20"], timeout=90)
+    s.check("错误命令独立退出码 127，会话不死", bool(j) and j.get("exit_code") == 127,
+            repr(j.get("exit_code")))
+    _live_run(["session", "send", tgt, "--name", name, "--cmd", "echo PWD=$(pwd)"], timeout=60)
+    rc, j, _ = _live_run(["session", "read", tgt, "--name", name, "--wait-rc", "20"], timeout=90)
+    s.check("状态保留：错误命令后 cwd 仍是 /var/log",
+            bool(j) and "PWD=/var/log" in (j.get("stdout") or ""), repr(j.get("stdout"))[:120])
+
+    # ctrl-c：中断执行中的命令，会话与状态都保住
+    _live_run(["session", "send", tgt, "--name", name, "--cmd", "sleep 300"], timeout=60)
+    rc, jr, _ = _live_run(["session", "read", tgt, "--name", name, "--wait-rc", "2"], timeout=60)
+    s.check("长命令 status=running", bool(jr) and jr.get("status") == "running",
+            repr(jr.get("status")))
+    rc, jc, _ = _live_run(["session", "ctrl-c", tgt, "--name", name], timeout=90)
+    s.check("ctrl-c 发出信号（signaled_count>=1）",
+            bool(jc) and jc.get("ok") and (jc.get("signaled_count") or 0) >= 1, repr(jc)[:180])
+    rc, j2, _ = _live_run(["session", "read", tgt, "--name", name, "--wait-rc", "15"], timeout=60)
+    s.check("被中断命令收敛（有退出码，非 None）",
+            bool(j2) and j2.get("exit_code") is not None, repr(j2.get("exit_code")))
+    _live_run(["session", "send", tgt, "--name", name, "--cmd", "echo ALIVE; pwd"], timeout=60)
+    rc, j3, _ = _live_run(["session", "read", tgt, "--name", name, "--wait-rc", "20"], timeout=90)
+    s.check("ctrl-c 后会话存活且状态保留",
+            bool(j3) and "ALIVE" in (j3.get("stdout") or "")
+            and "/var/log" in (j3.get("stdout") or ""), repr(j3.get("stdout"))[:140])
+
+    # keys：应答交互提示（哨兵必须不被 read 吃掉——本套件的核心回归点）
+    _live_run(["session", "send", tgt, "--name", name, "--cmd",
+               'read -p "N? " X; echo GOT:$X'], timeout=60)
+    time.sleep(1.0)
+    rc, jk, _ = _live_run(["session", "keys", tgt, "--name", name, "--data", "hello_pty\\n"],
+                          timeout=60)
+    s.check("keys 写入成功", rc == 0 and bool(jk) and jk.get("bytes_sent") == 10, repr(jk)[:140])
+    rc, j4, _ = _live_run(["session", "read", tgt, "--name", name, "--wait-rc", "15"], timeout=60)
+    s.check("交互提示被应答（GOT:hello_pty）且哨兵未被吃掉",
+            bool(j4) and "GOT:hello_pty" in (j4.get("stdout") or "")
+            and j4.get("exit_code") == 0, repr(j4.get("stdout"))[:140])
+
+    # ANSI/CR 清洗
+    _live_run(["session", "send", tgt, "--name", name, "--cmd",
+               "printf '\\033[31mRED\\033[0m\\n'"], timeout=60)
+    rc, j5, _ = _live_run(["session", "read", tgt, "--name", name, "--wait-rc", "20"], timeout=60)
+    s.check("默认剥离 ANSI（保留文本）",
+            bool(j5) and "RED" in (j5.get("stdout") or "") and "\x1b" not in (j5.get("stdout") or ""),
+            repr(j5.get("stdout"))[:100])
+
+    # list
+    rc, jl, _ = _live_run(["session", "list", tgt], timeout=60)
+    rows = [(x.get("session"), x.get("status"), x.get("pty"))
+            for x in (jl or {}).get("sessions", [])]
+    s.check("list 含本会话且 running/pty", bool(jl) and any(
+        r[0] == name and r[1] == "running" and r[2] for r in rows), repr(rows))
+
+    # kill：进程树闭包（不只是删目录）
+    _live_run(["session", "send", tgt, "--name", name, "--cmd", "sleep 200 &"], timeout=60)
+    time.sleep(0.8)
+    rc, jz, _ = _live_run(["session", "kill", tgt, "--name", name], timeout=120)
+    row = ((jz or {}).get("sessions") or [{}])[0]
+    s.check("kill 扫到会话进程树（swept>=3）", bool(jz) and (row.get("swept") or 0) >= 3,
+            repr(row)[:160])
+    s.check("kill 后无残留、目录已清",
+            bool(jz) and jz.get("remaining_total") == 0 and row.get("cleaned") is True,
+            repr(jz)[:180])
+    rc, js, _ = _live_run(["exec", tgt, "--cmd", "pgrep -x script | wc -l"], timeout=60)
+    s.check("远端无 script 残留（会话进程真被杀）",
+            bool(js) and (js.get("stdout") or "").strip() == "0", repr(js.get("stdout")))
+    rc, jsl, _ = _live_run(["session", "list", tgt], timeout=60)
+    s.check("kill 后该会话不在 list", bool(jsl) and not any(
+        x.get("session") == name for x in (jsl.get("sessions") or [])), repr(jsl)[:140])
+
+    # 错误路径
+    rc, je, _ = _live_run(["session", "read", tgt, "--name", "nope_xyz"], timeout=60)
+    s.check("读不存在的会话 → session_not_found(2)",
+            rc == 2 and bool(je) and je.get("error") == "session_not_found", repr(je)[:140])
+    rc, je2, _ = _live_run(["session", "ctrl-c", tgt, "--name", "../etc"], timeout=60)
+    s.check("非法会话名拦截（bad_args）",
+            rc == 2 and bool(je2) and je2.get("error") == "bad_args", repr(je2)[:140])
+    rc, je3, _ = _live_run(["session", "send", tgt, "--name", "x"], timeout=60)
+    s.check("send 缺命令 → bad_args", rc == 2 and bool(je3) and je3.get("error") == "bad_args",
+            repr(je3)[:140])
+    _live_run(["session", "kill", tgt, "--all"], timeout=120)
+
+
+# ============================================================
 # CLI：选择 / 编排
 # ============================================================
 
 SUITES = [
-    ("unit_regression", "回归（凭据矩阵/parse_target/编码/stdin/--exclude 匹配）", suite_unit_regression),
-    ("unit_credential", "凭据启发式（真命中/误报豁免矩阵）", suite_unit_credential),
+    ("unit_regression", "回归（凭据矩阵/parse_target/编码/stdin/--exclude 匹配）", suite_unit_regression),    ("unit_credential", "凭据启发式（真命中/误报豁免矩阵）", suite_unit_credential),
     ("unit_artifacts", "制品结构（域横幅/代码地图/VERSION）", suite_unit_artifacts),
     ("unit_host", "host add/remove/list 闭环（副本 .env，v2.1.4 自动化）", suite_unit_host),
     ("live_sudo", "--sudo 提权（真机）", suite_live_sudo),
     ("live_exec_field", "exec+field（真机）", suite_live_exec_field),
     ("live_transfer", "传输往返（真机：默认/并行/续传/排除）", suite_live_transfer),
+    ("live_session", "会话（真机：PTY/状态保留/退出码/ctrl-c/keys/kill 无孤儿）", suite_live_session),
 ]
 
 
@@ -1078,6 +1241,7 @@ def main():
     ap.add_argument("--sudo", action="store_true")
     ap.add_argument("--exec", action="store_true")
     ap.add_argument("--transfer", action="store_true")
+    ap.add_argument("--session", action="store_true", help="仅会话真机集")
     ap.add_argument("--list", action="store_true", help="列出测试集")
     a = ap.parse_args()
 
@@ -1091,7 +1255,7 @@ def main():
         order = [0, 1, 2, 3]
     elif a.artifacts:
         order = [2]
-    elif a.sudo or a.exec or a.transfer:
+    elif a.sudo or a.exec or a.transfer or a.session:
         order = []
         if a.sudo:
             order.append(4)
@@ -1099,6 +1263,8 @@ def main():
             order.append(5)
         if a.transfer:
             order.append(6)
+        if a.session:
+            order.append(7)
     else:
         order = _interactive()
         if order is None:

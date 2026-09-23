@@ -145,3 +145,21 @@
   归一同样生效
 - **传输不受影响**：`upload`/`download` 是数据面，MCP 层也不改字节
 - MCP 层代码逻辑零改动（`SERVER_VERSION` 随之标记 0.2.6）
+
+## [0.3.0] - 2026-09-24
+
+### 新增工具：`pyaissh_session`（常驻会话，跟随 CLI v2.3.0）
+
+- **固定副本同步至 CLI v2.3.0**（13 个文件逐一 md5 校验；新增 `docs/session.md` 进同步清单）
+- **第 7 个工具 `pyaissh_session`**：`action` 二级子命令（`start`/`send`/`read`/`ctrl-c`/`keys`/`list`/`kill`），
+  参数：`name`/`cmd`/`cmd_file`/`offset`/`lines`/`wait_rc`/`token`/`data`/`raw`/`force`/`all`/`keep_dir`/
+  `cols`/`no_pty`/`keep_ansi`/`session_dir`/`keep_crlf`
+  - argv 拼装：会话是**二级子命令**（`pyaissh session <action> <target> …`），`_build_argv` 为此加了
+    专门分支；非法 `action` 在**连接前**报 `bad_args`
+  - `wait_rc` 上限沿用 MCP 层 45s 拦截（`action="read"` 同样适用）
+  - 典型流程：`start` → `send 'cd /opt/app'` → `send 'git pull'` → `read wait_rc=45` →
+    `send 'make -j8'` →（跑歪了）`ctrl-c` → `send 'make -j4'` → `kill`
+- **测试**：离线 40 → 41（`T2a` 7 个工具、`T2a2` session schema：action 枚举 7 项 + 参数齐全）；
+  真机套件 17 → 21（`B16a` start、`B16b` send+read 拿 exit_code、`B16c` kill 无残留、
+  `B16d` 非法 action 连接前拒绝）
+- **真机验证数据**：MCP 离线 41 + 真机 21 全绿；CLI 侧 `live_session` 19 例全绿（见 CLI CHANGELOG）

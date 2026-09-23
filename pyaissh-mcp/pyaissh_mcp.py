@@ -47,7 +47,7 @@ import time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CLI_PATH = os.path.join(BASE_DIR, "pyaissh.py")
-SERVER_VERSION = "0.2.6"
+SERVER_VERSION = "0.3.0"
 SERVER_NAME = "pyaissh-mcp"
 
 SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
@@ -419,9 +419,39 @@ TOOLS = [
             "required": ["target", "local", "remote"],
         },
     },
+    {
+        "name": "pyaissh_session",
+        "description": "常驻会话（真 PTY）：多步且带状态的远端操作——逐条喂命令、cd/export 跨命令保留、每条独立退出码、可中断执行中的命令、可应答交互提示。action 取值与用法：start（起会话，返回 pid/pty/ready）→ send（喂一条命令，返回 token/offset）→ read（读输出：offset 增量 / wait_rc 等这条结束拿 exit_code；载荷字段 stdout）→ ctrl-c（中断执行中的命令，会话不死；force=true 用 SIGKILL）→ keys（注入按键文本应答提示，data 支持 \\n \\r \\t \\xNN）→ list（列会话）→ kill（结束会话，进程树全清+删目录）。典型：start → send 'cd /opt/app' → send 'git pull' → read wait_rc=45 → send 'make -j8' → （错了）ctrl-c → send 'make -j4' → kill。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "[user@]host[:port]；@别名"},
+                "action": {"type": "string", "enum": ["start", "send", "read", "ctrl-c", "keys",
+                                                      "list", "kill"],
+                           "description": "会话子命令（必填）"},
+                "name": {"type": "string", "description": "会话名（默认 main；字母/数字/._-，≤32）"},
+                "cmd": {"type": "string", "description": "send：要执行的命令（与 cmd_file 二选一）"},
+                "cmd_file": {"type": "string", "description": "send：从本地文件读命令；keys：从本地文件读原始字节"},
+                "data": {"type": "string", "description": "keys：要注入的文本（支持 \\n \\r \\t \\xNN 转义）"},
+                "raw": {"type": "boolean", "description": "keys：data 不做转义解析，原样发送"},
+                "offset": {"type": "integer", "description": "read：从该字节偏移增量读（用 send 返回的 offset/next_offset；与 lines 互斥）"},
+                "lines": {"type": "integer", "description": "read：回传尾部 N 行（与 offset 互斥）"},
+                "wait_rc": {"type": "integer", "description": "read：阻塞等待某条命令结束最多 N 秒（MCP 层上限 45s），结束即返回 exit_code；不带 token 时等最近一次 send 的那条"},
+                "token": {"type": "string", "description": "read：只等这个 token 的哨兵（send 返回）"},
+                "force": {"type": "boolean", "description": "ctrl-c：用 SIGKILL（默认 SIGINT→自动升级 SIGTERM）"},
+                "all": {"type": "boolean", "description": "kill：结束该主机全部会话（与 name 二选一）"},
+                "keep_dir": {"type": "boolean", "description": "kill：只杀进程、保留会话目录（便于事后看 out.log）"},
+                "cols": {"type": "integer", "description": "start：PTY 列宽（默认 200，防折行）"},
+                "no_pty": {"type": "boolean", "description": "start：强制非 PTY（无 tty，但状态与退出码照常）"},
+                "keep_ansi": {"type": "boolean", "description": "read：保留 ANSI 颜色码（默认剥离，便于解析）"},
+                "session_dir": {"type": "string", "description": "会话根目录（默认 /tmp/pyaissh-sessions）"},
+                "keep_crlf": {"type": "boolean", "description": "send：保留命令文本 CRLF（默认归一为 LF，与 exec 同规则）"},
+                **_AUTH_PROPS,
+            },
+            "required": ["target", "action"],
+        },
+    },
 ]
-
-# 工具参数 → CLI flag 映射（snake_case → --kebab-case；bool=true 才加 flag）
 _FLAG_MAP = {
     "cmd": "--cmd", "cmd_file": "--cmd-file", "sudo": "--sudo", "sudo_password": "--sudo-password",
     "encoding": "--encoding", "idle_timeout": "--idle-timeout", "max_time": "--max-time",
@@ -435,6 +465,10 @@ _FLAG_MAP = {
     "detach": "--detach", "job_id": "--job-id", "list": "--list", "lines": "--lines",
     "offset": "--offset", "wait_rc": "--wait-rc", "kill": "--kill", "cleanup": "--cleanup",
     "force": "--force", "job_dir": "--job-dir",
+    # v0.3.0 常驻会话
+    "name": "--name", "data": "--data", "raw": "--raw", "all": "--all", "keep_dir": "--keep-dir",
+    "cols": "--cols", "no_pty": "--no-pty", "keep_ansi": "--keep-ansi",
+    "session_dir": "--session-dir", "keep_crlf": "--keep-crlf", "token": "--token",
 }
 _TOOL_SUB = {t["name"]: t["name"][len("pyaissh_"):] for t in TOOLS}
 
@@ -467,10 +501,20 @@ def _build_argv(tool, args):
     - 数值型参数收到 `false` / wait_rc 收到 0 → 视为"不要这个行为"，不传该参数
     """
     argv = ["pyaissh", _TOOL_SUB[tool], str(args["target"])]
+    skip = ("target",)
+    if tool == "pyaissh_session":
+        # session 需要二级子命令：pyaissh session <action> <target> [flags]
+        action = str(args.get("action") or "").strip()
+        if action not in ("start", "send", "read", "ctrl-c", "keys", "list", "kill"):
+            return None, {"ok": False, "error": "bad_args", "retryable": False,
+                          "message": "session 需要 action（start/send/read/ctrl-c/keys/list/kill），"
+                                     "收到 %r" % (args.get("action"),)}, []
+        argv = ["pyaissh", "session", action, str(args["target"])]
+        skip = ("target", "action")
     notes = []
     declared = _SCHEMA_TYPES.get(tool, {})
     for k, v in args.items():
-        if k == "target":
+        if k in skip:
             continue
         flag = _FLAG_MAP.get(k)
         if flag is None:
@@ -530,7 +574,8 @@ def _build_argv(tool, args):
         return None, {"ok": False, "error": "bad_args", "retryable": False,
                       "message": "MCP 模式不支持 cmd_file=\"-\"（stdin 属于 MCP 协议通道）；"
                                  "请把脚本写成本地文件后用 cmd_file 传路径"}, notes
-    if tool == "pyaissh_log":
+    if tool == "pyaissh_log" or (tool == "pyaissh_session"
+                                 and str(args.get("action") or "") == "read"):
         # wait_rc 上限：客户端会在 toolCallTimeoutMs（DSH 默认 60s）处掐断调用，
         # 与其被掐断（AI 只看到"调用超时"、拿不到任何作业状态），不如提前拒绝并给出两条出路。
         try:

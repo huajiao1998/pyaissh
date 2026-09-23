@@ -216,3 +216,22 @@
 - unit_artifacts 11 → 9：删掉 3 条锚断言（锚已不存在），保留并加强为
   "MANIFEST 12 域 / 域序 00..11 / 域文件齐全"
 - 回归：`dist` md5 与移除前一致（`94a7a654…`，说明移除不影响成品）、`check` 逐字节一致 + 编译 OK
+
+## [2026-09-24] v2.3.0 session 常驻会话（真 PTY）
+
+### 新增用例
+- **live_session（新套件，19 例）**：start 返回 pid/pty/ready+0700 权限；逐条喂命令退出码 0 与 127；
+  错误命令不中断会话且 cwd 保留；长命令 `status=running`；`ctrl-c` 发信号且被中断命令收敛、
+  会话存活状态保留；`keys` 应答 `read -p` 提示（`GOT:hello_pty`）且**哨兵未被吃掉**；
+  默认剥离 ANSI；`list` 显示 running/pty；`kill` 扫到进程树（swept>=3）+ 无残留 + 目录清理 +
+  远端无 `script` 残留；`session_not_found`/非法名/缺命令三条错误路径
+- 单元 9 例：会话路径表、会话名正则（拒穿越/空/超长/前导连字符）、`--data` 转义
+  （`\n \r \t \xNN \\`）、哨兵包裹（`{ ...; }; echo` 同一行）、哨兵切分（按 token 取各自输出与退出码、
+  无 token 取最后一个、目标未出现→running）、输出清洗（CR/ANSI/哨兵行/script 头）
+- 制品集随域数更新：13 域 / 横幅 12 个（01..12/13）/ docstring ≥13
+### 开发期实测教训（已固化为实现与断言）
+- 哨兵单列一行会被命令里的 `read` 吃掉 → 必须 `{ ...; }; echo 哨兵`（同一行解析）
+- `kill` 按 sid 清理无效（`script` 的子 shell 自己 setsid）→ 改用 starter 进程树闭包；
+  闭包 awk 另有两坑：引号写成 `root=\"$P\"`（值带引号→闭包恒空）与打印用下标而非 `pid[k]`
+- `ctrl-c` 的 SIGINT 对 setsid+nohup 起的会话树可能无效 → 自动升级 SIGTERM（`--force`=SIGKILL）
+- 测试助手坑：`time` 未导入导致套件中途崩；哨兵 fixture 用了非 hex token（正则按设计不认）

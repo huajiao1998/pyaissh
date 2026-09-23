@@ -38,7 +38,7 @@ PAIRS = [
     ("CHANGELOG.md", "CLI_CHANGELOG.md"),
 ]
 DOCS = ("contract.md", "edge-cases.md", "errors.md", "exec.md", "jump.md",
-        "setup.md", "transfer.md")
+        "session.md", "setup.md", "transfer.md")
 PAIRS += [(os.path.join("docs", d), os.path.join("docs", d)) for d in DOCS]
 
 

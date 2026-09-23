@@ -30,6 +30,7 @@ python tests/run_tests.py --list         # 列出测试集
 | 4 | live_sudo | --sudo 提权/整链/NOPASSWD/失败提示/互斥（真机）|
 | 5 | live_exec_field | exec 行为 + --field 消费端 + 失败尾巴 + --progress（真机）|
 | 6 | live_transfer | 传输往返字节一致 + --parallel + --resume + --exclude（真机）|
+| 7 | live_session | 常驻会话（真 PTY）：逐条喂命令/状态保留/退出码/ctrl-c/keys/kill 无孤儿（真机）|
 
 ## live 凭据（脱敏，不入库）
 

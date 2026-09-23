@@ -15,6 +15,19 @@
 - **`crlf_normalized`（v2.2.4，仅在有归一发生时出现）**：命令文本里被归一为 LF 的 CRLF/CR 行尾**处数**（exec 与 exec --detach 都会回传）。默认行为：命令文本（内联 `--cmd`、`--cmd-file`、stdin）的行尾 CRLF/CR 一律归一为 LF——远端 bash 会把 `\r` 当词的一部分（`$'\r': command not found`、关键字行语法错、heredoc 落盘文件每行带 CR）；要原样发送加 `--keep-crlf`（此时不出现本字段）。**传输通道不受影响**：upload/download 是数据面，绝不改字节，Windows 文件传上去仍是 CRLF
 - 远程命令的 stdout/stderr 已分别放入结果的 `stdout`/`stderr` 字段，无需自行拼接
 
+## 常驻会话字段契约（v2.3：`session` 子命令）
+
+- **`session start`**：`session`（名字）、`dir`/`fifo`/`log`、`pid`（starter，setsid 组长）、`pty`（是否真 PTY）、`cols`、`ready`（就绪确认：初始化命令的哨兵是否按时出现）、`permissions`；`pty=false` 时带 warning（远端缺 util-linux `script` 或指定了 `--no-pty`）
+- **`session send`**：`token`（这条命令的哨兵 id）、`offset`/`next_offset`（本次输出起点，接着 `read --offset` 就只读这条命令的输出）、`sent_bytes`
+- **`session read`**：载荷字段与 `log` 对齐——**`stdout`**（合并流，已清洗 CR/ANSI/哨兵行与 `script` 头）、`bytes_returned`、`log_bytes`、`next_offset`、`has_more`、`status`（`done`|`running`）、`exit_code`/`exit_success`、`token`、`pid`、`waited_ms`/`wait_rc_secs`、`output_truncated`/`omitted_bytes`；默认剥离 ANSI（`--keep-ansi` 保留）
+- **`session ctrl-c`**：`signal`（`INT`|`KILL`）、`signaled_groups`/`signaled_children`（被发信号的进程组/进程）、`signaled_count`、`escalated_to_term`（SIGINT 后幸存者升级为 TERM 的 pid 列表，非空时带 warning）、`sid`
+- **`session keys`**：`bytes_sent`（注入的原始字节数）
+- **`session list`**：`sessions[]`（`session`/`pid`/`status`(`running`|`dead`)/`pty`/`cols`/`log_bytes`/`mtime`/`dir`）+ `count`
+- **`session kill`**：`sessions[]`（`swept` 扫到的进程树规模 / `remaining` 残留 / `cleaned`）+ `remaining_total`
+- **状态语义**：会话本身只有 `running`/`dead`（starter 存活探测）；**命令级**状态在 `read` 里——`status:"done"` + `exit_code` 表示那条命令结束（哨兵出现），`running` 表示还没结束
+- **退出码**：`session start` 成功 = 0（同名会话已存在 = 2 `session_exists`）；`send`/`read`/`ctrl-c`/`keys`/`list`/`kill` 成功 = 0；会话不存在 = 2（`session_not_found`）、会话已死 = 2（`session_dead`）、非法名字/参数 = 2（`bad_args`）；启动/写入/读取失败 = 255
+- **`session` 与 `exec` 的关系**：`session send` 的命令文本同样走 **CRLF 归一**（`--keep-crlf` 可关）；`session read` 的载荷字段与 `log`/`exec` 一致（`stdout`/`next_offset`/`exit_code`），便于同一套消费代码
+
 ## `--text` 可读模式（仅供人类速览，AI 直接用默认 JSON）
 
 - 不加 flag 默认 JSON（见上）；`--text` 可读模式：exec 用 `---STDOUT.<nonce>---` / `---STDERR.<nonce>---`，test 用 `---INFO.<nonce>---`，upload/download 用 `---RESULT.<nonce>---`，ls 用 `---LS.<nonce>---`；错误用 `---ERROR.<nonce>---` + 一行 JSON；都以 `---END.<nonce>---` 结尾

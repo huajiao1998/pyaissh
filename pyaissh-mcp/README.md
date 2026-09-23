@@ -70,6 +70,7 @@ PYAISSH_HOST_PROD=<user>@<host>:<port>      # 之后工具里用 target: "@PROD"
 | `pyaissh_ls` | `ls` | 列目录，`entries[]` 结构化字段 |
 | `pyaissh_upload` / `pyaissh_download` | `upload` / `download` | SFTP 传输，**零 token 消耗**（文件内容永不回传，只回元数据）；支持并行分片/断点续传 |
 | `pyaissh_log` | `log` | 读**后台作业**日志：默认尾部 100 行；`offset` 增量读（返回 `next_offset` 续读不重复）；`wait_rc` 等结束拿 `exit_code`；`kill` 整组停掉；`cleanup` 清理；`list` 列作业。载荷字段 `stdout`（2>&1 合并流）。配合 `pyaissh_exec(detach=true)` 做准流式 |
+| `pyaissh_session` | `session` | **常驻会话（真 PTY）**：多步且带状态的远端操作——`action` = `start`/`send`/`read`/`ctrl-c`/`keys`/`list`/`kill`。逐条喂命令、`cd`/`export` 跨命令保留、**每条独立退出码**、**可中断执行中的命令**（`ctrl-c`）、**可应答交互提示**（`keys`）。载荷字段 `stdout`/`next_offset`/`status`/`exit_code` |
 
 **结果就是 pyaissh CLI 的原生单行 JSON 契约**：`ok`=工具操作成功、`exit_success`=远程命令成败、错误看 `error`+`message`+`retryable`。完整契约见 [`skills/pyaissh/SKILL.md`](../skills/pyaissh/SKILL.md) 与 `docs/`。
 

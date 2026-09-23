@@ -426,3 +426,34 @@
   不碰磁盘。MANIFEST 的**锚列一并删除**（锚的唯一消费者就是 split，留着只会再烂一次——
   这次的过期锚就是这么来的）；MANIFEST 退回纯顺序清单，`unit_artifacts` 仍校验
   "12 域 / 域序 00..11 / 域文件齐全"
+
+## [2.3.0] - 2026-09-24
+
+### 新增：`session` 常驻会话（真 PTY）——逐条喂命令 / 状态保留 / 可中断
+
+- **解决的痛点**：`exec` 无状态（`cd`/`export` 不跨调用）、`exec --detach` 启动后**改不了**
+  （长任务开头命令写错只能 kill 重来）。`session` 在远端起一个常驻 shell，AI **逐条喂命令**：
+  每条独立退出码，错了改下一条继续，状态（cwd/env/函数）全在；执行中的命令**可中断**
+- **真 PTY**：`setsid`+`nohup`+util-linux `script` 分配真终端（`test -t 0` 为真、`tty`=/dev/pts/N），
+  所以**能应答交互提示**（`read -p`、y/n、密码）——`session keys --data 'y\n'` 实测可答上；
+  远端缺 `script` 时自动降级为非 PTY（状态与退出码照常，无 tty）
+- **子命令**：`start` / `send` / `read`（尾部·增量·`--wait-rc` 等某条命令结束）/ `ctrl-c`
+  （中断执行中的命令，`--force`=SIGKILL）/ `keys`（注入按键文本）/ `list` / `kill`
+- **契约与 exec/log 对齐**：`read` 载荷字段 `stdout`（合并流）/`next_offset`/`status`(`done`|`running`)/
+  `exit_code`/`token`；默认剥离 ANSI（`--keep-ansi` 保留）、清洗 CR 与 `script` 头；
+  命令文本同样走 CRLF 归一（`--keep-crlf` 可关）；会话目录 0700、文件 0600
+- **三个实测坑（都有测试护栏）**：
+  1. **哨兵必须与命令同一行被解析**（`{ ...; }; echo 哨兵`）——早期单列一行会被命令里的
+     `read -p` 当输入**吃掉**（实测 `read` 拿到的值就是哨兵文本，真哨兵永不出现）
+  2. **会话身份是 starter 的进程树闭包，不是 sid**——实测 `script` 给子 shell **另起会话**
+     （starter sid ≠ pty sid），按 sid 清理 ⇒ 目录删了、会话进程还活着（留孤儿）；
+     `kill` 现在先算一次闭包再 TERM→(幸存者)KILL→校验，实测 `swept=3`/`remaining=0`/无 `script` 残留
+  3. **`ctrl-c` 只发 SIGINT 不够**——会话树由 `setsid nohup` 起、SIGINT 处置可能被继承为忽略
+     （实测 `kill -INT <sleep pid>` 返回成功但进程没死）→ 0.7s 后自动升级 SIGTERM；
+     另：往 FIFO 写 `0x03` 想靠 pty 行规程转 SIGINT **实测无效**，故不依赖该路径
+- **测试**：新增真机套件 `live_session`（19 例：PTY/权限/逐条退出码/状态保留/错误命令不中断会话/
+  running 检测/ctrl-c 收敛与会话存活/keys 应答提示/ANSI 清洗/list/kill 进程树与无孤儿/错误路径）+
+  单元 9 例（路径表/名字正则/`--data` 转义/哨兵包裹/哨兵切分/清洗）；单元集随之升到 13 域
+  （新增 `11_cmd_session.py`，`12_cli_main.py` 顺延）
+- **文档**：新增 `docs/session.md`（定位对比/子命令/三个实测坑/边界）；SKILL.md 增章节与触发词；
+  contract.md 增会话字段契约；errors.md 增 `session_*` 错误类型

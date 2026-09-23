@@ -4,7 +4,8 @@
 # 顺序尊重顶层执行语义（护栏 2）：
 #   00 含极早期信号标志/注册（任何慢操作前）+ docstring + stdlib import
 #   04 含 _setup_console_utf8() 与 _QUIET 的模块级执行点
-#   01-11 常量/正则/函数定义按原顺序（模块级赋值依赖顺序）
+#   01-12 常量/正则/函数定义按原顺序（模块级赋值依赖顺序）
+#   12_cli_main 必须最后（它以 `if __name__ == "__main__"` 调 main()，其后不能再有定义）
 #
 # 域文件在 pyaissh-dev/domains/ 下：<序号>_<域名>.py
 # 每行: <序号>_<域名>.py
@@ -28,4 +29,5 @@
 08_cmd_exec.py
 09_cmd_transfer.py
 10_cmd_test_ls.py
-11_cli_main.py
+11_cmd_session.py
+12_cli_main.py

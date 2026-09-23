@@ -61,6 +61,7 @@
 """
 
 import argparse
+import base64
 import codecs
 import errno
 import fnmatch

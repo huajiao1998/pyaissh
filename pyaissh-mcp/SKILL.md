@@ -1,7 +1,7 @@
 ---
 name: pyaissh
-description: 通过 pyaissh（paramiko CLI）做远程 SSH 运维与排障：exec 执行命令（--sudo 提权、--field 取裸字段、--cmd-file 喂脚本），log 读后台作业（exec --detach 起长任务后按 offset 增量读日志、--wait-rc 等退出码、--kill 停掉），upload/download 传文件（大文件并行分片、断点续传），test 探活，ls 列目录，host 管理主机别名；支持跳板机 --jump、默认输出整行 JSON 供 AI 精确解析、多级超时防挂死、传输零 token 消耗（文件内容不回传，只给元数据）。长任务后台化、边跑边看日志、服务器故障排查优先用它。
-whenToUse: 需要 SSH 到远程主机执行命令、跑长任务（后台作业 + 增量看日志）、传文件、查目录、探活或管理主机别名时；宿主 shell 会吃掉 $ 等特殊字符（PowerShell/MSYS）需改用 --cmd-file 时
+description: 通过 pyaissh（paramiko CLI）做远程 SSH 运维与排障：exec 执行命令（--sudo 提权、--field 取裸字段、--cmd-file 喂脚本），session 常驻会话（真 PTY：逐条喂命令、cd/export 状态跨命令保留、每条独立退出码、ctrl-c 中断执行中的命令、keys 应答交互提示——多步部署/排障/试错用它），log 读后台作业（exec --detach 起长任务后按 offset 增量读日志、--wait-rc 等退出码、--kill 停掉），upload/download 传文件（大文件并行分片、断点续传），test 探活，ls 列目录，host 管理主机别名；支持跳板机 --jump、默认输出整行 JSON 供 AI 精确解析、多级超时防挂死、传输零 token 消耗（文件内容不回传，只给元数据）。长任务后台化、边跑边看日志、多步交互式操作、服务器故障排查优先用它。
+whenToUse: 需要 SSH 到远程主机执行命令、跑长任务（后台作业 + 增量看日志）、需要多步且带状态的远端操作（常驻会话：可中断、可应答提示）、传文件、查目录、探活或管理主机别名时；宿主 shell 会吃掉 $ 等特殊字符（PowerShell/MSYS）需改用 --cmd-file 时
 ---
 
 # pyaissh — 结构化 SSH 工具（给 AI 用）
@@ -91,6 +91,28 @@ python3 pyaissh.py exec root@1.2.3.4 --cmd-file win.sh --keep-crlf  # 确实要 
 ```
 
 **`upload`/`download` 是数据通道，任何情况下不改字节**（Windows 上写好再上传的脚本在远端仍是 CRLF：要执行就用 `--cmd-file` 送脚本，或远端 `dos2unix`）。
+
+### session — 常驻会话（真 PTY）：逐条喂命令 / 状态保留 / 可中断（v2.3）
+
+`exec` 无状态、`exec --detach` 启动后改不了；**多步且带状态**的活（部署、排障、试错、交互式安装）用 `session`：
+
+```bash
+python3 pyaissh.py session start h --name work                   # 起会话（真 PTY；返回 pid/pty/ready）
+python3 pyaissh.py session send  h --name work --cmd 'cd /opt/app'
+python3 pyaissh.py session send  h --name work --cmd 'git pull'
+python3 pyaissh.py session read  h --name work --wait-rc 60      # 等这条跑完 → exit_code + 输出
+python3 pyaissh.py session send  h --name work --cmd 'make -j8'
+python3 pyaissh.py session ctrl-c h --name work                  # 中断正在跑的 make（会话不死，cwd 还在）
+python3 pyaissh.py session keys  h --name work --data 'y\n'      # 应答程序提示（y/n、密码…）
+python3 pyaissh.py session kill  h --name work                   # 收尾（进程树全清 + 删目录）
+```
+
+- **每条命令独立退出码**（`read --wait-rc` 回 `exit_code`）；**`cd`/`export`/函数跨命令保留**——错了改下一条继续，不用重来
+- **能中断执行中的命令**：`ctrl-c`（SIGINT→自动升级 TERM；`--force` = SIGKILL），会话与状态都保住
+- **能应答交互提示**：`keys --data 'y\n'`（支持 `\n \r \t \xNN`）
+- `read` 载荷字段 `stdout`（合并流，自动清洗 CR/ANSI/哨兵行）/`next_offset`/`status`(`done`|`running`)/`exit_code`
+- 依赖：真 PTY 需 util-linux `script`（缺则自动降级为非 PTY，状态与退出码照常但没有 tty）
+- 详细设计、三个实测坑（哨兵被 `read` 吃掉 / kill 按 sid 会留孤儿 / SIGINT 需升级）见 `docs/session.md`
 
 ### ls — 列远程目录
 ```bash

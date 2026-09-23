@@ -473,6 +473,111 @@ def build_parser():
                     help="只取结果字段裸值（如 --field entries 得清单 JSON）")
     hl.set_defaults(func=cmd_host_list)
 
+    # session（v2.3）：真 PTY 常驻会话——逐条喂命令 + 状态保留 + 可中断
+    sp = sub.add_parser("session", help="常驻会话（真 PTY）：逐条喂命令、状态保留、可中断",
+                        description="远端一个常驻 shell（util-linux script 给真 PTY）："
+                                    "每条命令独立退出码，cd/export 等状态跨命令保留，"
+                                    "执行中的命令可 ctrl-c 中断。子命令：start/send/read/"
+                                    "ctrl-c/keys/list/kill。",
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        epilog="""\
+典型流程（长任务开头写错也不用重来：改下一条继续，状态还在）:
+  pyaissh session start h --name work                    # 起会话（返回 pid/pty/log）
+  pyaissh session send  h --name work --cmd 'cd /opt/app && git pull'
+  pyaissh session read  h --name work --wait-rc 30       # 等这条跑完，拿 exit_code
+  pyaissh session send  h --name work --cmd 'make -j8'   # 状态还在（cwd 仍是 /opt/app）
+  pyaissh session ctrl-c h --name work                   # 中断正在跑的 make（会话不死）
+  pyaissh session keys  h --name work --data 'y\\n'       # 应答程序提示（y/n、密码等）
+  pyaissh session kill  h --name work                    # 结束会话（按 sid 全量清理）
+
+与 exec / exec --detach 的分工:
+  exec              一次一条、无状态（cd/export 不跨调用）、受宿主单次调用时长限制
+  exec --detach     一条长命令丢后台，启动后不能改，错了只能 --kill 重启
+  session           逐条喂 + 状态保留 + 可中断（本轮次最灵活；需要 tty 的程序也能跑）
+
+载荷字段: stdout（合并流，已清洗 CR/ANSI/哨兵行）/ next_offset / status(done|running)
+          / exit_code / token / session / pid / pty
+""")
+    ss = sp.add_subparsers(dest="session_cmd", metavar="start|send|read|ctrl-c|keys|list|kill")
+
+    ssp = ss.add_parser("start", help="起会话（真 PTY；缺 script 时降级为非 PTY）",
+                        description="setsid+nohup 起常驻 shell：SSH 断开不影响；"
+                                    "有 util-linux script 则分配真 PTY（可跑需要 tty 的程序）")
+    add_conn(ssp)
+    ssp.add_argument("--name", default="main", help="会话名（默认 main；字母/数字/._-）")
+    ssp.add_argument("--session-dir", dest="session_dir", help="会话根目录（默认 %s）"
+                     % DEFAULT_SESSION_DIR)
+    ssp.add_argument("--cols", type=_positive_int, default=200, help="PTY 列宽（默认 200，防折行）")
+    ssp.add_argument("--no-pty", dest="no_pty", action="store_true",
+                     help="强制非 PTY（无 tty，但状态与退出码照常）")
+    ssp.add_argument("--wait-ready", dest="wait_ready", type=_positive_int,
+                     default=SESSION_READY_WAIT, help="等会话就绪秒数（默认 %d）" % SESSION_READY_WAIT)
+    ssp.set_defaults(func=cmd_session_start)
+
+    sse = ss.add_parser("send", help="把一条命令喂进会话（自动追加退出码哨兵）",
+                        description="命令 + 哨兵写入会话 FIFO；用返回的 token/offset 去 read")
+    add_conn(sse)
+    sse.add_argument("--name", default="main", help="会话名（默认 main）")
+    sse.add_argument("--session-dir", dest="session_dir", help="会话根目录")
+    sse.add_argument("--cmd", help="要执行的命令")
+    sse.add_argument("--cmd-file", dest="cmd_file", help="从文件读命令 (- 表示 stdin)")
+    sse.add_argument("--keep-crlf", dest="keep_crlf", action="store_true",
+                     help="保留命令文本里的 CRLF（默认归一为 LF，与 exec 同规则）")
+    sse.set_defaults(func=cmd_session_send)
+
+    ssr = ss.add_parser("read", help="读会话输出（尾部/增量/等某条命令结束）",
+                        description="默认回传尾部 %d 行；--offset 增量读；"
+                                    "--wait-rc 等到哨兵出现并回 exit_code" % SESSION_DEFAULT_LINES)
+    add_conn(ssr)
+    ssr.add_argument("--name", default="main", help="会话名（默认 main）")
+    ssr.add_argument("--session-dir", dest="session_dir", help="会话根目录")
+    ssr.add_argument("--offset", type=_nonneg_int, help="从该字节偏移增量读（与 --lines 互斥）")
+    ssr.add_argument("--lines", type=_positive_int, default=None,
+                     help="回传尾部 N 行（默认 %d；与 --offset 互斥）" % SESSION_DEFAULT_LINES)
+    ssr.add_argument("--wait-rc", dest="wait_rc", type=_positive_int,
+                     help="等待命令结束最多 N 秒（上限 %d）" % SESSION_WAIT_MAX)
+    ssr.add_argument("--token", help="只等这个 token 的哨兵（send 返回的 token）")
+    ssr.add_argument("--max-output", dest="max_output", type=_positive_int,
+                     default=DEFAULT_MAX_OUTPUT, help="单次回传上限字节（默认 64KB）")
+    ssr.add_argument("--keep-ansi", dest="keep_ansi", action="store_true",
+                     help="保留 ANSI 颜色码（默认剥离，便于 AI 解析）")
+    ssr.set_defaults(func=cmd_session_read)
+
+    ssc = ss.add_parser("ctrl-c", help="中断会话里正在执行的命令（会话不死，状态保留）",
+                        description="对命令自己的进程组发 SIGINT（--force 用 SIGKILL）。"
+                                    "PTY 下 bash 有 job control，每条命令独立进程组")
+    add_conn(ssc)
+    ssc.add_argument("--name", default="main", help="会话名（默认 main）")
+    ssc.add_argument("--session-dir", dest="session_dir", help="会话根目录")
+    ssc.add_argument("--force", action="store_true", help="用 SIGKILL（对忽略 SIGINT 的命令）")
+    ssc.set_defaults(func=cmd_session_ctrl_c)
+
+    ssk = ss.add_parser("keys", help="向会话注入按键/文本（应答提示、Ctrl-D）",
+                        description="原始字节写入会话；中断命令请用 ctrl-c（信号≠按键）")
+    add_conn(ssk)
+    ssk.add_argument("--name", default="main", help="会话名（默认 main）")
+    ssk.add_argument("--session-dir", dest="session_dir", help="会话根目录")
+    ssk.add_argument("--data", help="要注入的文本（支持 \\n \\r \\t \\xNN 转义）")
+    ssk.add_argument("--cmd-file", dest="cmd_file", help="从文件读原始字节 (- 表示 stdin)")
+    ssk.add_argument("--raw", action="store_true", help="--data 不做转义解析（原样发送）")
+    ssk.set_defaults(func=cmd_session_keys)
+
+    ssl = ss.add_parser("list", help="列该主机的会话（存活/pty/日志大小/最后活动）")
+    add_conn(ssl)
+    ssl.add_argument("--session-dir", dest="session_dir", help="会话根目录")
+    ssl.set_defaults(func=cmd_session_list)
+
+    ssz = ss.add_parser("kill", help="结束会话（按 sid 全量清理，默认连目录一起删）",
+                        description="TERM → 校验 → KILL 残留；只杀 leader 进程组会留 job 孤儿，"
+                                    "所以按 sid 全量枚举")
+    add_conn(ssz)
+    ssz.add_argument("--name", help="会话名")
+    ssz.add_argument("--all", action="store_true", help="结束该主机全部会话")
+    ssz.add_argument("--session-dir", dest="session_dir", help="会话根目录")
+    ssz.add_argument("--keep-dir", dest="keep_dir", action="store_true",
+                     help="保留会话目录（只杀进程，便于事后看 out.log）")
+    ssz.set_defaults(func=cmd_session_kill)
+
     return parser
 
 

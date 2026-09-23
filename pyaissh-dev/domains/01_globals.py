@@ -6,7 +6,7 @@
 被 00_head（信号区）、各 cmd_*（超时/常量）引用；拼接后与本包其余域同模块共享命名空间。
 """
 
-VERSION = "2.2.4"
+VERSION = "2.3.0"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -99,6 +99,14 @@ JOB_TAIL_WINDOW = 1048576    # log 取尾部时的最大回看字节窗口（1MB
 JOB_WAIT_MAX = 600           # --wait-rc 上限秒数（宿主单次调用上限约 600s）
 BUF_ALIGN_WINDOW = 4096      # 截断行对齐时回退搜索窗口（字节）
 MIN_BUF_FLOOR = 4096         # 内存缓冲下限：max(args.max_output, 4096) 保证小档位也有可用缓冲
+
+# --- 常驻会话（v2.3：session 子命令 —— 真 PTY + 逐条喂命令 + 状态保留）------
+DEFAULT_SESSION_DIR = "/tmp/pyaissh-sessions"  # 远端会话根目录（每会话一个子目录）
+SESSION_TAIL_WINDOW = 1048576    # read 取尾部时的最大回看字节窗口（1MB，与 log 同款）
+SESSION_WAIT_MAX = 600           # --wait-rc 上限秒数
+SESSION_READY_WAIT = 8           # start 后等会话就绪（哨兵）的默认秒数
+SESSION_DEFAULT_LINES = 100      # read 默认尾部行数
+SESSION_RC_PREFIX = "__PYAISSH_RC__"   # 每条命令的退出码哨兵前缀（<prefix><token>__<rc>）
 JOIN_GRACE = 1.5             # 读线程 join 宽限（秒）
 RETRY_SLEEP = 0.5            # Windows 句柄未释放等场景的删除重试等待
 PUT_RETRY_SLEEP = 0.3        # 远端 .part 清理重试等待

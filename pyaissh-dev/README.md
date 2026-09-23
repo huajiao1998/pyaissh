@@ -1,6 +1,6 @@
 # pyaissh-dev — 重构开发仓库（维护入口）
 
-> 本仓库是 pyaissh 的开发态源码（12 个域文件 + 构建器）。
+> 本仓库是 pyaissh 的开发态源码（13 个域文件 + 构建器）。
 > **发布物 = `build_single.py join` 生成的单文件**（成品放 skills/pyaissh/pyaissh.py 由用户决定）。
 > **维护规矩：只改 `domains/`，绝不手改单文件**（单文件可再生；diff 找 `pyaissh.built.py` 比对）。
 
@@ -36,7 +36,7 @@
 
 **方向是单向的：`domains/` 是源，`pyaissh.py` 是产物。**
 
-- `build_single.py join`：12 域文件 → 单文件（确定性，逐字节稳定）
+- `build_single.py join`：13 域文件 → 单文件（确定性，逐字节稳定）
 - `build_single.py check`：金标对比（built vs 指定单文件）+ 编译
 - `build_single.py dist`：**日常就用这条**——join + 双份同步（根 `pyaissh.py` + `skills/pyaissh/pyaissh.py`，md5 一致）
 - `MANIFEST_domains.txt`：域文件顺序（显式，非 import 拓扑；顺序尊重顶层执行语义——00 含极早期信号、04 含 console/emit 模块级执行点）
@@ -62,6 +62,7 @@ python tests/run_tests.py                 # 交互菜单选集；--all/--unit/--
 | live_sudo | 12 | --sudo 真机（需 tester 用户 env）| 同上 |
 | live_exec_field | 19 | exec 行为 + --field 真机 | 同上 |
 | live_transfer | 3 | 传输往返真机 | 同上 |
+| live_session | 19 | 常驻会话（真 PTY）真机 | 同上 |
 
 测 dev built 产物：`PYAISSH_PY=<pyaissh.built.py> python tests/run_tests.py --unit`；
 live 测任意产物：`PYAISSH_BIN=<pyaissh.py> python tests/run_tests.py --exec`。
