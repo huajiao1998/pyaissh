@@ -7785,8 +7785,9 @@ def build_parser():
     ssc = ss.add_parser("ctrl-c", help="中断会话里正在执行的命令（会话不死，状态保留）",
                         description="往 tmux pane 注入 Ctrl-C（tty 把它交给**前台进程组**，就是终端里的 "
                                     "Ctrl-C）；--force 用 SIGKILL 打前台进程组（内核的 tpgid）。"
-                                    "注意：被中断那条命令的退出码哨兵不会出现（bash 收到 SIGINT 会"
-                                    "丢弃当前命令行），别再对它 --wait-rc")
+                                    "被中断的命令不会自己产出哨兵（bash 收到 SIGINT 会丢弃当前命令行），"
+                                    "所以 ctrl-c 会**代它补一条**（INT→130 / KILL→137）——"
+                                    "正在等它的 `read --wait-rc --token` 会正常收敛")
     add_conn(ssc)
     ssc.add_argument("--name", default="main", help="会话名（默认 main）")
     ssc.add_argument("--session-dir", dest="session_dir", help="会话根目录")
