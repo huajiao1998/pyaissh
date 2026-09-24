@@ -30,26 +30,24 @@ pyaissh 是基于 paramiko 的命令行 SSH 工具，专为非交互的 AI/脚�
 4. 高频错误一句话动作：`auth_failed` 换凭据 / `connection_timeout` 查网络 / `exec_idle_timeout`/`exec_total_timeout` 按消息调大对应超时（**超时后远程进程可能仍在运行**，副作用命令先 pgrep 确认再重试）/ `connection_lost` 不信任部分结果重跑 / `jump_failed` 查跳板转发限制 / `bad_args` 查参数
 5. 退出码仅粗筛，**决策一律以 `error` 字段为准**（超时退出码为 124，与连接失败 255 区分）
 6. 多主机/跳板场景：**无论失败发生在跳板机还是目标机，JSON 的 `host`/`user`/`port` 恒指向目标机**；若 message 带 `[跳板机 user@host]` 前缀，说明失败发生在**跳板机侧**；连接期 `bad_args` 无 `host`/`user` 字段（目标尚未解析出来）；**连接成功后的路径类 `bad_args` 带 `host`/`user`/`port`**
-7. **大文件传输慢或超时：加 `--parallel 8`**——下载默认 ≥8MB 自动 4 连接分片；**显式 `--parallel 8` 强制 8 连接（≥64KB 即启用并行）**，上传同参数（v1.5.8 起 `upload --parallel 1-8`，显式时 ≥64KB 分片，与 `--resume` 互斥），**实际档位见结果 `parallel_used` 字段**（下载与上传结果都有；高丢包/跨境链路单连接吞吐塌陷，多连接近似线性提速；**8 不行反试 4/2**）；**所有传输路径**（串行/目录/并行）都写进程唯一的 `.part.<pid>` 成功后原子改名（**下载的 `.part` 在本地、上传的 `.part` 在远端**）——失败/中断不留半截**最终**文件（上传中断可能残留 `.part` 临时文件，warnings 会提示清理命令）；上传先传 `.part` 再 posix-rename 原子覆盖（服务器不支持该扩展时退化为删除+改名并 WARN）
-8. **`--cmd` 与 `--cmd-file -` 按调用环境选**：bash/常规 shell 下 `--cmd '...'` 完全可靠（标准引号规则，`$()`/反引号/管道/引号组合都安全，单引号包住即原样传远端）；**仅当调用环境是 Windows PowerShell 时**——`--cmd` 字符串会被 PowerShell 先解析（`$` 插值/子表达式执行、`\` 非转义），含 `$()`/反引号/多行/引号组合的复杂命令务必改用 `--cmd-file -`（heredoc/stdin 绕过 PowerShell 字符串层）；拿不准就在 PowerShell 里用 `--cmd-file -`
+7. **大文件慢/超时：加 `--parallel 8`**（显式 ≥64KB 即分片，上传同参数，与 `--resume` 互斥；**实际档位看结果 `parallel_used`**；8 不行反试 4/2）。**所有传输路径都写 `.part.<pid>` 成功后原子改名**（下载的在本地、上传的在远端）——失败/中断不留半截最终文件（上传中断可能残留 `.part`，warnings 会给清理命令）。细节见 `docs/transfer.md`
+8. **`--cmd` vs `--cmd-file -` 按调用环境选**：bash/常规 shell 用 `--cmd '...'`（标准引号规则，单引号包住即原样传远端）；**调用环境是 Windows PowerShell 时**，`--cmd` 会先被 PowerShell 解析（`$` 插值、`\` 非转义）→ 含 `$()`/反引号/多行/引号组合的复杂命令**一律用 `--cmd-file -`**；拿不准就用它
 9. **`file_list.path` 语义两侧不同，勿混用**：upload 的 `path` 是**本地**路径/相对路径（重试本地定位用），download 的 `path` 是**远端**相对路径（重试远端定位用）——写重试逻辑时按方向取对侧的路径
-10. **普通用户登录需要提权：加 `--sudo`**——`--sudo --cmd "apt update"` 自动 `sudo -S -p ''` 提权；密码走 `--sudo-password` 或 `PYAISSH_SUDO_PASSWORD` 环境变量（密码只经 SSH stdin 注入，命令/cmd 字段/日志均无密码）；**无密码时自动 `sudo -n` 免密探测**（免密直接跑；需密码立即失败不挂，warnings 提示密码配置）；复合命令（`&&`/`;`/管道）自动 bash -c 整链提权；`--sudo` 与 `--pty` 互斥
+10. **普通用户登录要提权：加 `--sudo`**（`sudo -S` 提权，复合命令自动 `bash -c` 整链提权）；密码走 `--sudo-password`/`PYAISSH_SUDO_PASSWORD`，**只经 SSH stdin 注入**（命令/日志无密码）；无密码时自动 `sudo -n` 免密探测（需密码则立即失败不挂）；`--sudo` 与 `--pty` 互斥
 
 ## 快速开始
 
 - **本 skill 自带 `pyaissh.py`**（技能目录 `skills/pyaissh/` 下）：调用主路径 `python3 <pyaissh_dir>/pyaissh.py <子命令> ...`（Windows cmd / Git Bash 的额外调用方式见 docs/setup.md）；环境需 `python3` + `paramiko`（`pip install paramiko`）
-- 目标格式 `[user@]host[:port]`（如 `root@1.2.3.4:22`）；**IPv6 必须加方括号**：`user@[2001:db8::1]:22`、`[2001:db8::1]`（裸 IPv6 直接写也行）；支持主机别名 `@名称`、`-p/--port` 优先于内嵌端口；凭据 `--password`/`--key` 或环境变量 `PYAISSH_PASSWORD`/`PYAISSH_KEY` 等（也可写**技能目录下**的 `.env`——**配置样例见同目录 `.env.example`**；工作目录 `.env` 默认不加载，完整规则见 docs/setup.md）；**凭据安全实践：不要把 token/密码写进 `--cmd` 或脚本内容**——`cmd` 字段会原样回显命令（含凭据需脱敏），且会触发凭据 WARN；凭据走 `--password`/`--key` 参数、`PYAISSH_*` 环境变量、`.env`、或让脚本从文件读取（`cat /path/secret`），绝不内联进命令
+- 目标格式 `[user@]host[:port]`（如 `root@1.2.3.4:22`）；**IPv6 必须加方括号**：`user@[2001:db8::1]:22`、`[2001:db8::1]`（裸 IPv6 直接写也行）；支持主机别名 `@名称`、`-p/--port` 优先于内嵌端口；凭据 `--password`/`--key` 或环境变量 `PYAISSH_PASSWORD`/`PYAISSH_KEY` 等（也可写**技能目录下**的 `.env`——**配置样例见同目录 `.env.example`**；工作目录 `.env` 默认不加载，完整规则见 docs/setup.md）；**凭据别写进 `--cmd`/脚本**（`cmd` 字段原样回显 + 触发 WARN）——走 `--password`/`--key`、`PYAISSH_*`、`.env`，或让脚本从文件读（见「安全规则」）
 - **完整规则**（认证优先级、别名专属凭据、`.env` 加载与供应链安全、IPv6/端口解析细节）见 **docs/setup.md**
 
 ## 输出约定（核心，完整版见 docs/contract.md）
 
-- **stdout 才是可解析结果**；进度日志全部在 stderr，不要拿 stderr 当结果
-- **默认即 JSON**：整行 JSON 直接 `json.loads`；`--text` 切可读模式（标记带随机 nonce，仅供人类速览，**AI 一律用默认 JSON**）
-- **`--field` 消费端免样板**（v1.5.16）：**标准示例 `--field stdout,-stderr`**——stdout 内容打 stdout、stderr 内容打进程 stderr（**stderr 报错不被吞**——三次实测教训：AI 只读 stdout 丢过认证失败等真实原因）；只要某个字段裸值时用它代替手写 `json.loads`；`-` 前缀=打 stderr 通道，多字段逗号分隔每行一个；与 `--text` 互斥；**错误路径仍输出完整 JSON**；**`--field` 模式 stderr 无进度日志、仅含信号（WARN/提示）——不要 `2>/dev/null`**；不用 `--field` 时契约零变化
+- **stdout 才是可解析结果**（进度日志全在 stderr）；**默认即 JSON**，直接 `json.loads`；`--text` 仅供人类速览（AI 一律用默认 JSON）
+- **`--field` 消费端免样板**（v1.5.16）：**标准示例 `--field stdout,-stderr`**——stdout/stderr 各走对应通道（**stderr 报错不被吞**：只读 stdout 曾丢过认证失败的真实原因）；`-` 前缀=打 stderr，多字段逗号分隔每行一个；与 `--text` 互斥；错误路径仍输出完整 JSON；该模式 stderr 无进度日志（仅 WARN/提示）——**不要 `2>/dev/null`**
 - **`ok` 与 `exit_success` 区分**：`ok=true` 只表示工具操作成功（连接+执行完成）；**远程命令成败看 `exit_success`**（例：`exit 3` → `ok=true, exit_code=3, exit_success=false`）
-- 错误 JSON：`ok:false` + `error` + `message` + **`retryable`**（bool，机器可读的重试建议：true=重试可能成功且安全，false=改输入或放弃；exec 超时类 true 仅表示值得一试，重试前读 message 确认远程进程，或**直接读 `remote_may_be_running` 字段**（超时类恒有，true=进程可能仍在跑，副作用命令先 pgrep 再重试），见 **docs/errors.md**）；参数写错输出 `bad_args` JSON（退出码 2）；`--help` 是纯文本输出（非 JSON），`--version` 输出一行 JSON
+- 错误 JSON：`ok:false` + `error` + `message` + **`retryable`**（true=重试可能成功且安全，false=改输入或放弃；超时类 true 只表示值得一试，**先看 `remote_may_be_running`**——超时类恒有，true=进程可能仍在跑，副作用命令先 pgrep 再重试；见 **docs/errors.md**）；参数写错 `bad_args`（退出码 2）；`--help` 纯文本，`--version` 一行 JSON
 - **`warnings` 恒为参考信息，不代表操作失败**（疑似凭据等安全类提示不阻断执行，命令照常运行；需要行动的如 `.part` 残留会附清理命令）
-- 字段/截断/warnings/`--text` 标记细节：**docs/contract.md**
 
 ## 退出码粗筛（完整见 docs/errors.md）
 
@@ -57,7 +55,7 @@ pyaissh 是基于 paramiko 的命令行 SSH 工具，专为非交互的 AI/脚�
 
 ## 错误类型（完整表见 docs/errors.md）
 
-高频：`auth_failed` / `connection_timeout`（含 SSH banner 超时）/ `connection_refused`（含 TCP 可达但收到错误 banner）/ `connection_failed`（兜底）/ `dns_failed` / `host_key_rejected` / `jump_failed` / `exec_idle_timeout` / `exec_total_timeout` / `exec_timeout` / `exec_failed` / `connection_lost` / `interrupted`（上传中断可能残留 `.part`，warnings 明示清理命令）/ `upload_failed` / `download_failed` / `upload_timeout` / `download_timeout` / `bad_args` / `ssh_error` / `internal_error` / `read_cmd_failed` / `ls_failed` / `ls_timeout` / `test_failed`——每类的含义与建议动作见 **docs/errors.md**
+高频：`auth_failed` / `connection_timeout`（含 banner 超时）/ `connection_refused`（含错误 banner）/ `connection_failed`（兜底）/ `dns_failed` / `host_key_rejected` / `jump_failed` / `exec_idle_timeout` / `exec_total_timeout` / `exec_timeout` / `exec_failed` / `connection_lost` / `interrupted`（上传中断可能残留 `.part`）/ `upload_failed` / `download_failed` / `upload_timeout` / `download_timeout` / `bad_args` / `ssh_error` / `internal_error` / `read_cmd_failed` / `ls_failed` / `ls_timeout` / `test_failed`——含义与建议动作见 **docs/errors.md**
 
 ## 子命令速览（完整细节见 docs/ 子文档）
 
@@ -78,55 +76,38 @@ EOF
 
 ### exec --detach + log — 后台作业（v2.2，长任务"边跑边看"）
 ```bash
-python3 pyaissh.py exec root@1.2.3.4 --detach --cmd 'apt install -y nginx'   # 立即返回 job_id/log/rc
-python3 pyaissh.py log  root@1.2.3.4 --list                                  # 列作业（状态/大小/退出码）
-python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --offset 0                # 增量读（返回 next_offset）
-python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --offset <next_offset>    # 接着读，不重复
-python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --wait-rc 30                    # 等结束拿 exit_code
-python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --kill                        # 整组停掉（TERM→KILL）
-python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --cleanup                     # 清理远端作业目录
+python3 pyaissh.py exec root@1.2.3.4 --detach --cmd 'apt install -y nginx'  # 立即返回 job_id/log/rc
+python3 pyaissh.py log  root@1.2.3.4 --list                                 # 列作业（状态/大小/退出码）
+python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --offset <next_offset>   # 增量读，不重复
+python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --wait-rc 30             # 等结束拿 exit_code
+python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --kill --cleanup         # 停掉整组并清理
 ```
-- **为什么用**：`exec` 前台受宿主单次调用时长限制（约 600s，pyaissh 自身可到 1200）；`--detach` 把作业丢到远端 `setsid+nohup` 后台（SSH 断开照跑），日志/退出码/pid 落 `/tmp/pyaissh-jobs/<job_id>/{job.log,job.rc,job.pid}`，AI 用 `log` 轮询增量读——分钟级任务的"正在进行中"变得可见
-- **载荷字段是 `stdout`**（v2.2.1 起与 exec 对齐，`--field stdout` 取裸内容；它是 `2>&1` 合并流）
-- **状态三级**：`finished`（有 job.rc = 退出码）/ `dead`（无 rc 且进程已消失：被 kill/OOM/崩溃，带 `hint`）/ `running`——被 kill 的作业不再永远 running，`--wait-rc` 能收敛；要主动停用 `--kill`
-- **落盘权限**：目录 0700、job.sh/job.log/job.rc/job.pid 0600（命令原文与输出都在盘上，同机他人不可读）
-- **清理有守卫**：`--cleanup` 在作业仍运行时**拒绝**（job_running，防自断追踪 + 进程还在跑）；收尾用 `--kill --cleanup` 一步到位，或 `--cleanup --force` 显式放弃追踪
-- **force 之后要停进程**：结果直接给 `kill -9 -<pid>`（负号=进程组；pid 即 setsid 组长，一条命令清整组含子进程，**不用先 pgrep**）
-- **与 `--sudo`/`--pty` 互斥**（bad_args）；命令原文会落远端 `job.sh`（别写明文凭据，用完 `--cleanup`）
+- **为什么用**：`exec` 前台受宿主单次调用时长限制（约 600s）；`--detach` 把作业丢到远端 `setsid+nohup` 后台（SSH 断开照跑），日志/退出码/pid 落 `/tmp/pyaissh-jobs/<job_id>/{job.log,job.rc,job.pid}`，AI 用 `log` 轮询增量读
+- **载荷字段是 `stdout`**（v2.2.1 起与 exec 对齐，`2>&1` 合并流）；状态三级：**finished**（有 job.rc 即退出码）/ **dead**（无 rc 且进程已消失，带 `hint`）/ **running**——被 kill 的作业不再永远 running，`--wait-rc` 能收敛
+- 目录 0700、文件 0600；`--cleanup` 在作业仍运行时**拒绝**（防自断追踪），收尾用 `--kill --cleanup`；`--force` 后若进程仍在，结果直接给 `kill -9 -<pid>`（负号=进程组，不用先 pgrep）
+- 与 `--sudo`/`--pty` 互斥（bad_args）；命令原文落远端 `job.sh`（别写明文凭据，用完 `--cleanup`）
 
 ### CRLF 行尾自动归一（v2.2.4）
 
-Windows 工具（记事本 / VS Code / PowerShell 重定向 / here-string）写出的命令文本行尾是 `\r\n`，远端 bash 会把 `\r` 当词的一部分（`$'\r': command not found`、`if/then` 行语法错、heredoc 落盘文件每行带 CR）。pyaissh **默认把命令文本的 CRLF/CR 归一为 LF**——`--cmd` 内联、`--cmd-file` 文件、`--cmd-file -` stdin 三条路都覆盖，结果回传 `crlf_normalized: <处数>` + warnings 说明：
-
-```bash
-python3 pyaissh.py exec root@1.2.3.4 --cmd-file win_written.sh    # 自动归一，不必再 sed -i 's/\r$//'
-python3 pyaissh.py exec root@1.2.3.4 --cmd 'printf "a\r\nb\r\n"'  # 要真 CR 用转义写法（不受影响）
-python3 pyaissh.py exec root@1.2.3.4 --cmd-file win.sh --keep-crlf  # 确实要 CRLF 数据时保留原样
-```
+Windows 工具（记事本 / VS Code / 重定向 / here-string）写出的命令文本行尾是 `\r\n`，远端 bash 会把 `\r` 当词的一部分（`$'\r': command not found`、`if/then` 语法错、heredoc 落盘每行带 CR）。pyaissh **默认把命令文本的 CRLF/CR 归一为 LF**——`--cmd` 内联 / `--cmd-file` 文件 / `--cmd-file -` stdin 三条路都覆盖，结果回传 `crlf_normalized: <处数>`；要真 CR 用转义写法（不受影响），确实需要 CRLF 数据时加 `--keep-crlf`。
 
 **`upload`/`download` 是数据通道，任何情况下不改字节**（Windows 上写好再上传的脚本在远端仍是 CRLF：要执行就用 `--cmd-file` 送脚本，或远端 `dos2unix`）。
 
-### session — 常驻会话（真 PTY）：逐条喂命令 / 状态保留 / 可中断（v2.3）
+### session — 常驻会话（真 PTY）：**第二工作模式**（长程/多步任务用）
 
-`exec` 无状态、`exec --detach` 启动后改不了；**多步且带状态**的活（部署、排障、试错、交互式安装）用 `session`：
+**默认工作模式仍是"单次连接、单条命令"（`exec`）**；只有**长程或多步、步骤间有状态**的任务才切到 session
+（部署、排障、试错、交互式安装）——它把"一条一条喂命令"变成可能，且执行中的命令可以中断：
 
 ```bash
-python3 pyaissh.py session start h --name work                   # 起会话（真 PTY；返回 pid/pty/ready）
-python3 pyaissh.py session run   h --name work --cmd 'cd /opt/app && git pull'   # 跑一条并等结果（一次调用）
-python3 pyaissh.py session run   h --name work --cmd 'make -j8' --wait-rc 5      # 状态还在（cwd 仍是 /opt/app）
-python3 pyaissh.py session ctrl-c h --name work                  # 中断正在跑的 make（会话不死，cwd 还在）
-python3 pyaissh.py session keys  h --name work --data 'y\n'      # 应答程序提示（y/n、密码…）
-python3 pyaissh.py session read  h --name work --offset 0        # 增量读（send/--no-wait 之后用）
-python3 pyaissh.py session kill  h --name work                   # 收尾（进程树全清 + 删目录）
+python3 pyaissh.py session start h --name work                   # 起会话（真 PTY）
+python3 pyaissh.py session run   h --name work --cmd 'cd /opt/app && make -j8'  # 跑一条并等结果（一步一次调用）
+python3 pyaissh.py session ctrl-c h --name work                  # 中断执行中的命令（会话不死，状态保留）
+python3 pyaissh.py session kill  h --name work                   # 收尾（进程树全清）
 ```
 
-- **`session run` = send + 等结果，一步一次调用**（与 `exec` 同成本）；`--wait-rc N` 超时则回 `status:"running"`（带 `token`，可 `read --wait-rc` 续等或 `ctrl-c` 中断）；`--no-wait` 只发送（等价 `send`）
-- **每条命令独立退出码**（`exit_code`）；**`cd`/`export`/函数跨命令保留**——**打错了就把那条命令改对再发一遍**（同一条重试）：像人打错文件名那样，报错 → 改对 → 重发 → 成功，上下文（cwd/变量）与上次完全一致，不用重来
-- **能中断执行中的命令**：`ctrl-c`（SIGINT→自动升级 TERM；`--force` = SIGKILL），会话与状态都保住
-- **能应答交互提示**：`keys --data 'y\n'`（支持 `\n \r \t \xNN`）
-- `read` 载荷字段 `stdout`（合并流，自动清洗 CR/ANSI/哨兵行）/`next_offset`/`status`(`done`|`running`)/`exit_code`
-- 依赖：真 PTY 需 util-linux `script`（缺则自动降级为非 PTY，状态与退出码照常但没有 tty）
-- 详细设计、三个实测坑（哨兵被 `read` 吃掉 / kill 按 sid 会留孤儿 / SIGINT 需升级）见 `docs/session.md`
+- **每条命令独立退出码**；**`cd`/`export`/函数跨命令保留**——**打错了就把那条命令改对再发一遍**（同一条重试）：像人打错文件名那样，报错 → 改对 → 重发 → 成功，上下文与上次完全一致
+- `run --wait-rc` 超时回 `status:"running"`（带 `token`，可 `read --wait-rc` 续等或 `ctrl-c` 中断）；`read` 载荷字段 `stdout`（合并流，已清洗 CR/ANSI/哨兵行）
+- 子命令 `start/run/send/read/ctrl-c/keys/list/kill`；真 PTY 需 util-linux `script`（缺则自动降级为非 PTY）。**实现细节、实测坑与边界 → `docs/session.md`**
 
 ### ls — 列远程目录
 ```bash
@@ -148,7 +129,7 @@ python3 pyaissh.py host add prod root@1.2.3.4 --password 'xxx'   # 写 .env（�
 python3 pyaissh.py exec @prod --cmd 'df -h'                       # 之后用 @别名 走专属凭据
 ```
 **PowerShell 注意（v2.1.4 实测）**：PS 会把行首 `@名称` 当特殊语法吞掉（`pyaissh test @prod` 报缺 target）——PowerShell 下给别名**加引号**：`pyaissh test "@prod"`。
-两台机器不同密码不再逐条 `--password`（进程列表可见 + WARN 刷屏）：`host add` 把 `PYAISSH_HOST_<NAME>`（+`_PASSWORD`/`_KEY`）写进脚本同目录 .env，`@别名` 调用自动用专属凭据；密码是明文存 .env，勿提交 git/分享。管理：`host list`（列别名，不回显密码）/ `host remove NAME`（删别名含专属凭据）；均支持 `--field`（如 `host list --field entries`）
+`host add` 把 `PYAISSH_HOST_<NAME>`（+`_PASSWORD`/`_KEY`）写进脚本同目录 `.env`，`@别名` 调用自动用专属凭据（免去逐条 `--password`：进程列表可见 + WARN 刷屏）；**密码明文存 .env，勿提交/分享**。管理：`host list`（列别名，不回显密码）/ `host remove NAME`（含专属凭据）；均支持 `--field`
 
 ### 跳板机
 ```bash
@@ -175,7 +156,7 @@ python3 pyaissh.py exec root@10.0.0.5 --jump root@1.2.3.4:2222 --cmd 'hostname'
 
 ## 文档导航（按需读取，节省上下文）
 
-> **维护约定**：每次更新/修改/修复 pyaissh，必须在 **CHANGELOG.md** **末尾追加**一条记录（最新在最后，历史条目禁止覆盖/删除；版本号与 `pyaissh.py` 的 `VERSION` 常量一致），并同步技能目录（`/skills/pyaissh/`） `pyaissh.py` / `CHANGELOG.md`。
+> **维护约定**：每次更新/修复 pyaissh，必须在 **CHANGELOG.md 末尾追加**一条记录（最新在最后，禁止覆盖/删除历史），并同步技能目录（`/skills/pyaissh/`）的 `pyaissh.py` / `CHANGELOG.md`。
 
 | 场景 | 读哪个文档 |
 |---|---|
@@ -184,6 +165,7 @@ python3 pyaissh.py exec root@10.0.0.5 --jump root@1.2.3.4:2222 --cmd 'hostname'
 | 输出约定完整版（字段/截断/warnings/--text 标记） | **docs/contract.md** |
 | 退出码完整说明 + 错误类型完整表 | **docs/errors.md** |
 | exec 超时参数 / 输出截断 / PTY / 长脚本 / --encoding / --sudo | **docs/exec.md** |
+| session 常驻会话（第二工作模式）完整用法与实现坑 | **docs/session.md** |
 | upload/download 并行分片 / 原子性 / 断点重试 / 符号链接 | **docs/transfer.md** |
 | 跳板机凭据 / 隧道 / 分片 | **docs/jump.md** |
 | PTY/ANSI / host key / MaxStartups / 信号 / Windows / Git Bash 等边界 | **docs/edge-cases.md** |
