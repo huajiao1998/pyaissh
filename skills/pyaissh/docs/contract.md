@@ -15,18 +15,31 @@
 - **`crlf_normalized`（v2.2.4，仅在有归一发生时出现）**：命令文本里被归一为 LF 的 CRLF/CR 行尾**处数**（exec 与 exec --detach 都会回传）。默认行为：命令文本（内联 `--cmd`、`--cmd-file`、stdin）的行尾 CRLF/CR 一律归一为 LF——远端 bash 会把 `\r` 当词的一部分（`$'\r': command not found`、关键字行语法错、heredoc 落盘文件每行带 CR）；要原样发送加 `--keep-crlf`（此时不出现本字段）。**传输通道不受影响**：upload/download 是数据面，绝不改字节，Windows 文件传上去仍是 CRLF
 - 远程命令的 stdout/stderr 已分别放入结果的 `stdout`/`stderr` 字段，无需自行拼接
 
-## 常驻会话字段契约（v2.3：`session` 子命令）
+## 常驻会话字段契约（v2.4：`session` 子命令；引擎 = tmux）
 
-- **`session start`**：`session`（名字）、`dir`/`fifo`/`log`、`pid`（starter，setsid 组长）、`pty`（是否真 PTY）、`cols`、`ready`（就绪确认：初始化命令的哨兵是否按时出现）、`permissions`；`pty=false` 时带 warning（远端缺 util-linux `script` 或指定了 `--no-pty`）
+> **键集不变**：v2.4.0 把 session 的**进程引擎**从自研实现（`setsid`+`nohup`+util-linux `script`+FIFO+
+> 看门狗）换成 **tmux**，下面所有字段与 v2.3 契约基线**逐键相同**；仅按白名单**新增** `orphans` /
+> `orphans_total` / `orphan_remaining_total`（`kill` 结果**恒返回且恒空**，AI 侧零感知）。
+> **与 v2.3 的行为差异只有 SPEC §7.1 的 C1~C8（既知变化，不是缺陷，解析代码无需改）**：
+> ① `--no-pty` 变 no-op（结果恒 `pty: true`）；② 会话内 `TERM` = `tmux-256color`（tmux 强制决定）；
+> ③ 新增的 `orphans*` 三字段恒空；④ 空闲回收从"服务器端准点"变为"**惰性扫 + 每主机一个 reaper**
+> （默认 300 秒一轮）"（`ttl_seconds`/`idle_seconds`/`expires_in_seconds` 字段与口径不变）；
+> ⑤ 会话目录少了 `in`/`sess.pid`/`bash.pid`/`watch.*`、多了 `tmux`；⑥ 依赖远端 tmux ≥ 3.0
+> （没有/过低分别报 `tmux_missing`/`tmux_unsupported`，退出码 255）；⑦ `ctrl-c --force` 打的是内核给出的
+> 前台进程组（`ps -o tpgid=`）；⑧ 多一个"服务器级"对象 tmux server（闲置时随最后一个会话退出，
+> `list` 不受影响）。详见 `docs/session.md` 与 `docs/errors.md`。
+
+- **`session start`**：`session`（名字）、`dir`/`log`、`pid`（= tmux pane 的 `#{pane_pid}`，即会话 shell；`list` 里同一个值也放在 `shell_pid`）、`pty`（**恒 `true`**——tmux 永远提供 PTY）、`cols`、`ready`（就绪确认：初始化命令的哨兵是否按时出现）、`permissions`；**`fifo` 字段保留但恒为 `null`**（旧引擎的 FIFO 已不存在，留着只为键集不变）；**`--no-pty` 已废弃**：no-op + 一条 warning，结果仍是 `pty: true`（C1）
 - **`session send`**：`token`（这条命令的哨兵 id）、`offset`/`next_offset`（本次输出起点，接着 `read --offset` 就只读这条命令的输出）、`sent_bytes`
-- **`session read`**：载荷字段与 `log` 对齐——**`stdout`**（合并流，已清洗 CR/ANSI/哨兵行与 `script` 头）、`bytes_returned`、`log_bytes`、`next_offset`、`has_more`、`status`（`done`|`running`）、`exit_code`/`exit_success`、`token`、`pid`、`waited_ms`/`wait_rc_secs`、`output_truncated`/`omitted_bytes`；默认剥离 ANSI（`--keep-ansi` 保留）
-- **`session ctrl-c`**：`signal`（`INT`|`KILL`）、`signaled_groups`/`signaled_children`（被发信号的进程组/进程）、`signaled_count`、`escalated_to_term`（SIGINT 后幸存者升级为 TERM 的 pid 列表，非空时带 warning）、`sid`
+- **`session read`**：载荷字段与 `log` 对齐——**`stdout`**（合并流，已清洗 CR/ANSI/哨兵行）、`bytes_returned`、`log_bytes`、`next_offset`、`has_more`、`status`（`done`|`running`）、`exit_code`/`exit_success`、`token`、`pid`、`waited_ms`/`wait_rc_secs`、`output_truncated`/`omitted_bytes`；默认剥离 ANSI（`--keep-ansi` 保留）
+- **`session run`**：与 `read` 同构（`stdout`/`exit_code`/`status`/`token`/`next_offset`/`waited_ms`），外加 `sent_bytes`
+- **`session ctrl-c`**：`signal`（`INT`|`KILL`）、`signaled_groups`/`signaled_children`（`--force` 时给出内核判定的前台进程组及其成员；默认注入 Ctrl-C 时 `signaled_groups` 为空、`signaled_count=1`）、`signaled_count`、`escalated_to_term`（**tmux 引擎下恒空**——不再有"INT 无效就升级 TERM"那条路，字段保留只为键集不变）、`sid`（= pane pid）；**被中断的命令自己不会产出哨兵**（bash 收到 SIGINT 丢弃当前命令行），所以 ctrl-c 会**代它补一条**（INT→`exit_code=130`、`--force`→`137`）⇒ 正等它的 `read --wait-rc --token` 会收敛
 - **`session keys`**：`bytes_sent`（注入的原始字节数）
-- **`session list`**：`sessions[]`（`session`/`pid`/`status`(`running`|`dead`)/`pty`/`cols`/`log_bytes`/`mtime`/`dir`）+ `count`
-- **`session kill`**：`sessions[]`（`swept` 扫到的进程树规模 / `remaining` 残留 / `cleaned`）+ `remaining_total`
-- **状态语义**：会话本身只有 `running`/`dead`（starter 存活探测）；**命令级**状态在 `read` 里——`status:"done"` + `exit_code` 表示那条命令结束（哨兵出现），`running` 表示还没结束
-- **退出码**：`session start` 成功 = 0（同名会话已存在 = 2 `session_exists`）；`send`/`read`/`ctrl-c`/`keys`/`list`/`kill` 成功 = 0；会话不存在 = 2（`session_not_found`）、会话已死 = 2（`session_dead`）、非法名字/参数 = 2（`bad_args`）；启动/写入/读取失败 = 255
-- **`session` 与 `exec` 的关系**：`session send` 的命令文本同样走 **CRLF 归一**（`--keep-crlf` 可关）；`session read` 的载荷字段与 `log`/`exec` 一致（`stdout`/`next_offset`/`exit_code`），便于同一套消费代码
+- **`session list`**：`sessions[]`（`session`/`pid`(=`shell_pid`)/`status`(`running`|`dead`)/`pty`/`cols`/`log_bytes`/`mtime`/`dir`/`started_at`/`age_seconds`/`idle_seconds`/`ttl_seconds`/`expires_in_seconds`/`current_command`/`tmux_session`）+ `count`
+- **`session kill`**：`sessions[]`（`swept` 进程树闭包规模 / `remaining` 残留 / `roots` 是否拿到权威根 = pane_pid / `verified`（有根且无幸存）/ `cleaned` / `tmux_killed`）+ `remaining_total`/`verified_total` + **`orphans`/`orphans_total`/`orphan_remaining_total`（恒返回且恒空）**
+- **状态语义**：会话本身只有 `running`/`dead`（**tmux `has-session`** 存活探测，不再是 starter 进程探测）；**命令级**状态在 `read`/`run` 里——`status:"done"` + `exit_code` 表示那条命令结束（哨兵出现），`running` 表示还没结束
+- **退出码**：`session start` 成功 = 0（同名会话已存在 = 2 `session_exists`）；`send`/`run`/`read`/`ctrl-c`/`keys`/`list`/`kill` 成功 = 0；会话不存在 = 2（`session_not_found`）、会话已死 = 2（`session_dead`）、非法名字/参数 = 2（`bad_args`）；启动/写入/读取失败 = 255，**tmux 预检失败也是 255**（`tmux_missing`/`tmux_unsupported`/`tmux_failed`）
+- **`session` 与 `exec` 的关系**：`session send`/`run` 的命令文本同样走 **CRLF 归一**（`--keep-crlf` 可关）；`session read`/`run` 的载荷字段与 `log`/`exec` 一致（`stdout`/`next_offset`/`exit_code`），便于同一套消费代码
 
 ## `--text` 可读模式（仅供人类速览，AI 直接用默认 JSON）
 

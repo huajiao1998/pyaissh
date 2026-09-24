@@ -473,9 +473,9 @@ def build_parser():
                     help="只取结果字段裸值（如 --field entries 得清单 JSON）")
     hl.set_defaults(func=cmd_host_list)
 
-    # session（v2.3）：真 PTY 常驻会话——逐条喂命令 + 状态保留 + 可中断
+    # session（v2.4）：真 PTY 常驻会话（引擎 = tmux）——逐条喂命令 + 状态保留 + 可中断
     sp = sub.add_parser("session", help="常驻会话（真 PTY）：逐条喂命令、状态保留、可中断",
-                        description="远端一个常驻 shell（util-linux script 给真 PTY）："
+                        description="远端一个常驻 shell（**引擎 = tmux**，专用 socket `pyaissh`）："
                                     "每条命令独立退出码，cd/export 等状态跨命令保留，"
                                     "执行中的命令可 ctrl-c 中断。子命令：start/send/read/"
                                     "ctrl-c/keys/list/kill。",
@@ -487,7 +487,7 @@ def build_parser():
   pyaissh session run   h --name work --cmd 'make -j8' --wait-rc 5      # 状态还在（cwd 仍是 /opt/app）
   pyaissh session ctrl-c h --name work                   # 中断正在跑的 make（会话不死）
   pyaissh session keys  h --name work --data 'y\\n'       # 应答程序提示（y/n、密码等）
-  pyaissh session kill  h --name work                    # 结束会话（进程树全清 + 删目录）
+  pyaissh session kill  h --name work                    # 结束会话（tmux 会话 + 进程树 + 目录）
   pyaissh session kill  h --all                          # 清掉该主机上全部会话（含忘了关的）
 
 与 exec / exec --detach 的分工:
@@ -496,29 +496,36 @@ def build_parser():
   session           多步·需状态·可能要中断·要应答提示：逐条喂 + 状态保留 + ctrl-c + keys
                     （run = send + 等结果，一步一次调用；send/read 分离时用于增量读）
 
+依赖（重要）:
+  session 需要远端有 **tmux ≥ 3.0**（PTY 与进程生命周期都由它提供）。没有就报 tmux_missing
+  并给出安装命令；装不了的环境请用 exec / exec --detach 跑长任务。
+
 会话的生命周期（重要）:
-  会话是 setsid+nohup 起的**远端常驻进程，不会自己退出**（SSH 断开也照跑）——
-  用完必须 session kill（默认连目录一起删，--keep-dir 保留日志）；
-  会话里 exit 掉、或进程被 OOM/外力杀掉时，进程会消失但 /tmp 下的目录与日志仍在。
-  list 会给你 age_seconds/log_bytes，挂了超过 24 小时的会额外提示。
+  会话由远端 tmux 常驻，**不会自己退出**（SSH 断开也照跑）——
+  用完必须 session kill（默认连 tmux 会话、进程树、目录一起清；--keep-dir 保留日志）；
+  **空闲回收**：提示符空闲（没有命令在跑）且 TTL 内没有任何 pyaissh 交互时自动回收
+  （默认 600 秒，--ttl 0 关闭）。回收由两条路触发：会话子命令（send/run/read/ctrl-c/keys/list）
+  入口的**惰性扫**，以及每主机一个 reaper（默认 5 分钟一轮）——没人再回来时最迟 TTL+5 分钟被收掉。
+  会话里 exit 掉、或 tmux 会话被外部 kill 时，进程没了但目录与日志仍在（list 显示 dead）。
 
 载荷字段: stdout（合并流，已清洗 CR/ANSI/哨兵行）/ next_offset / status(done|running)
           / exit_code / token / session / pid / pty
 """)
     ss = sp.add_subparsers(dest="session_cmd", metavar="start|send|read|ctrl-c|keys|list|kill")
 
-    ssp = ss.add_parser("start", help="起会话（真 PTY；缺 script 时降级为非 PTY）",
-                        description="setsid+nohup 起常驻 shell：SSH 断开不影响；"
-                                    "有 util-linux script 则分配真 PTY（可跑需要 tty 的程序）。"
+    ssp = ss.add_parser("start", help="起会话（tmux 引擎；需要远端有 tmux ≥ 3.0）",
+                        description="用远端 tmux 起常驻 shell（专用 socket `pyaissh`，不碰用户自己的 "
+                                    "tmux）：SSH 断开不影响，真 PTY（可跑需要 tty 的程序）。"
                                     "**空闲回收**：提示符空闲（没有命令在跑）且 TTL 内没有任何 pyaissh "
-                                    "交互时，会话自动回收（进程 + 目录）——默认 600 秒，--ttl 0 关闭")
+                                    "交互时自动回收（tmux 会话 + 进程 + 目录）——默认 600 秒，"
+                                    "--ttl 0 关闭。")
     add_conn(ssp)
     ssp.add_argument("--name", default="main", help="会话名（默认 main；字母/数字/._-）")
     ssp.add_argument("--session-dir", dest="session_dir", help="会话根目录（默认 %s）"
                      % DEFAULT_SESSION_DIR)
     ssp.add_argument("--cols", type=_positive_int, default=200, help="PTY 列宽（默认 200，防折行）")
     ssp.add_argument("--no-pty", dest="no_pty", action="store_true",
-                     help="强制非 PTY（无 tty，但状态与退出码照常）")
+                     help="已废弃（tmux 引擎永远提供 PTY）：保留参数，仅回一条 warning")
     ssp.add_argument("--ttl", help="空闲回收秒数（默认 600=10 分钟；可写 30s/10m/2h；0 = 关闭回收）；"
                                    "也可用环境变量 PYAISSH_SESSION_TTL")
     ssp.add_argument("--attach", action="store_true",
@@ -528,7 +535,8 @@ def build_parser():
     ssp.set_defaults(func=cmd_session_start)
 
     sse = ss.add_parser("send", help="把一条命令喂进会话（自动追加退出码哨兵）",
-                        description="命令 + 哨兵写入会话 FIFO；用返回的 token/offset 去 read")
+                        description="命令 + 哨兵经 tmux 缓冲区灌进会话（原样字节，不经 tmux 命令行"
+                                    "解析）；用返回的 token/offset 去 read")
     scur = ss.add_parser("run", help="会话内跑一条命令并等它结束（send+等待，一次调用）",
                          description="喂命令 + 等哨兵 + 回传这条命令的输出与 exit_code——"
                                      "会话式的「一步一次调用」。--no-wait 则只发送（等价 send）")
@@ -577,8 +585,11 @@ def build_parser():
     ssr.set_defaults(func=cmd_session_read)
 
     ssc = ss.add_parser("ctrl-c", help="中断会话里正在执行的命令（会话不死，状态保留）",
-                        description="对命令自己的进程组发 SIGINT（--force 用 SIGKILL）。"
-                                    "PTY 下 bash 有 job control，每条命令独立进程组")
+                        description="往 tmux pane 注入 Ctrl-C（tty 把它交给**前台进程组**，就是终端里的 "
+                                    "Ctrl-C）；--force 用 SIGKILL 打前台进程组（内核的 tpgid）。"
+                                    "被中断的命令不会自己产出哨兵（bash 收到 SIGINT 会丢弃当前命令行），"
+                                    "所以 ctrl-c 会**代它补一条**（INT→130 / KILL→137）——"
+                                    "正在等它的 `read --wait-rc --token` 会正常收敛")
     add_conn(ssc)
     ssc.add_argument("--name", default="main", help="会话名（默认 main）")
     ssc.add_argument("--session-dir", dest="session_dir", help="会话根目录")
@@ -586,7 +597,7 @@ def build_parser():
     ssc.set_defaults(func=cmd_session_ctrl_c)
 
     ssk = ss.add_parser("keys", help="向会话注入按键/文本（应答提示、Ctrl-D）",
-                        description="原始字节写入会话；中断命令请用 ctrl-c（信号≠按键）")
+                        description="原始字节经 tmux 缓冲区灌进会话；中断命令请用 ctrl-c（信号≠按键）")
     add_conn(ssk)
     ssk.add_argument("--name", default="main", help="会话名（默认 main）")
     ssk.add_argument("--session-dir", dest="session_dir", help="会话根目录")
@@ -595,19 +606,21 @@ def build_parser():
     ssk.add_argument("--raw", action="store_true", help="--data 不做转义解析（原样发送）")
     ssk.set_defaults(func=cmd_session_keys)
 
-    ssl = ss.add_parser("list", help="列该主机的会话（存活/pty/日志大小/最后活动）")
+    ssl = ss.add_parser("list", help="列该主机的会话（存活/日志大小/最后活动）",
+                        description="数据来自 tmux（谁真的活着）+ 会话目录（TTL/最后交互/日志大小）；"
+                                    "不续期，但会顺手做一次惰性回收")
     add_conn(ssl)
     ssl.add_argument("--session-dir", dest="session_dir", help="会话根目录")
     ssl.set_defaults(func=cmd_session_list)
 
-    ssz = ss.add_parser("kill", help="结束会话（按 sid 全量清理，默认连目录一起删）",
-                        description="以自证的会话进程（sess.pid / bash.pid / script）为根算进程树闭包，"
-                                    "TERM → 校验 → KILL 残留：只杀 leader 进程组会留 job 孤儿，"
-                                    "只按 sess.pid 会在 starter 已被 OOM/外力杀掉时漏掉 reparent 的孤儿")
+    ssz = ss.add_parser("kill", help="结束会话（tmux 会话 + 进程树 + 目录，默认一起清）",
+                        description="先取 pane_pid 的进程树闭包快照，再 tmux kill-session，"
+                                    "对幸存者 TERM → 校验 → KILL；orphans 系列字段恒返回且恒空"
+                                    "（tmux 引擎下「目录没了进程还在」的结构性孤儿不复存在）")
     add_conn(ssz)
     ssz.add_argument("--name", help="会话名")
     ssz.add_argument("--all", action="store_true",
-                     help="结束该主机全部会话；并**按 argv 扫描孤儿**（目录已被删、只剩进程的会话）")
+                     help="结束该主机全部会话（含会话目录已被外部删掉、只剩 tmux 会话的）")
     ssz.add_argument("--session-dir", dest="session_dir", help="会话根目录")
     ssz.add_argument("--keep-dir", dest="keep_dir", action="store_true",
                      help="保留会话目录（只杀进程，便于事后看 out.log）")

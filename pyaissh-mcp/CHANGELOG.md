@@ -218,3 +218,14 @@
 
 - 修一处自身失误：给工具描述追加"不会无声误报「清干净」"时误用了半角双引号，导致 `pyaissh_mcp.py`
   语法错误（`py_compile` 不过、离线套件直接 EOF 失败）——已改为 `「」` 并补了 `py_compile` 习惯。
+
+### 补充（2026-09-24）：跟随 CLI v2.4.0 —— `pyaissh_session` 描述同步 tmux 引擎（无逻辑变更，`SERVER_VERSION` 仍 0.3.1）
+
+- 只改**描述性文本**（工具 description 与参数说明里的引擎措辞），argv 拼装与工具逻辑一行未动：
+  清掉旧引擎说法（FIFO / util-linux `script` / 看门狗 / 非 PTY 降级 / `all=true` 按 argv 扫孤儿），
+  换成 tmux 语义——**远端需 tmux ≥ 3.0**（缺则 `tmux_missing` 并给安装命令，**不自动安装**；装不了用
+  `exec`/`exec --detach`）、空闲回收改为**惰性扫 + 每主机一个 reaper（默认 300 秒一轮，无会话自退）**
+  （`ttl` 与 `list` 的字段口径不变）、`ctrl-c` 的 `force=true` = SIGKILL 打内核给出的前台进程组
+  （tpgid）、被中断那条命令的退出码哨兵不会出现、`no_pty` 标为**已废弃**（no-op + warning，恒
+  `pty: true`）、`all=true` 不再扫孤儿（`orphans` 系列字段恒返回且恒空）。`README.md` 的工具表与
+  「会话归属与退出清理」一节同步。

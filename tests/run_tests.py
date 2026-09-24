@@ -48,15 +48,13 @@ sys.stdout.reconfigure(encoding="utf-8")
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 仓库根
 _py_module = None
 
-# 看门狗检查周期：与 CLI 同源（PYAISSH_SESSION_TTL_TICK）。开发用 `--fast` 调到 3s，
-# 那些"等一个 tick"的用例随之缩短；发布前全量跑默认 15s（真实生产值）。
-_FAST_TICK = 3
-_TICK = int(os.environ.get("PYAISSH_SESSION_TTL_TICK") or 15)
-
-
-def _wait(ticks=1, extra=3):
-    """等 n 个看门狗检查周期（随 --fast 自动缩短）。`extra` 是覆盖 SSH 往返的余量。"""
-    return max(2, int(ticks) * int(_TICK) + int(extra))
+# 空闲回收：tmux 引擎下主路径是**惰性扫**（任何会话子命令入口先续期目标、再扫其它），
+# reaper（每主机一个，默认 300s 一轮）只是"没人再回来"的兜底。
+# 因此回收类用例主要靠"等够 TTL + 发一条会话命令触发懒扫"，reaper 类用例则**显式**给那次
+# start 传 PYAISSH_SESSION_REAP_INTERVAL=3（间隔在 start 时写进远端 reap.sh），
+# 这样不管有没有 --fast 都是几秒钟的事。`--fast` 只是把默认间隔也调小。
+_FAST_REAP = 3
+_REAP = int(os.environ.get("PYAISSH_SESSION_REAP_INTERVAL") or 300)
 
 _py_module = None
 
@@ -348,19 +346,50 @@ def suite_unit_regression(s):
     s.check("--data 转义：\\n/\\r/\\t/\\xNN/\\\\ 与原文",
             un("y\\n") == "y\n" and un("a\\tb") == "a\tb" and un("\\x03") == "\x03"
             and un("\\\\") == "\\" and un("plain") == "plain", repr((un("y\\n"), un("\\x03"))))
-    # kill 命令（R1 加固）：两个根 + 根自证闸门 + ROOTS/HAD 回传
-    _kc = m._session_kill_cmd(m._session_files("/tmp/pyaissh-sessions", "demo"))
-    s.check("kill 命令：根候选含 sess.pid / bash.pid / watch.pid / 会话 shell 的父进程",
-            "sess.pid" in _kc and "bash.pid" in _kc and "watch.pid" in _kc
-            and 'for r in "$P" "$B" "$W"' in _kc and 'ps -o ppid= -p "$B"' in _kc,
-            _kc[:200])
-    s.check("kill 命令：根自证闸门（argv 必须含本会话目录，防 pid 回收误杀）",
-            'case "$A" in *"$D"*)' in _kc and 'D=' in _kc, _kc[:160])
-    s.check("kill 命令：回传 ROOTS/HAD 供上层判 verified/是否告警",
-            "__PYAISSH_SESS__ROOTS=$ROOTS" in _kc and "__PYAISSH_SESS__HAD=$HAD" in _kc,
-            _kc[:160])
-    s.check("kill 命令：awk 根按循环变量（不再写死 $P）",
-            'awk -v root="$r"' in _kc and 'awk -v root="$P"' not in _kc, _kc[:160])
+    # ---- tmux 引擎（v2.4.0）：名字映射 / target 语法 / 预检闸门（纯函数，无需真机）----
+    _tn = m._session_tmux_name
+    s.check("会话名映射：py-<utf-8 hex>，可逆且不含 tmux 特殊字符（实测 tmux 会把 `.`/`:` 改成 `_`）",
+            _tn("main") == "py-6d61696e" and _tn("a.b") == "py-612e62"
+            and m._session_tmux_decode(_tn("a.b")) == "a.b"
+            and m._session_tmux_decode(_tn("work-2_x")) == "work-2_x"
+            and "." not in _tn("a.b") and ":" not in _tn("a:b"),
+            repr((_tn("main"), _tn("a.b"))))
+    s.check("tmux 名反解：不是本工具建的会话一律 None（不碰别人的 tmux）",
+            m._session_tmux_decode("plain") is None and m._session_tmux_decode("py-zz") is None
+            and m._session_tmux_decode("py-612") is None and m._session_tmux_decode("") is None
+            and m._session_tmux_decode("py-2f") is None, "非法名/非法 hex 都要拒")
+    _tp = m._session_tmux_pair("main")
+    s.check("target 语法：会话级 `=NAME`、pane 级 `=NAME:`（实测少了冒号会 can't find pane）",
+            _tp == ("py-6d61696e", "=py-6d61696e", "=py-6d61696e:"), repr(_tp))
+    _errs = []
+    _orig_emit = m.emit_error
+    m.emit_error = lambda use_json, et, msg, extra=None: _errs.append((et, msg, extra or {}))
+    try:
+        _g1 = m._session_tmux_gate(False, {"TMUX": "missing"})
+        _g2 = m._session_tmux_gate(False, {"TMUX": "oldver", "TMUXV": "1.8"})
+        _g3 = m._session_tmux_gate(False, {"TMUX": "badver", "TMUXV": "weird"})
+        _g4 = m._session_tmux_gate(False, {"TMUX": "ok", "TMUXV": "3.5a"})
+        _g5 = m._session_tmux_gate(False, {})
+    finally:
+        m.emit_error = _orig_emit
+    s.check("预检闸门：缺 tmux → tmux_missing/255，message 给出可执行安装命令",
+            _g1 == 255 and _errs[0][0] == "tmux_missing"
+            and "apt-get install -y tmux" in _errs[0][1] and _errs[0][2].get("install_hint"),
+            repr(_errs[:1])[:220])
+    s.check("预检闸门：版本过低 → tmux_unsupported/255（带版本与下限）",
+            _g2 == 255 and _errs[1][0] == "tmux_unsupported"
+            and _errs[1][2].get("tmux_version") == "1.8"
+            and str(m.SESSION_TMUX_MIN_MAJOR) in str(_errs[1][2].get("required")),
+            repr(_errs[1])[:200])
+    s.check("预检闸门：版本读不出来 → tmux_failed/255（不猜、继续用）",
+            _g3 == 255 and _errs[2][0] == "tmux_failed", repr(_errs[2])[:160])
+    s.check("预检闸门：ok 放行；没有标记（老路径/无预检输出）也放行",
+            _g4 is None and _g5 is None)
+    s.check("retryable 表：tmux_missing/tmux_unsupported 不可重试，tmux_failed 可重试",
+            "tmux_missing" not in m._RETRYABLE_ERRORS
+            and "tmux_unsupported" not in m._RETRYABLE_ERRORS
+            and "tmux_failed" in m._RETRYABLE_ERRORS,
+            repr(sorted(m._RETRYABLE_ERRORS))[:200])
     s.check("list 会话年龄常量（24h 提醒）", m._SESSION_STALE_HINT == 86400,
             repr(m._SESSION_STALE_HINT))
     # 空闲回收（v2.3.0）：TTL 解析 + 看门狗脚本 + 会话路径/元信息
@@ -374,88 +403,107 @@ def suite_unit_regression(s):
             and _p("10x")[0] is None, repr(_p("abc")))
     _f = m._session_files("/tmp/pyaissh-sessions", "demo")
     s.check("会话路径表含 beat（活动时间戳）", _f["beat"].endswith("/beat"), _f["beat"])
-    _ws = m._session_watchdog_script(_f, 600)
-    s.check("看门狗：目录消失时先临终清理再退出（不留常驻循环）",
-            'if [ ! -d "$D" ]; then cleanup_tree; exit 0; fi' in _ws, _ws[:160])
-    s.check("看门狗：有前台命令就续期 + beat 判闲",
-            'pgrep -P "$B"' in _ws and 'LAST=$(<"$BEAT")' in _ws
-            and 'printf \'%s\\n\' "$NOW" > "$BEAT"' in _ws, _ws[:200])
-    s.check("看门狗：自证闭包（argv 含会话目录）+ 先删目录再杀",
-            'case "$A" in *"$D"*)' in _ws and 'case " $SEEN "' in _ws
-            and _ws.index('[ "$1" = rm ] && rm -rf "$D"') < _ws.index("kill -TERM $T"),
-            _ws[-400:])
-    # 临终带走（用户提的补充）：有人 rm -rf 会话目录时，看门狗最后收一次自己的进程树再自退
-    s.check("看门狗：共用一套清理实现（cleanup_tree 函数 + 两处调用）",
-            "cleanup_tree() {" in _ws and "cleanup_tree rm" in _ws
-            and "cleanup_tree; exit 0" in _ws, _ws[:400])
-    s.check("看门狗：每轮开头就记 pid/meta（内建读、空读不覆盖旧值）",
-            'if [ -r "$SPID" ]; then _pv=$(<"$SPID"); [ -n "$_pv" ] && P=$_pv; fi' in _ws
-            and '[ -n "$_pv" ] && B=$_pv' in _ws and '[ -z "$M0" ] && M0=$_pv' in _ws,
-            _ws[:600])
-    s.check("看门狗：判闲前重读 shell pid，且**pid 未知一律视为忙**（实测踩过的误回收）",
-            'if [ -r "$BPID" ]; then _pv=$(<"$BPID"); [ -n "$_pv" ] && B=$_pv; fi' in _ws
-            and 'if [ -z "$B" ]; then printf \'%s\\n\' "$NOW" > "$BEAT"; continue; fi' in _ws,
-            _ws[-700:])
-    s.check("看门狗：归属自检两道（watch.pid≠自己 / meta 变了 ⇒ 退出，防同名新会话被误杀）",
-            'W=""; [ -r "$WPID" ] && W=$(<"$WPID")' in _ws
-            and '[ "$W" != "$$" ] && exit 0' in _ws
-            and '[ "$M" != "$M0" ] && exit 0' in _ws, _ws[:700])
-    s.check("看门狗：临终路径不自证根时不乱杀，且不写 wd.log（用户要求不留审计痕）",
-            _ws.split('if [ ! -d "$D" ]')[1].split("fi")[0].count("wd.log") == 0
-            and "|| return 1" in _ws, _ws[:200])
-    s.check("看门狗：读文件前用内建 [ -r ] 保护（缺失文件不往 stderr 报错）",
-            '[ -r "$SPID" ]' in _ws and '[ -r "$BPID" ]' in _ws
-            and '[ -r "$BEAT" ]' in _ws and '[ -r "$META" ]' in _ws, _ws[:400])
-    # 设计 C（v2.3.0）：单进程看门狗 = read -t + 自持 FIFO fd（省掉 sleep 的 1.9 MB/1 进程）
-    #   + 防 spin 护栏（内建 $SECONDS 计时，连续 3 次立刻返回就退回外部 sleep）
-    #   + 内建读（$(<) 不 fork cat/stat）+ $EPOCHSECONDS（bash≥5 不 fork date）
-    s.check("看门狗 C：read -t + 自持 FIFO fd（单进程睡眠，无 sleep 子进程）",
-            'read -t "$TICK" -r -u 9 _x' in _ws and 'exec 9<>"$WDFIFO"' in _ws
-            and 'mkfifo -m 600 "$WDFIFO"' in _ws, _ws[:260])
-    s.check("看门狗 C：防 spin 护栏（连续 3 次立刻返回 ⇒ 退回 sleep + 记 wd.log）",
-            "$((SECONDS - T0)) -lt 1" in _ws and '"$FAST" -ge 3' in _ws
-            and 'sleep "$TICK"' in _ws and 'wd.log' in _ws, _ws[:400])
-    s.check("看门狗 C：内建读 + EPOCHSECONDS（不 fork cat/stat/date）",
-            '$(<"$SPID")' in _ws and '$(<"$BPID")' in _ws and '$(<"$META")' in _ws
-            and "NOW=${EPOCHSECONDS:-$(date +%s)}" in _ws
-            and "cat " not in _ws and "stat -c" not in _ws, _ws[:300])
-    s.check("看门狗 C：beat 非法/缺失只续期不回收",
-            "case \"$LAST\" in ''|*[!0-9]*)" in _ws, _ws[:300])
-    s.check("看门狗 C：无 %% 转义残留（生成脚本里不该出现双百分号）", "%%" not in _ws, _ws[:160])
-    # tick 可配（`--fast` 用；生产默认 15）
-    _save_tick = os.environ.get("PYAISSH_SESSION_TTL_TICK")
+    # ---- tmux 引擎命令生成（v2.4.0）：start/probe/paste/ctrl-c/kill/reaper ----
+    _f = m._session_files("/tmp/pyaissh-sessions", "demo")
+    _tm, _tgs, _tgp = m._session_tmux_pair("demo")
+    _sc = m._session_start_cmd(_f, _tm, 200, 600,
+                              [("PATH", "/usr/bin:/bin"), ("LANG", "C.UTF-8")])
+    s.check("start：专用 socket + 不读用户 tmux 配置（-L pyaissh -f /dev/null）",
+            "tmux -L pyaissh -f /dev/null" in _sc)
+    s.check("start：依赖预检在任何动作之前（缺 tmux 立即退出，不半途建目录）",
+            _sc.index("command -v tmux") < _sc.index("mkdir") < _sc.index("new-session"))
+    s.check("start：环境注入在 new-session **之前**（tmux server 环境启动即冻结）",
+            "set-environment -g" in _sc and _sc.index("set-environment -g") < _sc.index("new-session"))
+    s.check("start：window-size manual + pipe-pane 输出镜像落 out.log",
+            'set-window-option -t "$TN:" window-size manual' in _sc
+            and "pipe-pane -o" in _sc and "cat >> /tmp/pyaissh-sessions/demo/out.log" in _sc)
+    s.check("start：meta 4 字段（pty/cols/起始秒/TTL）+ tmux 名文件 + beat 写 epoch",
+            "printf '%s %s %s %s\\n' 1 200" in _sc and "/demo/tmux" in _sc
+            and "> '/tmp/pyaissh-sessions/demo/beat'" in _sc)
+    s.check("start：已有会话时走 EXISTS 分支（不重建、回传旧 pid/TTL）",
+            "has-session" in _sc and "SESS__EXISTS=1" in _sc and "SESS__EXTTL" in _sc)
+    _sc0 = m._session_start_cmd(_f, _tm, 200, 0, [])
+    s.check("start：--ttl 0 只把 TTL 写成 0（回收由 meta 第 4 字段表达，不再有看门狗脚本）",
+            " 0 > '/tmp/pyaissh-sessions/demo/meta'" in _sc0
+            and "watch.sh" not in _sc0 and "wd.fifo" not in _sc0)
+    _pc = m._session_probe_cmd(_f, _tm)
+    s.check("probe：一次 exec 拿到 alive/pid/tty/前台命令/管道状态，并顺手续期",
+            "SESS__ALIVE=1" in _pc and "SESS__PID=" in _pc and "SESS__CUR=" in _pc
+            and "SESS__PIPE=" in _pc and "> '/tmp/pyaissh-sessions/demo/beat'" in _pc)
+    s.check("probe：out.log 被删时**不带 -o** 重新 arm（实测：管道活着但文件没了会静默丢输出）",
+            "pipe-pane -t" in _pc and "SESS__LOG_REARM=1" in _pc
+            and "pipe-pane -o -t" in _pc, _pc[:200])
+    _pac = m._session_paste_cmd(_f, _tm)
+    s.check("命令注入：load-buffer + paste-buffer（避开 tmux 命令行二次解析）",
+            "load-buffer -b pyaissh-buf -" in _pac and "paste-buffer -b pyaissh-buf -d" in _pac
+            and "TN='py-64656d6f'" in _pac and '-t "$TN:"' in _pac
+            and "send-keys -l" not in _pac, _pac[:260])
+    s.check("命令注入：会话不在时先报 GONE（不做无意义的 buffer 操作）",
+            "SESS__GONE=1" in _pac)
+    _cc = m._session_ctrl_c_cmd(_f, _tm)
+    _ccf = m._session_ctrl_c_cmd(_f, _tm, force=True)
+    s.check("ctrl-c：注入 C-c 给 pane（tty 交给前台进程组）",
+            "send-keys -t \"$TN:\" C-c" in _cc)
+    s.check("ctrl-c --force：对内核给的前台进程组 SIGKILL（tpgid），且不用 SIGQUIT（会 core dump）",
+            "ps -o tpgid=" in _ccf and 'kill -KILL -- "-$FG"' in _ccf
+            and "C-\\\\" not in _ccf and "QUIT" not in _ccf, _ccf[:260])
+    s.check("ctrl-c：回传 PID/SID/GROUPS/CHILDREN/SIGNALED（字段集不变）",
+            all(k in _cc for k in ("SESS__PID=", "SESS__SID=", "SESS__GROUPS=",
+                                   "SESS__CHILDREN=", "SESS__SIGNALED=")))
+    _kc = m._session_kill_cmd(_f, _tm, pane_pid=4242)
+    s.check("kill：闭包快照根 = tmux 给的 pane_pid（不再有 bash.pid/script 自证根）",
+            "P='4242'" in _kc and 'kill -0 "$P"' in _kc
+            and "bash.pid" not in _kc and "script -qfc" not in _kc, _kc[:200])
+    s.check("kill：先快照再 kill-session（父进程被杀后子进程会 reparent，事后算会漏）",
+            _kc.index("SNAP=") < _kc.index("kill-session"))
+    s.check("kill：TERM → 校验 → KILL + 回传 SWEPT/LEFT/ROOTS/HAD/CLEANED",
+            "kill -TERM $T" in _kc and "kill -KILL $K" in _kc
+            and all(k in _kc for k in ("SESS__SWEPT=", "SESS__LEFT=", "SESS__ROOTS=",
+                                        "SESS__HAD=", "SESS__CLEANED=1")))
+    s.check("kill：识别旧引擎遗留目录（有 sess.pid/in 却没有 tmux 会话）+ 去掉 last.token",
+            "SESS__LEGACY=$LEGACY" in _kc and "/demo/sess.pid" in _kc
+            and "/demo/last.token" in _kc)
+    s.check("kill：--keep-dir 时不删目录", "rm -rf '/tmp/pyaissh-sessions/demo'" in _kc
+            and "rm -rf" not in m._session_kill_cmd(_f, _tm, keep_dir=True, pane_pid=1))
+    _rs = m._session_reap_script("/tmp/pyaissh-sessions")
+    s.check("reaper 脚本：--once/--loop 两用 + pid 文件带指纹（pid + 间隔）",
+            "reap_once()" in _rs and "[ \"$1\" = \"--loop\" ]" in _rs
+            and 'printf \'%s %s\\n\' "$$" "$INTERVAL" > "$ROOT/.reaper.pid"' in _rs)
+    s.check("reaper 脚本：TTL 取 meta 第 4 字段、空闲判据取 beat 内容、非法值一律不回收",
+            "awk '{print $4}'" in _rs and 'B=$(cat "$D/beat"' in _rs
+            and "*[!0-9]*)" in _rs and "continue" in _rs)
+    s.check("reaper 脚本：只有提示符空闲（前台是 shell）才收，判不出就不收",
+            "pane_current_command" in _rs and "bash|sh|dash|zsh|ksh|-bash" in _rs)
+    s.check("reaper 脚本：没有会话目录时下一轮自退并清掉 pid 文件（不留空转常驻）",
+            'if [ "$n" -eq 0 ]; then rm -f "$ROOT/.reaper.pid" 2>/dev/null; exit 0; fi' in _rs,
+            _rs[-320:])
+    s.check("reaper 脚本：不碰旧引擎遗留目录（没有 tmux 名文件的目录直接跳过）",
+            '[ -z "$TN" ]; then continue' in _rs)
+    s.check("reaper 脚本：日志超限截断（只留尾 200 行）",
+            "tail -n 200" in _rs and str(m.SESSION_TMUX_REAP_LOG_MAX) in _rs)
+    _sw = m._session_reap_sweep_cmd("/tmp/pyaissh-sessions")
+    s.check("惰性扫 = 同一份 reaper 逻辑内联（不依赖远端 reap.sh 是否落盘）",
+            "reap_once()" not in _sw and "SESS__REAPED=1" in _sw
+            and "pane_current_command" in _sw and "reclaim $N" in _sw, _sw[:200])
+    _save_reap = os.environ.get("PYAISSH_SESSION_REAP_INTERVAL")
     try:
-        os.environ.pop("PYAISSH_SESSION_TTL_TICK", None)
-        _t1 = m._session_tick_default()
-        os.environ["PYAISSH_SESSION_TTL_TICK"] = "3"
-        _t2 = m._session_tick_default()
-        for _bad in ("0", "abc", "9999", "2.5"):
-            os.environ["PYAISSH_SESSION_TTL_TICK"] = _bad
-            globals()["_t_" + _bad.replace(".", "_")] = m._session_tick_default()
-        _t3, _t4 = globals()["_t_0"], globals()["_t_abc"]
-        _t5, _t6 = globals()["_t_9999"], globals()["_t_2_5"]
+        os.environ.pop("PYAISSH_SESSION_REAP_INTERVAL", None)
+        _r1 = m._session_reap_interval()
+        os.environ["PYAISSH_SESSION_REAP_INTERVAL"] = "3"
+        _r2 = m._session_reap_interval()
+        _rbad = []
+        for _b in ("0", "abc", "99999", "2.5"):
+            os.environ["PYAISSH_SESSION_REAP_INTERVAL"] = _b
+            _rbad.append(m._session_reap_interval())
     finally:
-        if _save_tick is None:
-            os.environ.pop("PYAISSH_SESSION_TTL_TICK", None)
+        if _save_reap is None:
+            os.environ.pop("PYAISSH_SESSION_REAP_INTERVAL", None)
         else:
-            os.environ["PYAISSH_SESSION_TTL_TICK"] = _save_tick
-    s.check("看门狗 tick 可配：默认 15 / 3 生效 / 0・abc・9999・2.5 一律回落 15（只收整数）",
-            (_t1, _t2, _t3, _t4, _t5, _t6) == (15, 3, 15, 15, 15, 15),
-            repr((_t1, _t2, _t3, _t4, _t5, _t6)))
-    s.check("测试等待随 tick 缩短：_wait(2) = 2*tick+3（--fast 时 33s→9s）",
-            _wait(2) == 2 * _TICK + 3, "_TICK=%s _wait(2)=%s" % (_TICK, _wait(2)))
-    s.check("看门狗：TTL/周期写进脚本且可关闭",
-            "TTL=600" in _ws and "TICK=%d" % m._SESSION_TTL_TICK in _ws
-            and "watch.sh" not in m._session_start_cmd(_f, 200, False, 0)
-            and "watch.sh" in m._session_start_cmd(_f, 200, False, 600), _ws[:80])
-    _sc6 = m._session_start_cmd(_f, 200, False, 600)
-    s.check("看门狗启动：前台写脚本 + 单条后台启动（`;` 分隔，`&` 只作用于 setsid 那条）",
-            "2>/dev/null; chmod 700" in _sc6 and "; setsid nohup bash" in _sc6
-            and "& echo $!" in _sc6 and "} >/dev/null 2>&1 </dev/null &" not in _sc6,
-            _sc6[-360:])
-    s.check("start 命令：beat 初始化写 epoch（看门狗靠内容判闲，不能是空文件）",
-            "printf '%s\\n' \"$(date +%s)\" > '/tmp/pyaissh-sessions/demo/beat'" in _sc6,
-            _sc6[:400])
+            os.environ["PYAISSH_SESSION_REAP_INTERVAL"] = _save_reap
+    s.check("reaper 间隔可配：默认 %d / 3 生效 / 0・abc・99999・2.5 一律回落默认（只收整数）"
+            % m.SESSION_TMUX_LOOP_INTERVAL,
+            (_r1, _r2) == (m.SESSION_TMUX_LOOP_INTERVAL, 3)
+            and _rbad == [m.SESSION_TMUX_LOOP_INTERVAL] * 4, repr((_r1, _r2, _rbad)))
     _cap = {}
     _orig_run = m._session_run
     m._session_run = lambda client, cmd, stdin_data=None, timeout=30: (
@@ -464,47 +512,18 @@ def suite_unit_regression(s):
         m._session_touch(None, _f)
     finally:
         m._session_run = _orig_run
-    s.check("交互续期：_session_touch 写的是 epoch 秒（不再只 touch mtime）",
+    s.check("交互续期：_session_touch 写的是 epoch 秒（start --attach 用）",
             _cap.get("cmd") == ("printf '%s\\n' \"$(date +%s)\" > "
-                                "'/tmp/pyaissh-sessions/demo/beat' 2>/dev/null || true"),
+                                "'/tmp/pyaissh-sessions/demo/beat' 2>/dev/null; "
+                                "chmod 600 '/tmp/pyaissh-sessions/demo/beat' 2>/dev/null"),
             repr(_cap.get("cmd")))
-    s.check("start 命令：meta 写 4 字段（pty/cols/起始秒/TTL）",
-            "printf '%s %s %s %s\\n' \"$PTY\" 200 \"$(date +%s)\" 600" in _sc6, _sc6[-420:-260])
-    # 孤儿扫描（kill --all 的 argv 自证）：只认"以会话身份出现"的进程，不误杀"提到路径"的进程
-    _ps = "\n".join([
-        "  101 root  bash -c umask 077; exec 9<>'/tmp/pyaissh-sessions/gone1/in'; sleep 9",
-        "  102 root  script -qfc stty -echo /tmp/pyaissh-sessions/gone1/out.log",
-        "  103 root  bash /tmp/pyaissh-sessions/gone2/watch.sh",
-        "  104 root  tail -f /tmp/pyaissh-sessions/gone1/out.log",
-        "  105 root  bash -c 'sleep 300' /tmp/pyaissh-sessions/gone1/out.log",
-        "  106 root  bash -c exec 9<>'/tmp/pyaissh-sessions/alive/in'; sleep 9",
-        "  107 root  bash -c exec 9<>'/tmp/pyaissh-sessions/../etc/in'; x",
-        "  108 root  ps -eo pid=,args=",
-    ])
-    _cands = m._session_orphan_candidates(_ps, "/tmp/pyaissh-sessions", {"alive"})
-    _kinds = dict((p, k) for p, _n, k in _cands)
-    s.check("孤儿扫描：认出 starter/pty 包装/看门狗（目录已不在的那些）",
-            sorted(p for p, _n, _k in _cands) == [101, 102, 103], repr(_cands))
-    s.check("孤儿扫描：类型标注正确",
-            _kinds.get(101) == "starter" and _kinds.get(102) == "pty-wrapper"
-            and _kinds.get(103) == "watchdog", repr(_kinds))
-    s.check("孤儿扫描：不误杀「只是提到路径」的进程（tail / argv 里带路径的旁观者）",
-            104 not in _kinds and 105 not in _kinds, repr(_cands))
-    s.check("孤儿扫描：目录还在的会话不在这里处理（走正常 kill 路径）",
-            106 not in _kinds, repr(_cands))
-    s.check("孤儿扫描：路径穿越/非法名字被拒", 107 not in _kinds, repr(_cands))
-    _kc2 = m._session_pid_kill_cmd(101)
-    s.check("孤儿清理命令：按 pid 做闭包 + TERM→KILL + 回传 SWEPT/LEFT",
-            'awk -v root="101"' in _kc2 and "kill -TERM $T" in _kc2
-            and "kill -KILL $K" in _kc2 and "SESS__SWEPT=$SWEPT" in _kc2, _kc2[:160])
     # 哨兵包裹（真 bug 的护栏：哨兵必须与命令同一行被解析，否则被 read 吃掉）
     pl = m._session_payload_text("read -p 'x' V; echo $V", "abcd1234")
     s.check("命令与哨兵同一行（{ ...; }; echo 哨兵）",
             pl.startswith("\n{\n") and "\n}; echo \"%sabcd1234__$?\"\n" % m.SESSION_RC_PREFIX in pl,
             repr(pl))
     s.check("载荷以换行开头（R2：先把上次断线残留的半行终结掉，防串行）",
-            pl.startswith("\n") and m._session_payload_text("echo x", "tk", plain=True).startswith("\n"),
-            repr(pl[:6]))
+            pl.startswith("\n"))
     s.check("多行命令也被包裹且状态留在同一 shell（用 {} 非 ()）",
             "(" not in pl.split("\n")[0] and "{\n" in pl)
     # 哨兵切分：只回"这条命令"的输出
@@ -1444,75 +1463,51 @@ def suite_live_session(s):
             and isinstance(_aged[0].get("age_seconds"), int)
             and 0 <= _aged[0]["age_seconds"] < 3600, repr(_aged[:1])[:200])
 
-    # kill：进程树闭包（不只是删目录）
+    # kill：进程树闭包（不只是删目录；tmux 引擎下闭包 = 会话 shell + 它的作业）
     _live_run(["session", "send", tgt, "--name", name, "--cmd", "sleep 200 &"], timeout=60)
     time.sleep(0.8)
     rc, jz, _ = _live_run(["session", "kill", tgt, "--name", name], timeout=120)
     row = ((jz or {}).get("sessions") or [{}])[0]
-    s.check("kill 扫到会话进程树（swept>=3）", bool(jz) and (row.get("swept") or 0) >= 3,
+    s.check("kill 扫到会话进程树（含后台作业，swept>=2）", bool(jz) and (row.get("swept") or 0) >= 2,
             repr(row)[:160])
     s.check("kill 后无残留、目录已清",
             bool(jz) and jz.get("remaining_total") == 0 and row.get("cleaned") is True,
             repr(jz)[:180])
-    s.check("kill 报了自证的根（roots>=1）且 verified=true",
+    s.check("kill 报了 pane pid 为根（roots>=1）且 verified=true",
             bool(jz) and (row.get("roots") or 0) >= 1 and row.get("verified") is True,
             repr(row)[:200])
-    rc, js, _ = _live_run(["exec", tgt, "--cmd", "pgrep -x script | wc -l"], timeout=60)
-    s.check("远端无 script 残留（会话进程真被杀）",
-            bool(js) and (js.get("stdout") or "").strip() == "0", repr(js.get("stdout")))
+    rc, js, _ = _live_run(["exec", tgt, "--cmd",
+                           "echo -n 'sess='; tmux -L pyaissh ls 2>/dev/null | grep -c '^%s:' || true; "
+                           "echo -n 'dir='; ls -d /tmp/pyaissh-sessions/%s 2>/dev/null | wc -l"
+                           % (_tmux_name(name), name)], timeout=60)
+    _js_txt = (js or {}).get("stdout") or ""
+    s.check("远端无 tmux 会话、无会话目录残留（真被杀干净）",
+            "sess=0" in _js_txt and "dir=0" in _js_txt, repr(_js_txt))
     rc, jsl, _ = _live_run(["session", "list", tgt], timeout=60)
     s.check("kill 后该会话不在 list", bool(jsl) and not any(
         x.get("session") == name for x in (jsl.get("sessions") or [])), repr(jsl)[:140])
 
-    # ---- 残留护栏（v2.3.0 加固 R1：会话是 setsid+nohup 的常驻进程，不会自己退出）----
-    # ① starter 被外力杀掉（模拟 OOM）：script/bash -i 会被 reparent →
-    #    kill 必须靠 bash.pid / script 兜底清干净（旧版只按 sess.pid 做闭包 ⇒ 空集 ⇒ 误报清干净）
-    _orph = name + "or"
-    _live_run(["session", "start", tgt, "--name", _orph], timeout=90)
-    _live_run(["session", "run", tgt, "--name", _orph, "--cmd", "sleep 300 &",
-               "--wait-rc", "3"], timeout=60)
-    rc, _jo, _ = _live_run(["exec", tgt, "--cmd",
-                            "kill -9 $(cat /tmp/pyaissh-sessions/%s/sess.pid); sleep 0.5; "
-                            "kill -0 $(cat /tmp/pyaissh-sessions/%s/bash.pid) 2>/dev/null "
-                            "&& echo ORPHAN_ALIVE" % (_orph, _orph)], timeout=60)
-    s.check("孤儿场景就绪（starter 已死、script/bash -i 仍在）",
-            bool(_jo) and "ORPHAN_ALIVE" in (_jo.get("stdout") or ""), repr(_jo)[:160])
-    rc, _jok, _ = _live_run(["session", "kill", tgt, "--name", _orph], timeout=120)
-    _rowk = ((_jok or {}).get("sessions") or [{}])[0]
-    s.check("R1 孤儿兜底：starter 已死也能清干净（swept>=2、remaining=0、verified）",
-            bool(_jok) and (_rowk.get("swept") or 0) >= 2 and _jok.get("remaining_total") == 0
-            and _rowk.get("verified") is True, repr(_rowk)[:200])
-    rc, _jr1, _ = _live_run(["exec", tgt, "--cmd",
-                             "ps -eo pid,args | grep -c '[p]yaissh-sessions/%s'" % _orph],
-                            timeout=60)
-    s.check("R1 孤儿场景后无残留进程", bool(_jr1) and (_jr1.get("stdout") or "").strip() == "0",
-            repr(_jr1.get("stdout")))
-
-    # ② 两个根都不可用（进程被杀 + pid 文件删掉）→ 不许无声宣称"清干净"，
-    #    必须 roots=0 + verified=false + warning（附 ps 自查）
+    # ---- 残留护栏（v2.4.0）：拿不到 pane pid 时**不许无声宣称"清干净"** ----
+    # 场景：会话目录被外部删掉 + tmux 会话被外部 kill（连接收尾时既没账也没 pid）
     _ghost = name + "gh"
     _live_run(["session", "start", tgt, "--name", _ghost], timeout=90)
-    # 把三个自证根全部打掉（sess.pid / bash.pid / watch.pid 的进程）再删 pid 文件，
-    # 才真正构成"无根"场景——否则空闲回收看门狗本身就是一个活的自证根（v2.3.0 起）
     _live_run(["exec", tgt, "--cmd",
-               "for k in sess bash watch; do kill -9 $(cat /tmp/pyaissh-sessions/{g}/$k.pid) "
-               "2>/dev/null; done; sleep 0.5; "
-               "rm -f /tmp/pyaissh-sessions/{g}/sess.pid /tmp/pyaissh-sessions/{g}/bash.pid "
-               "/tmp/pyaissh-sessions/{g}/watch.pid".format(g=_ghost)],
+               "tmux -L pyaissh kill-session -t '=%s' 2>/dev/null; "
+               "rm -rf /tmp/pyaissh-sessions/%s; echo gone" % (_tmux_name(_ghost), _ghost)],
               timeout=60)
     rc, _jg, _ = _live_run(["session", "kill", tgt, "--name", _ghost], timeout=120)
     _rowg = ((_jg or {}).get("sessions") or [{}])[0]
-    s.check("R1 无根时不误报：roots=0 + verified=false + warning(未获确认)",
-            bool(_jg) and _rowg.get("roots") == 0 and _rowg.get("verified") is False
-            and any("未获确认" in w for w in (_jg.get("warnings") or [])), repr(_jg)[:240])
+    s.check("无账无 pid 时不谎报：roots=0 + verified=false（确有残留时空手时也不会说 verified）",
+            bool(_jg) and _rowg.get("roots") == 0 and _rowg.get("verified") is False,
+            repr(_jg)[:240])
 
-    # ③ 会话不自退：放着不动 35s（超过看门狗窗口）后仍能跑命令
+    # 会话不自退：放着不动 20s（远超任何空闲判定窗口）后仍能跑命令
     _idle = name + "id"
     _live_run(["session", "start", tgt, "--name", _idle], timeout=90)
-    time.sleep(_wait(2))
+    time.sleep(20)
     rc, _ji, _ = _live_run(["session", "run", tgt, "--name", _idle, "--cmd", "echo IDLE_OK",
                             "--wait-rc", "10"], timeout=60)
-    s.check("闲置 %ds 后会话仍可用（常驻不自退、无 idle 超时）" % _wait(2),
+    s.check("闲置 20s 后会话仍可用（常驻不自退、无 idle 超时）",
             bool(_ji) and _ji.get("exit_code") == 0 and "IDLE_OK" in (_ji.get("stdout") or ""),
             repr(_ji)[:160])
 
@@ -1530,7 +1525,13 @@ def suite_live_session(s):
             "exit=%s 输出=%r" % ((_jr2 or {}).get("exit_code"), _o2[:120]))
     _live_run(["session", "kill", tgt, "--name", _idle], timeout=60)
 
+def _tmux_name(name):
+    """测试侧复算 tmux 会话名（与被测实现同一映射：py-<utf-8 hex>）。"""
+    return "py-" + name.encode("utf-8").hex()
+
+
 def suite_live_session_ttl(s):
+    """空闲回收（v2.4.0 tmux 引擎）：**惰性扫**为主 + 每主机 reaper 兜底 + attach 语义。"""
     if _missing_env(_REQ_EXEC):
         print("SKIP: 需配置 %s" % " / ".join(_REQ_EXEC))
         return None
@@ -1539,68 +1540,140 @@ def suite_live_session_ttl(s):
     _live_run(["session", "kill", tgt, "--name", name], timeout=120)
     _live_run(["session", "kill", tgt, "--all"], timeout=120)
 
-    rc, j, _ = _live_run(["session", "start", tgt, "--name", name], timeout=120)
-    # ---- T：空闲回收（v2.3.0，用户设计：提示符空闲 + TTL 内无交互 ⇒ 自动回收）----
-    # T1：--ttl 5 且完全不碰它（list 不算交互）→ 看门狗应在 ~15-30s 内回收进程与目录
+    # T1：--ttl 5 且完全不碰它 → 8 秒后**一条 list**（惰性扫）就该把它收掉（进程+目录+tmux 会话）
     _ttl = name + "ttl"
     rc, _jt, _ = _live_run(["session", "start", tgt, "--name", _ttl, "--ttl", "5"], timeout=90)
-    s.check("T1a start --ttl 5 回传 ttl_seconds=5",
-            bool(_jt) and _jt.get("ok") is True and _jt.get("ttl_seconds") == 5,
-            repr(_jt)[:200])
-    time.sleep(_wait(2, 6))
+    s.check("T1a start --ttl 5 回传 ttl_seconds=5（字段口径不变）",
+            bool(_jt) and _jt.get("ok") is True and _jt.get("ttl_seconds") == 5, repr(_jt)[:200])
+    _pid_ttl = (_jt or {}).get("pid")
+    time.sleep(8)
     rc, _jl2, _ = _live_run(["session", "list", tgt], timeout=60)
-    s.check("T1b 空闲 %ds 后会话已自动回收（list 里没了）" % _wait(2, 6),
+    s.check("T1b 空闲 8s 后惰性扫已回收（list 里没有它了）",
             bool(_jl2) and not any(x.get("session") == _ttl
-                                   for x in (_jl2.get("sessions") or [])), repr(_jl2)[:200])
+                                   for x in (_jl2.get("sessions") or [])), repr(_jl2)[:220])
     rc, _jd, _ = _live_run(["exec", tgt, "--cmd",
-                            "ls -d /tmp/pyaissh-sessions/%s 2>/dev/null | wc -l; "
-                            "pgrep -fc '[p]yaissh-sessions/%s' || true" % (_ttl, _ttl)],
-                           timeout=60)
-    s.check("T1c 回收后目录与进程都没了",
-            bool(_jd) and ((_jd.get("stdout") or "").split() or [""])[0] == "0",
-            repr((_jd or {}).get("stdout")))
+                            "echo -n 'dir='; ls -d /tmp/pyaissh-sessions/%s 2>/dev/null | wc -l; "
+                            "echo -n 'proc='; kill -0 %s 2>/dev/null && echo 1 || echo 0; "
+                            "echo -n 'sess='; tmux -L pyaissh ls 2>/dev/null | grep -c '%s' || true"
+                            % (_ttl, _pid_ttl, _tmux_name(_ttl))], timeout=60)
+    _d1 = (_jd or {}).get("stdout") or ""
+    s.check("T1c 回收后目录、进程、tmux 会话三样都没了",
+            "dir=0" in _d1 and "proc=0" in _d1 and "sess=0" in _d1, repr(_d1))
 
     # T2：TTL 很小但**有命令在跑** → 不回收（构建/安装不会被误杀）
     _ttlr = name + "run"
     _live_run(["session", "start", tgt, "--name", _ttlr, "--ttl", "5"], timeout=90)
-    _live_run(["session", "send", tgt, "--name", _ttlr, "--cmd",
-               "sleep 25; echo TTLRUN_DONE"], timeout=60)
-    time.sleep(_wait(1, 6))   # 跨过看门狗第一次检查：那会儿命令还在跑 ⇒ 必须续期
+    _live_run(["session", "send", tgt, "--name", _ttlr, "--cmd", "sleep 20; echo TTLRUN_DONE"],
+              timeout=60)
+    time.sleep(8)      # 远超 TTL=5，但前台有命令 ⇒ 判忙
     rc, _jlr, _ = _live_run(["session", "list", tgt], timeout=60)
     _row = next((x for x in (_jlr or {}).get("sessions", []) if x.get("session") == _ttlr), None)
-    s.check("T2a 命令在跑时不回收（跨过看门狗检查仍 running）",
-            bool(_row) and _row.get("status") == "running", repr(_row)[:200])
-    rc, _jout, _ = _live_run(["session", "read", tgt, "--name", _ttlr, "--wait-rc", "20"],
+    s.check("T2a 有前台命令时不回收（跨过 TTL 仍 running，且前台命令是 sleep）",
+            bool(_row) and _row.get("status") == "running"
+            and _row.get("current_command") == "sleep", repr(_row)[:220])
+    rc, _jout, _ = _live_run(["session", "read", tgt, "--name", _ttlr, "--wait-rc", "25"],
                              timeout=90)
     s.check("T2b 长命令跑完能拿到输出（没被空闲回收误杀）",
             bool(_jout) and "TTLRUN_DONE" in (_jout.get("stdout") or ""),
-            "status=%s 尾=%r" % ((_jout or {}).get("status"), ((_jout or {}).get("stdout") or "")[-40:]))
+            "status=%s 尾=%r" % ((_jout or {}).get("status"),
+                                ((_jout or {}).get("stdout") or "")[-40:]))
     _live_run(["session", "kill", tgt, "--name", _ttlr], timeout=60)
 
-    # T3：--attach（活着就接上、没有才新建）+ 不带 --attach 时的提示
+    # T3：list **不续期**（看一眼≠在用）：一直 list 也照样到点被收
+    #     注：start 自身耗时也算 idle，所以 TTL 取 10、两次等待 5+6 才稳
+    _ttl3 = name + "nolist"
+    _live_run(["session", "start", tgt, "--name", _ttl3, "--ttl", "10"], timeout=90)
+    time.sleep(5)
+    rc, _jl3a, _ = _live_run(["session", "list", tgt], timeout=60)
+    _alive3 = any(x.get("session") == _ttl3 for x in (_jl3a or {}).get("sessions", []))
+    time.sleep(6)
+    rc, _jl3b, _ = _live_run(["session", "list", tgt], timeout=60)
+    s.check("T3 list 不续期：中途 list 过也照样到点回收",
+            _alive3 and not any(x.get("session") == _ttl3
+                                for x in (_jl3b or {}).get("sessions", [])),
+            "中途在=%s 之后=%r" % (_alive3, [_x.get("session")
+                                            for _x in (_jl3b or {}).get("sessions", [])]))
+
+    # T4：--ttl 0 关闭回收 —— 不装 reaper、也不被任何清扫收掉
+    _t0 = name + "off"
+    rc, _j0, _ = _live_run(["session", "start", tgt, "--name", _t0, "--ttl", "0"], timeout=90)
+    s.check("T4a --ttl 0：ttl_seconds=null + 明确警告",
+            bool(_j0) and _j0.get("ttl_seconds") is None
+            and any("空闲回收已关闭" in w for w in (_j0.get("warnings") or [])), repr(_j0)[:220])
+    time.sleep(8)
+    rc, _jl0, _ = _live_run(["session", "list", tgt], timeout=60)
+    s.check("T4b --ttl 0 的会话不会被惰性扫/reaper 收掉",
+            any(x.get("session") == _t0 for x in (_jl0 or {}).get("sessions", [])),
+            repr(_jl0)[:200])
+    _live_run(["session", "kill", tgt, "--name", _t0], timeout=60)
+
+    # T5：每主机 reaper 兜底（**无人值守**：期间不发任何 pyaissh 命令）
+    #     显式把间隔设成 3s（间隔在 start 时写进远端 reap.sh），与有没有 --fast 无关
+    _re = name + "reap"
+    _old_reap = os.environ.get("PYAISSH_SESSION_REAP_INTERVAL")
+    os.environ["PYAISSH_SESSION_REAP_INTERVAL"] = "3"
+    try:
+        rc, _jr, _ = _live_run(["session", "start", tgt, "--name", _re, "--ttl", "5"], timeout=90)
+        s.check("T5a start 带出 reaper（间隔 3s 写进远端脚本）", rc == 0 and bool(_jr),
+                repr(_jr)[:160])
+        time.sleep(13)
+    finally:
+        if _old_reap is None:
+            os.environ.pop("PYAISSH_SESSION_REAP_INTERVAL", None)
+        else:
+            os.environ["PYAISSH_SESSION_REAP_INTERVAL"] = _old_reap
+    rc, _jre, _ = _live_run(["exec", tgt, "--cmd",
+                             "echo -n 'dir='; ls -d /tmp/pyaissh-sessions/%s 2>/dev/null | wc -l; "
+                             "echo -n 'log='; grep -c 'reclaim %s' "
+                             "/tmp/pyaissh-sessions/.reaper.log 2>/dev/null || true; "
+                             "echo -n 'reapers='; ps -eo args | grep -c '[r]eap.sh --loop' || true"
+                             % (_re, _re)], timeout=60)
+    _d5 = (_jre or {}).get("stdout") or ""
+    s.check("T5b reaper 无人值守回收（13s 里没有任何 pyaissh 命令）",
+            "dir=0" in _d5 and "log=" in _d5 and "log=0" not in _d5, repr(_d5))
+    s.check("T5c 收掉最后一个会话后 reaper 自行退出（不留空转常驻）",
+            _field(_d5, "reapers") == "0", repr(_d5))
+
+    # T6：list 的保活进度字段（AI 据此判断"还能放多久"）
+    _ttl6 = name + "exp"
+    _live_run(["session", "start", tgt, "--name", _ttl6, "--ttl", "60"], timeout=90)
+    rc, _jl6, _ = _live_run(["session", "list", tgt], timeout=60)
+    _row6 = next((x for x in (_jl6 or {}).get("sessions", []) if x.get("session") == _ttl6), None)
+    s.check("T6 list 给出 idle_seconds/ttl_seconds/expires_in_seconds（口径不变）",
+            bool(_row6) and isinstance(_row6.get("idle_seconds"), int)
+            and _row6.get("ttl_seconds") == 60
+            and isinstance(_row6.get("expires_in_seconds"), int)
+            and 0 <= _row6["expires_in_seconds"] <= 60, repr(_row6)[:240])
+    _live_run(["session", "kill", tgt, "--name", _ttl6], timeout=60)
+
+    # T7：--attach（活着就接上、没有才新建）+ 不带 --attach 时的提示
     _at = name + "at"
     rc, _ja1, _ = _live_run(["session", "start", tgt, "--name", _at, "--ttl", "60"], timeout=90)
     rc, _ja2, _ = _live_run(["session", "start", tgt, "--name", _at, "--ttl", "60",
                              "--attach"], timeout=90)
-    s.check("T3a --attach 接上旧会话（attached=true 且 pid 不变）",
+    s.check("T7a --attach 接上旧会话（attached=true 且 pid 不变）",
             bool(_ja2) and _ja2.get("ok") is True and _ja2.get("attached") is True
             and _ja2.get("pid") == (_ja1 or {}).get("pid"),
             "attached=%s pid=%s/%s" % ((_ja2 or {}).get("attached"), (_ja2 or {}).get("pid"),
                                        (_ja1 or {}).get("pid")))
+    s.check("T7b --attach 续期（idle_seconds 被刷新到很小）",
+            bool(_ja2) and isinstance(_ja2.get("idle_seconds"), int)
+            and _ja2["idle_seconds"] <= 3, repr(_ja2)[:200])
     rc, _je, _e = _live_run(["session", "start", tgt, "--name", _at, "--ttl", "60"], timeout=90)
-    s.check("T3b 不带 --attach 撞名仍报 session_exists，但提示改为「直接继续用它」",
+    s.check("T7c 不带 --attach 撞名仍报 session_exists，但提示改为「直接继续用它」",
             bool(_je) and _je.get("error") == "session_exists"
             and "直接继续用它" in (_je.get("message") or ""),
             repr(_je)[:220])
     _live_run(["session", "kill", tgt, "--name", _at], timeout=60)
     rc, _ja3, _ = _live_run(["session", "start", tgt, "--name", _at, "--ttl", "60",
                              "--attach"], timeout=90)
-    s.check("T3c --attach 在会话不存在时新建（attached=false）",
+    s.check("T7d --attach 在会话不存在时新建（attached=false）",
             bool(_ja3) and _ja3.get("ok") is True and _ja3.get("attached") is False
             and isinstance(_ja3.get("pid"), int), repr(_ja3)[:200])
     _live_run(["session", "kill", tgt, "--name", _at], timeout=60)
 
-def suite_live_session_watchdog(s):
+def suite_live_session_engine(s):
+    """tmux 引擎（v2.4.0）：socket 隔离 / 名字映射 / 输出镜像 / 无残留辅助进程 / 开销（PERF）。"""
     if _missing_env(_REQ_EXEC):
         print("SKIP: 需配置 %s" % " / ".join(_REQ_EXEC))
         return None
@@ -1609,79 +1682,147 @@ def suite_live_session_watchdog(s):
     _live_run(["session", "kill", tgt, "--name", name], timeout=120)
     _live_run(["session", "kill", tgt, "--all"], timeout=120)
 
-    rc, j, _ = _live_run(["session", "start", tgt, "--name", name], timeout=120)
-    # ---- W：单进程看门狗（设计 C）的实机开销 + 防 spin 护栏 ----
+    # E1：专用 socket + 名字映射（与用户自己的 tmux 完全隔离）
+    _e1 = name + "e1"
+    rc, _j1, _ = _live_run(["session", "start", tgt, "--name", _e1, "--ttl", "300"], timeout=90)
+    s.check("E1a start 就绪", bool(_j1) and _j1.get("ready") is True, repr(_j1)[:180])
+    rc, _js, _ = _live_run(["exec", tgt, "--cmd",
+                            "echo -n 'sock='; tmux -L pyaissh ls -F '#{session_name}' 2>/dev/null "
+                            "| grep -c '^%s$'; "
+                            "echo -n 'user='; tmux ls -F '#{session_name}' 2>/dev/null "
+                            "| grep -c '^%s$' || true" % (_tmux_name(_e1), _tmux_name(_e1))],
+                           timeout=60)
+    _e1s = (_js or {}).get("stdout") or ""
+    s.check("E1b 会话在专用 socket 上、且不污染用户默认 socket",
+            "sock=1" in _e1s and "user=0" in _e1s, repr(_e1s))
 
+    # E2：pane 事实（pid 一致、空闲时前台是 shell、管道已 arm）
+    rc, _jp, _ = _live_run(["exec", tgt, "--cmd",
+                            "echo -n 'pane='; tmux -L pyaissh display-message -p "
+                            "-t '=%s:' '#{pane_pid}'; "
+                            "echo -n 'cmd='; tmux -L pyaissh display-message -p "
+                            "-t '=%s:' '#{pane_current_command}'; "
+                            "echo -n 'pipe='; tmux -L pyaissh display-message -p "
+                            "-t '=%s:' '#{pane_pipe}'; "
+                            "echo -n 'size='; tmux -L pyaissh display-message -p "
+                            "-t '=%s:' '#{pane_width}x#{pane_height}'"
+                            % (_tmux_name(_e1), _tmux_name(_e1), _tmux_name(_e1),
+                               _tmux_name(_e1))], timeout=60)
+    _e2s = (_jp or {}).get("stdout") or ""
+    s.check("E2a pane_pid == 返回的 pid、空闲前台命令是 shell",
+            _field(_e2s, "pane") == str((_j1 or {}).get("pid"))
+            and _field(_e2s, "cmd") == "bash", repr(_e2s))
+    s.check("E2b pipe-pane 已 arm、窗格尺寸 = --cols x 50（window-size manual）",
+            _field(_e2s, "pipe") == "1" and _field(_e2s, "size") == "200x50", repr(_e2s))
 
-    _wdc = name + "wd"
-    rc, _jw, _ = _live_run(["session", "start", tgt, "--name", _wdc, "--ttl", "300"], timeout=90)
-    _wp = (_jw or {}).get("pid")
-    _cpu0 = None
-    if _wp:
-        rc, _jc0, _ = _live_run(["exec", tgt, "--cmd",
-                                 "W=$(cat /tmp/pyaissh-sessions/%s/watch.pid); "
-                                 "echo \"procs=$(pgrep -fc '/tmp/pyaissh-sessions/%s/[w]atch[.]sh')\"; "
-                                 "echo \"kids=$(pgrep -P $W | wc -l)\"; "
-                                 "echo \"rss=$(awk '/VmRSS/{print $2}' /proc/$W/status)\"; "
-                                 "echo \"cpu=$(awk '{print $14+$15}' /proc/$W/stat)\"" % (_wdc, _wdc)],
-                                timeout=60)
-        _w0 = (_jc0 or {}).get("stdout") or ""
-        time.sleep(_wait(2, 2))      # 2 个检查点
-        rc, _jc1, _ = _live_run(["exec", tgt, "--cmd",
-                                 "W=$(cat /tmp/pyaissh-sessions/%s/watch.pid); "
-                                 "echo \"cpu=$(awk '{print $14+$15}' /proc/$W/stat)\"; "
-                                 "echo \"beat=$(<//tmp/pyaissh-sessions/%s/beat)\"; "
-                                 "echo \"now=$(date +%%s)\"" % (_wdc, _wdc)], timeout=60)
-        _w1 = (_jc1 or {}).get("stdout") or ""
+    # E3：输出按**字节**镜像到 out.log（offset 契约的基础）
+    rc, _je3, _ = _live_run(["session", "run", tgt, "--name", _e1, "--cmd",
+                             "echo MIRROR_MARK_123", "--wait-rc", "20"], timeout=60)
+    rc, _jm, _ = _live_run(["exec", tgt, "--cmd",
+                            "echo -n 'has='; grep -c MIRROR_MARK_123 "
+                            "/tmp/pyaissh-sessions/%s/out.log" % _e1], timeout=60)
+    s.check("E3 命令输出确实落进 out.log（tmux pipe-pane 字节镜像）",
+            "has=1" in ((_jm or {}).get("stdout") or ""), repr((_jm or {}).get("stdout")))
 
-        _rss = _field(_w0, "rss")
-        try:
-            _dcpu = int(_field(_w1, "cpu") or 0) - int(_field(_w0, "cpu") or 0)
-        except ValueError:
-            _dcpu = -1
-        s.check("W1 单进程看门狗：只有 1 个 watch 进程、没有 sleep 子进程",
-                _field(_w0, "procs") == "1" and _field(_w0, "kids") == "0", repr(_w0)[:160])
-        s.check("W1 RSS < 4 MB（比 sleep 版省 ~1.9 MB）",
-                _rss.isdigit() and int(_rss) < 4000, "rss=%s KB" % _rss)
-        s.check("W1 %d 秒（2 个检查点）CPU ≤ 2 jiffy（内建睡眠不烧 CPU）" % _wait(2, 2),
-                0 <= _dcpu <= 2, "cpu_delta=%s jiffy" % _dcpu)
-        s.check("W1 beat 里是 epoch 秒，且与远端 now 相差 < TTL（判闲靠内容）",
-                _field(_w1, "beat").isdigit() and _field(_w1, "now").isdigit()
-                and 0 <= int(_field(_w1, "now")) - int(_field(_w1, "beat")) < 300,
-                repr(_w1)[:160])
-        _live_run(["session", "kill", tgt, "--name", _wdc], timeout=60)
+    # E4：out.log 被外部删除 ⇒ 下次探测自动重 arm（实测：管道活着但文件没了会静默丢输出）
+    rc, _jr4, _ = _live_run(["exec", tgt, "--cmd",
+                             "rm -f /tmp/pyaissh-sessions/%s/out.log; echo removed" % _e1],
+                            timeout=60)
+    rc, _je4, _err4 = _live_run(["session", "run", tgt, "--name", _e1, "--cmd",
+                                 "echo AFTER_LOG_RM", "--wait-rc", "20"], timeout=60)
+    rc, _jm4, _ = _live_run(["exec", tgt, "--cmd",
+                             "echo -n 'exists='; [ -f /tmp/pyaissh-sessions/%s/out.log ] "
+                             "&& echo 1 || echo 0; "
+                             "echo -n 'has='; grep -c AFTER_LOG_RM "
+                             "/tmp/pyaissh-sessions/%s/out.log 2>/dev/null || true" % (_e1, _e1)],
+                            timeout=60)
+    _e4s = (_jm4 or {}).get("stdout") or ""
+    s.check("E4 out.log 被删后自动重建并继续镜像（log_recreated 自愈）",
+            "exists=1" in _e4s and "has=1" in _e4s, repr(_e4s))
+    s.check("E4 自愈有 stderr 留痕（log_recreated）",
+            "log_recreated" in (_err4 or ""), repr((_err4 or "")[-160:]))
 
-    # W2 防 spin 护栏：把真实生成的看门狗脚本的 fd 改成 /dev/null（read 立刻返回）后跑 35 秒，
-    #    必须看到 wd.log 里出现护栏记录，且进程 CPU 仍然≈0（没有忙循环）。
-    import base64 as _b64
-    _wsrc = _module()._session_watchdog_script(
-        _module()._session_files("/tmp/pyaissh-sessions", "guard1"), 60)
-    _bad = _wsrc.replace('mkfifo -m 600 "$WDFIFO" 2>/dev/null || true', ":") \
-                .replace('exec 9<>"$WDFIFO"', "exec 9</dev/null")
-    assert "exec 9</dev/null" in _bad and "mkfifo" not in _bad, _bad[:200]
-    _live_run(["exec", tgt, "--cmd",
-               "rm -rf /tmp/pyaissh-sessions/guard1; mkdir -m 700 -p /tmp/pyaissh-sessions/guard1; "
-               "printf '%s' \"$(date +%s)\" > /tmp/pyaissh-sessions/guard1/beat; "
-               "echo $$ > /tmp/pyaissh-sessions/guard1/bash.pid; echo 1 > /tmp/pyaissh-sessions/guard1/sess.pid; "
-               "printf %s '" + _b64.b64encode(_bad.encode()).decode() + "' | base64 -d > "
-               "/tmp/pyaissh-sessions/guard1/watch.sh; chmod 700 /tmp/pyaissh-sessions/guard1/watch.sh; "
-               "setsid nohup bash /tmp/pyaissh-sessions/guard1/watch.sh >/dev/null 2>&1 </dev/null & "
-               "echo started"], timeout=60)
-    time.sleep(_wait(1, 6))
-    rc, _jg2, _ = _live_run(["exec", tgt, "--cmd",
-                             "P=$(pgrep -f '/tmp/pyaissh-sessions/guard1/[w]atch[.]sh' | head -1); "
-                             "echo \"guardlog=$(grep -c 'guard: read -t' /tmp/pyaissh-sessions/guard1/wd.log 2>/dev/null)\"; "
-                             "echo \"cpu=$(awk '{print $14+$15}' /proc/$P/stat 2>/dev/null)\"; "
-                             "echo \"kids=$(pgrep -P $P | wc -l)\" ; kill -9 $P 2>/dev/null; "
-                             "rm -rf /tmp/pyaissh-sessions/guard1; echo cleaned"], timeout=60)
-    _g2 = (_jg2 or {}).get("stdout") or ""
-    s.check("W2 防 spin 护栏生效：read 立刻返回时写 wd.log 并退回 sleep",
-            _field(_g2, "guardlog") not in ("", "0"), repr(_g2)[:200])
-    s.check("W2 护栏兜底期间不烧 CPU（≤3 jiffy / %d 秒）" % _wait(1, 6),
-            _field(_g2, "cpu").isdigit() and int(_field(_g2, "cpu")) <= 3,
-            "cpu=%s jiffy" % _field(_g2, "cpu"))
+    # E5：每会话**没有**常驻辅助进程（旧引擎每会话 1 看门狗 + 1 sleep）
+    rc, _ja, _ = _live_run(["exec", tgt, "--cmd",
+                            "echo -n 'helpers='; ps -eo args | "
+                            "grep -cE '[w]atch[.]sh|[w]d[.]fifo|[s]cript -qfc' || true; "
+                            "echo -n 'tmuxsrv='; pgrep -c -f '[t]mux -L pyaissh' || true"],
+                           timeout=60)
+    _e5s = (_ja or {}).get("stdout") or ""
+    s.check("E5 会话没有看门狗/FIFO/script 之类的常驻辅助进程",
+            _field(_e5s, "helpers") == "0", repr(_e5s))
+
+    # E8：reaper 收敛——换间隔起新会话会收掉旧代，每主机始终只有一个 reaper
+    _old_r2 = os.environ.get("PYAISSH_SESSION_REAP_INTERVAL")
+    try:
+        os.environ["PYAISSH_SESSION_REAP_INTERVAL"] = "30"
+        _live_run(["session", "start", tgt, "--name", name + "rr1", "--ttl", "300"], timeout=90)
+        os.environ["PYAISSH_SESSION_REAP_INTERVAL"] = "3"
+        _live_run(["session", "start", tgt, "--name", name + "rr2", "--ttl", "300"], timeout=90)
+    finally:
+        if _old_r2 is None:
+            os.environ.pop("PYAISSH_SESSION_REAP_INTERVAL", None)
+        else:
+            os.environ["PYAISSH_SESSION_REAP_INTERVAL"] = _old_r2
+    rc, _jrr, _ = _live_run(["exec", tgt, "--cmd",
+                             "echo -n 'reapers='; ps -eo args | grep -c '[r]eap.sh --loop' || true; "
+                             "echo -n 'interval='; awk '{print $2}' "
+                             "/tmp/pyaissh-sessions/.reaper.pid 2>/dev/null"], timeout=60)
+    _rr = (_jrr or {}).get("stdout") or ""
+    s.check("E8 每主机只有一个 reaper，且指纹是最新间隔（换间隔收掉旧代，不堆积）",
+            _field(_rr, "reapers") == "1" and _field(_rr, "interval") == "3", repr(_rr))
+    _live_run(["session", "kill", tgt, "--name", name + "rr1"], timeout=60)
+    _live_run(["session", "kill", tgt, "--name", name + "rr2"], timeout=60)
+
+    # E6：PERF（3 个空闲会话：内存 / 进程数 / 空闲 CPU）——SPEC PERF-01..04
+    _perf = [name + "p%d" % i for i in (1, 2, 3)]
+    for _pn in _perf:
+        _live_run(["session", "start", tgt, "--name", _pn, "--ttl", "300"], timeout=90)
+    _pscript = ("PIDS=''; for n in %s; do "
+                "  TN=$(cat /tmp/pyaissh-sessions/$n/tmux 2>/dev/null); "
+                "  P=$(tmux -L pyaissh display-message -p -t \"=$TN:\" '#{pane_pid}' 2>/dev/null); "
+                "  PIDS=\"$PIDS $P\"; done; "
+                "SRV=$(tmux -L pyaissh display-message -p '#{pid}' 2>/dev/null); "
+                "[ -n \"$SRV\" ] || SRV=$(pgrep -f '[t]mux -L pyaissh' | head -1); "
+                "RE=$(pgrep -f '[r]eap.sh --loop' | head -1); "
+                "ALL=\"$SRV $PIDS $RE\"; "
+                "N=0; RSS=0; CPU=0; "
+                "for p in $ALL; do [ -n \"$p\" ] || continue; N=$((N+1)); "
+                "  RSS=$((RSS + $(awk '/VmRSS/{print $2}' /proc/$p/status 2>/dev/null || echo 0))); "
+                "  CPU=$((CPU + $(awk '{print $14+$15}' /proc/$p/stat 2>/dev/null || echo 0))); done; "
+                "echo \"procs=$N\"; echo \"rss_kb=$RSS\"; echo \"cpu=$CPU\"") % " ".join(_perf)
+    rc, _jp1, _ = _live_run(["exec", tgt, "--cmd", _pscript], timeout=60)
+    time.sleep(20)
+    rc, _jp2, _ = _live_run(["exec", tgt, "--cmd", _pscript], timeout=60)
+    _p1 = (_jp1 or {}).get("stdout") or ""
+    _p2 = (_jp2 or {}).get("stdout") or ""
+    try:
+        _dcpu = int(_field(_p2, "cpu") or 0) - int(_field(_p1, "cpu") or 0)
+    except ValueError:
+        _dcpu = -1
+    _rss_mb = (int(_field(_p1, "rss_kb") or 0) / 1024.0)
+    s.check("PERF-01 3 个空闲会话常驻内存 ≤ 25MB（旧引擎实测 45.5MB）",
+            _rss_mb > 0 and _rss_mb <= 25.0, "rss=%.1f MB（%s）" % (_rss_mb, _p1))
+    s.check("PERF-02/03 常驻进程 ≤ 5（tmux server + 3 shell + reaper）且每会话无辅助进程",
+            0 < int(_field(_p1, "procs") or 0) <= 5, "procs=%s" % _field(_p1, "procs"))
+    s.check("PERF-04 20 秒空闲 CPU ≤ 2 jiffy（不烧 CPU）",
+            0 <= _dcpu <= 2, "cpu_delta=%s jiffy" % _dcpu)
+    for _pn in _perf:
+        _live_run(["session", "kill", tgt, "--name", _pn], timeout=60)
+
+    # E7：kill 之后不留 reaper（用完即净）
+    _live_run(["session", "kill", tgt, "--name", _e1], timeout=60)
+    rc, _jz, _ = _live_run(["exec", tgt, "--cmd",
+                            "echo -n 'reap='; ps -eo args | grep -c '[r]eap.sh --loop' || true; "
+                            "echo -n 'pid='; [ -f /tmp/pyaissh-sessions/.reaper.pid ] && echo 1 || echo 0; "
+                            "echo -n 'srv='; tmux -L pyaissh ls 2>/dev/null | wc -l"], timeout=60)
+    _e7s = (_jz or {}).get("stdout") or ""
+    s.check("E7 会话全清后：reaper 已停、pid 文件已删、tmux server 已退",
+            _field(_e7s, "reap") == "0" and _field(_e7s, "pid") == "0"
+            and _field(_e7s, "srv") == "0", repr(_e7s))
 
 def suite_live_session_lifecycle(s):
+    """会话消亡与账实分离（v2.4.0）：exit / 外部 kill-session / 目录被删 / 旧引擎遗留 / 同名重建。"""
     if _missing_env(_REQ_EXEC):
         print("SKIP: 需配置 %s" % " / ".join(_REQ_EXEC))
         return None
@@ -1690,85 +1831,109 @@ def suite_live_session_lifecycle(s):
     _live_run(["session", "kill", tgt, "--name", name], timeout=120)
     _live_run(["session", "kill", tgt, "--all"], timeout=120)
 
-    rc, j, _ = _live_run(["session", "start", tgt, "--name", name], timeout=120)
-    # ---- L：看门狗"临终带走"（v2.3.0 用户提案）：有人 rm -rf 会话目录时，看门狗最后收一次再自退 ----
-    import base64 as _b64b
-    # L1 主用例：start(ttl>0) → 等 >15s（看门狗已记下 pid）→ rm -rf 目录 → 等 ≤20s
-    #    → starter/script/bash -i 与看门狗全消失，且随后 kill --all 没有孤儿可扫（证明是看门狗干的）
-    _lz = name + "lz"
-    rc, _jl, _ = _live_run(["session", "start", tgt, "--name", _lz, "--ttl", "300"], timeout=90)
-    time.sleep(_wait(1, 3))
-    rc, _jpre, _ = _live_run(["exec", tgt, "--cmd",
-                              "rm -rf /tmp/pyaissh-sessions/%s; sleep 0.5; "
-                              "echo -n 'before='; pgrep -fc '[p]yaissh-sessions/%s' || true"
-                              % (_lz, _lz)], timeout=60)
-    _before = _field(((_jpre or {}).get("stdout") or ""), "before")
-    time.sleep(_wait(2, 4))
-    # 路径用变量拼（cmdline 里不出现完整路径）⇒ pgrep -f 不会匹配到执行本命令的 shell 自己
-    _l1cmd = ("R=$(printf '/tmp/pyaissh-%s' sessions); D=\"$R/" + _lz + "\"; "
-              "echo -n 'after='; pgrep -fc \"$D\" || true; "
-              "echo -n 'dir='; [ -d \"$D\" ] && echo 1 || echo 0; "
-              "echo -n 'script='; ps -eo args | grep -c \"[s]cript -qfc.*$D\" || true")
-    rc, _jz, _ = _live_run(["exec", tgt, "--cmd", _l1cmd], timeout=60)
-    _lzs = (_jz or {}).get("stdout") or ""
-    s.check("L1 孤儿确实存在过（rm -rf 目录后还有 >=3 个进程）",
-            _before.isdigit() and int(_before) >= 3, "before=%s" % _before)
-    s.check("L1 看门狗临终带走：rm -rf 目录后该会话的进程全消失、看门狗自退",
-            _field(_lzs, "after") == "0" and _field(_lzs, "dir") == "0"
-            and _field(_lzs, "script") == "0", repr(_lzs)[:200])
-    rc, _jall2, _ = _live_run(["session", "kill", tgt, "--all"], timeout=120)
-    s.check("L1 随后 kill --all 已无可扫孤儿（说明是看门狗清的，不是兜底扫描）",
-            bool(_jall2) and not (_jall2.get("orphans_total") or 0), repr(_jall2)[:200])
+    # L1：会话里 `exit` → tmux 会话消失但目录还在 ⇒ session_dead（不猜、不接管），kill 清目录
+    _l1 = name + "l1"
+    _live_run(["session", "start", tgt, "--name", _l1, "--ttl", "300"], timeout=90)
+    _live_run(["session", "run", tgt, "--name", _l1, "--cmd", "exit", "--no-wait"], timeout=60)
+    time.sleep(1.5)
+    rc, _je1, _ = _live_run(["session", "read", tgt, "--name", _l1], timeout=60)
+    s.check("L1a 会话里 exit 后：read 报 session_dead（rc=2）+ 目录仍在",
+            rc == 2 and bool(_je1) and _je1.get("error") == "session_dead"
+            and "tmux 会话已消失" in (_je1.get("message") or ""), repr(_je1)[:240])
+    rc, _jl1, _ = _live_run(["session", "list", tgt], timeout=60)
+    _row1 = next((x for x in (_jl1 or {}).get("sessions", []) if x.get("session") == _l1), None)
+    s.check("L1b list 显示 status=dead（账实不一致如实呈现）",
+            bool(_row1) and _row1.get("status") == "dead", repr(_row1)[:200])
+    rc, _jk1, _ = _live_run(["session", "kill", tgt, "--name", _l1], timeout=120)
+    _krow1 = ((_jk1 or {}).get("sessions") or [{}])[0]
+    s.check("L1c kill 清掉残留目录，但 verified=false + note（没拿到 pane pid，不谎报清干净）",
+            bool(_jk1) and _krow1.get("cleaned") is True and _krow1.get("verified") is False
+            and bool(_krow1.get("note")), repr(_krow1)[:240])
 
-    # L2 自证反向：记住的 pid 被内核复用成"无关进程"时**不得误杀**
-    #    做法：伪造 sess.pid/bash.pid 指向一个 argv 不含会话路径的 sleep，再 rm -rf 目录等一个 tick
-    _lz2 = name + "lz2"
-    _D2 = "/tmp/pyaissh-sessions/" + _lz2
-    _wsrc2 = _module()._session_watchdog_script(
-        _module()._session_files("/tmp/pyaissh-sessions", _lz2), 300)
-    _l2cmd = ("rm -rf {D}; mkdir -m 700 -p {D}; "
-              "setsid nohup sleep 120 >/dev/null 2>&1 </dev/null & DP=$!; "
-              "echo $DP > {D}/sess.pid; echo $DP > {D}/bash.pid; "
-              "date +%s > {D}/beat; echo \"1 200 $(date +%s) 300\" > {D}/meta; "
-              "printf %s '{B64}' | base64 -d > {D}/watch.sh; chmod 700 {D}/watch.sh; "
-              "setsid nohup bash {D}/watch.sh >/dev/null 2>&1 </dev/null & echo \"decoy=$DP\""
-              ).format(D=_D2, B64=_b64b.b64encode(_wsrc2.encode()).decode())
-    rc, _jdec2, _ = _live_run(["exec", tgt, "--cmd", _l2cmd], timeout=60)
-    _decoy2 = _field(((_jdec2 or {}).get("stdout") or ""), "decoy")
-    time.sleep(3)
-    _live_run(["exec", tgt, "--cmd", "rm -rf " + _D2], timeout=60)
-    time.sleep(_wait(2, 4))
-    rc, _jl2b, _ = _live_run(["exec", tgt, "--cmd",
-                              "echo -n 'decoy='; kill -0 %s 2>/dev/null && echo alive || echo gone; "
-                              "echo -n 'wd='; pgrep -fc '%s/[w]atch[.]sh' || true; "
-                              "kill -9 %s 2>/dev/null; rm -rf %s; echo cleaned"
-                              % (_decoy2, _D2, _decoy2, _D2)], timeout=60)
-    _l2s = (_jl2b or {}).get("stdout") or ""
-    s.check("L2 自证闸门：记住的 pid 已属无关进程（argv 不含会话路径）⇒ 不误杀、看门狗自退",
-            _decoy2.isdigit() and _field(_l2s, "decoy") == "alive" and _field(_l2s, "wd") == "0",
-            repr(_l2s)[:200])
+    # L2：外部 `tmux kill-session`（模拟人手工关掉）→ 同样 session_dead，不留进程
+    _l2 = name + "l2"
+    rc, _j2, _ = _live_run(["session", "start", tgt, "--name", _l2, "--ttl", "300"], timeout=90)
+    _live_run(["exec", tgt, "--cmd",
+               "tmux -L pyaissh kill-session -t '=%s'; echo killed" % _tmux_name(_l2)],
+              timeout=60)
+    time.sleep(0.8)
+    rc, _je2, _ = _live_run(["session", "run", tgt, "--name", _l2, "--cmd", "echo X"],
+                           timeout=60)
+    s.check("L2a 外部 kill-session 后 run 报 session_dead",
+            rc == 2 and bool(_je2) and _je2.get("error") == "session_dead", repr(_je2)[:200])
+    rc, _jk2, _ = _live_run(["session", "kill", tgt, "--name", _l2], timeout=120)
+    _krow2 = ((_jk2 or {}).get("sessions") or [{}])[0]
+    s.check("L2b kill 清理后无残留（目录删了）", bool(_jk2) and _krow2.get("cleaned") is True,
+            repr(_krow2)[:200])
 
-    # L3 名字被接管：rm -rf 目录后立刻同名重建 → 老看门狗必须退出、新会话必须活着
-    _lz3 = name + "lz3"
-    _live_run(["session", "start", tgt, "--name", _lz3, "--ttl", "300"], timeout=90)
-    time.sleep(_wait(1, 3))
-    _live_run(["exec", tgt, "--cmd", "rm -rf /tmp/pyaissh-sessions/%s" % _lz3], timeout=60)
-    rc, _jnew, _ = _live_run(["session", "start", tgt, "--name", _lz3, "--ttl", "300"], timeout=90)
-    time.sleep(_wait(2, 4))   # 给老看门狗足够时间 tick（它会看到 watch.pid/meta 变了，应自行退出）
-    rc, _jl3, _ = _live_run(["session", "run", tgt, "--name", _lz3, "--cmd", "echo NEWALIVE",
-                             "--wait-rc", "10"], timeout=60)
-    rc, _jc3, _ = _live_run(["exec", tgt, "--cmd",
-                             "echo -n 'watchprocs='; pgrep -fc '/tmp/pyaissh-sessions/%s/[w]atch[.]sh' || true"
-                             % _lz3], timeout=60)
-    s.check("L3 同名重建不被老看门狗误杀：新会话仍可执行命令",
-            bool(_jl3) and _jl3.get("exit_code") == 0 and "NEWALIVE" in (_jl3.get("stdout") or ""),
-            repr(_jl3)[:160])
-    s.check("L3 老看门狗已自退（只剩新会话的那 1 个看门狗进程）",
-            _field(((_jc3 or {}).get("stdout") or ""), "watchprocs") == "1",
-            repr((_jc3 or {}).get("stdout"))[:160])
-    _live_run(["session", "kill", tgt, "--name", _lz3], timeout=60)
+    # L3：目录被外部删除、tmux 会话还活着 ⇒ list 仍看得见（running + 目录缺失警告），kill 能收掉
+    _l3 = name + "l3"
+    rc, _j3, _ = _live_run(["session", "start", tgt, "--name", _l3, "--ttl", "300"], timeout=90)
+    _pid3 = (_j3 or {}).get("pid")
+    _live_run(["exec", tgt, "--cmd", "rm -rf /tmp/pyaissh-sessions/%s; echo rm" % _l3],
+              timeout=60)
+    rc, _jl3, _ = _live_run(["session", "list", tgt], timeout=60)
+    _row3 = next((x for x in (_jl3 or {}).get("sessions", []) if x.get("session") == _l3), None)
+    s.check("L3a 目录被删但会话活着：list 仍列出 running + 目录缺失警告",
+            bool(_row3) and _row3.get("status") == "running"
+            and any("目录缺失" in w for w in (_jl3.get("warnings") or [])), repr(_jl3)[:260])
+    rc, _jk3, _ = _live_run(["session", "kill", tgt, "--name", _l3], timeout=120)
+    _krow3 = ((_jk3 or {}).get("sessions") or [{}])[0]
+    rc, _jv3, _ = _live_run(["exec", tgt, "--cmd",
+                             "echo -n 'proc='; kill -0 %s 2>/dev/null && echo 1 || echo 0; "
+                             "echo -n 'sess='; tmux -L pyaissh ls 2>/dev/null "
+                             "| grep -c '%s' || true" % (_pid3, _tmux_name(_l3))], timeout=60)
+    _v3 = (_jv3 or {}).get("stdout") or ""
+    s.check("L3b kill 收掉这种" + "无目录活会话" + "（进程与 tmux 会话都没了）",
+            bool(_jk3) and "proc=0" in _v3 and "sess=0" in _v3, repr(_v3))
+
+    # L4：同名重建（kill 后同名字再起必须是新会话）
+    _l4 = name + "l4"
+    rc, _j4a, _ = _live_run(["session", "start", tgt, "--name", _l4, "--ttl", "300"], timeout=90)
+    rc, _j4b, _ = _live_run(["session", "start", tgt, "--name", _l4, "--ttl", "300"], timeout=90)
+    s.check("L4a 同名再起 → session_exists（不悄悄接管）",
+            bool(_j4b) and _j4b.get("error") == "session_exists", repr(_j4b)[:180])
+    _live_run(["session", "kill", tgt, "--name", _l4], timeout=120)
+    rc, _j4c, _ = _live_run(["session", "start", tgt, "--name", _l4, "--ttl", "300"], timeout=90)
+    rc, _j4d, _ = _live_run(["session", "run", tgt, "--name", _l4, "--cmd", "echo NEWALIVE",
+                             "--wait-rc", "15"], timeout=60)
+    s.check("L4b kill 后同名重建可用（新 pid，能跑命令）",
+            bool(_j4c) and _j4c.get("pid") != (_j4a or {}).get("pid")
+            and bool(_j4d) and "NEWALIVE" in (_j4d.get("stdout") or ""),
+            "pid=%s→%s" % ((_j4a or {}).get("pid"), (_j4c or {}).get("pid")))
+    _live_run(["session", "kill", tgt, "--name", _l4], timeout=120)
+
+    # L5：**旧引擎遗留目录**（有 sess.pid/in 却没有 tmux 会话）——不接管、不被清扫误删、kill 能清
+    _lg = name + "lg"
+    _live_run(["exec", tgt, "--cmd",
+               "D=/tmp/pyaissh-sessions/%s; rm -rf $D; mkdir -m 700 -p $D; "
+               "echo 999999 > $D/sess.pid; : > $D/in; "
+               "printf '1 200 %%d 5\\n' $(( $(date +%%s) - 600 )) > $D/meta; "
+               "printf '%%s\\n' $(( $(date +%%s) - 600 )) > $D/beat; echo made" % _lg],
+              timeout=60)
+    rc, _je5, _ = _live_run(["session", "read", tgt, "--name", _lg], timeout=60)
+    s.check("L5a 旧引擎遗留目录 → session_dead 且 message 点明是旧引擎遗留",
+            rc == 2 and bool(_je5) and _je5.get("error") == "session_dead"
+            and "旧引擎遗留" in (_je5.get("message") or ""), repr(_je5)[:260])
+    rc, _jl5, _ = _live_run(["session", "list", tgt], timeout=60)
+    _row5 = next((x for x in (_jl5 or {}).get("sessions", []) if x.get("session") == _lg), None)
+    s.check("L5b list 标出 legacy_engine + 给出清理提示",
+            bool(_row5) and _row5.get("legacy_engine") is True
+            and any("旧引擎" in w for w in (_jl5.get("warnings") or [])), repr(_jl5)[:260])
+    rc, _jex5, _ = _live_run(["exec", tgt, "--cmd",
+                              "[ -d /tmp/pyaissh-sessions/%s ] && echo still || echo gone" % _lg],
+                             timeout=60)
+    s.check("L5c 过期但**不**被惰性扫/reaper 误删（不接管别人的账）",
+            "still" in ((_jex5 or {}).get("stdout") or ""), repr((_jex5 or {}).get("stdout")))
+    rc, _jk5, _ = _live_run(["session", "kill", tgt, "--name", _lg], timeout=120)
+    _krow5 = ((_jk5 or {}).get("sessions") or [{}])[0]
+    s.check("L5d kill 能清掉遗留目录，并标 legacy_engine",
+            bool(_jk5) and _krow5.get("legacy_engine") is True
+            and _krow5.get("cleaned") is True, repr(_krow5)[:240])
 
 def suite_live_session_orphan(s):
+    """孤儿字段（v2.4.0）：tmux 引擎下结构性孤儿不复存在，`orphans*` **恒返回且恒空**；
+    `kill --all` 幂等、且能收掉"目录被外部删掉、只剩 tmux 会话"的活会话。"""
     if _missing_env(_REQ_EXEC):
         print("SKIP: 需配置 %s" % " / ".join(_REQ_EXEC))
         return None
@@ -1777,44 +1942,53 @@ def suite_live_session_orphan(s):
     _live_run(["session", "kill", tgt, "--name", name], timeout=120)
     _live_run(["session", "kill", tgt, "--all"], timeout=120)
 
-    rc, j, _ = _live_run(["session", "start", tgt, "--name", name], timeout=120)
-    # ---- O：按 argv 扫孤儿（v2.3.0）：目录被手工删掉、只剩进程的会话，`kill --all` 也要收掉 ----
-    _orph2 = name + "o2"
-    # 用 --ttl 0：新语义下"目录被删"的孤儿会由看门狗临终带走，argv 扫描只能在**没有看门狗**时被验证
-    _live_run(["session", "start", tgt, "--name", _orph2, "--ttl", "0"], timeout=90)
-    # 旁观者诱饵：argv 里"提到"会话路径，但不是会话进程（不该被杀）
-    rc, _jdec, _ = _live_run(["exec", tgt, "--cmd",
-                              "setsid nohup bash -c 'sleep 120; :' "
-                              "/tmp/pyaissh-sessions/%s/out.log >/dev/null 2>&1 </dev/null & echo $!"
-                              % _orph2], timeout=60)
-    _decoy = ((_jdec or {}).get("stdout") or "").strip().splitlines()[-1:] or [""]
-    _decoy = _decoy[0].strip()
-    # 手工删掉会话目录：进程失去 pid 记录 ⇒ 逐目录枚举看不见它们（本次加固要解决的场景）
-    _live_run(["exec", tgt, "--cmd", "rm -rf /tmp/pyaissh-sessions/%s; sleep 0.5; "
-                                     "ps -eo pid,args | grep -c '[p]yaissh-sessions/%s'"
-                                     % (_orph2, _orph2)], timeout=60)
-    rc, _jall, _ = _live_run(["session", "kill", tgt, "--all"], timeout=120)
-    _orph_rows = [o for o in (_jall or {}).get("orphans", []) if o.get("session") == _orph2]
-    s.check("O1a kill --all 按 argv 扫到孤儿（无看门狗会话：目录已删只剩进程）",
-            bool(_orph_rows), repr((_jall or {}).get("orphans"))[:220])
-    s.check("O1b 孤儿清理无残留（orphan_remaining_total=0 且 verified）",
-            bool(_jall) and (_jall.get("orphan_remaining_total") or 0) == 0
-            and all(o.get("verified") for o in _orph_rows), repr(_orph_rows)[:220])
-    # 注意：这条命令里既做 pgrep 又看同一个路径 ⇒ 路径用变量拼，避免 pgrep -f 的自匹配假阳性
-    _o1cmd = ("R=$(printf '/tmp/pyaissh-%s' sessions); D=\"$R/" + _orph2 + "\"; "
-              "echo -n 'script='; ps -eo args | grep -c '[s]cript -qfc' || true; "
-              "echo -n 'starter='; ps -eo args | grep -c \"[e]xec 9<>'$D/in'\" || true; "
-              "echo -n 'dir='; [ -d \"$D\" ] && echo 1 || echo 0; "
-              "echo -n 'decoy='; kill -0 " + str(_decoy) + " 2>/dev/null && echo alive || echo gone")
-    rc, _jo2, _ = _live_run(["exec", tgt, "--cmd", _o1cmd], timeout=60)
-    _o2s = (_jo2 or {}).get("stdout") or ""
-    s.check("O1c 孤儿进程真被杀掉（无 script 包装、无 starter、目录已删）",
-            "script=0" in _o2s and "starter=0" in _o2s and "dir=0" in _o2s, repr(_o2s))
-    s.check("O1d 旁观者（argv 提到路径但不是会话进程）**没被误杀**",
-            "decoy=alive" in _o2s, repr(_o2s))
-    if _decoy.isdigit():
-        _live_run(["exec", tgt, "--cmd", "kill -9 %s 2>/dev/null; echo decoy_cleaned" % _decoy],
-                  timeout=60)
+    # O1：空主机上的 kill --all：字段齐、计数 0
+    rc, _j0, _ = _live_run(["session", "kill", tgt, "--all"], timeout=120)
+    s.check("O1a 空主机 kill --all：ok + count=0 + 恒空孤儿三字段",
+            bool(_j0) and _j0.get("ok") is True and _j0.get("count") == 0
+            and _j0.get("orphans") == [] and _j0.get("orphans_total") == 0
+            and _j0.get("orphan_remaining_total") == 0, repr(_j0)[:220])
+
+    # O2：正常会话的 kill：孤儿字段依然在（且空）——AI 侧零感知
+    _o2 = name + "o2"
+    _live_run(["session", "start", tgt, "--name", _o2, "--ttl", "300"], timeout=90)
+    _live_run(["session", "send", tgt, "--name", _o2, "--cmd", "sleep 200 &"], timeout=60)
+    time.sleep(0.8)
+    rc, _j2, _ = _live_run(["session", "kill", tgt, "--name", _o2], timeout=120)
+    _r2 = ((_j2 or {}).get("sessions") or [{}])[0]
+    s.check("O2a kill 扫到会话进程树（含后台作业，swept>=2）+ 无残留 + verified",
+            bool(_j2) and (_r2.get("swept") or 0) >= 2 and _j2.get("remaining_total") == 0
+            and _r2.get("verified") is True, repr(_r2)[:220])
+    s.check("O2b 孤儿字段恒空（不再是 argv 扫描的产物）",
+            _j2.get("orphans") == [] and _j2.get("orphans_total") == 0
+            and _j2.get("orphan_remaining_total") == 0, repr(_j2)[:200])
+
+    # O3：目录被外部删掉、只剩 tmux 会话 ⇒ kill --all 仍要收掉它（不能"看不见就留着"）
+    _o3 = name + "o3"
+    rc, _j3, _ = _live_run(["session", "start", tgt, "--name", _o3, "--ttl", "300"], timeout=90)
+    _pid3 = (_j3 or {}).get("pid")
+    _live_run(["exec", tgt, "--cmd", "rm -rf /tmp/pyaissh-sessions/%s; echo rm" % _o3],
+              timeout=60)
+    rc, _ja3, _ = _live_run(["session", "kill", tgt, "--all"], timeout=120)
+    rc, _jv3, _ = _live_run(["exec", tgt, "--cmd",
+                             "echo -n 'proc='; kill -0 %s 2>/dev/null && echo 1 || echo 0; "
+                             "echo -n 'sess='; tmux -L pyaissh ls 2>/dev/null "
+                             "| grep -c '%s' || true" % (_pid3, _tmux_name(_o3))], timeout=60)
+    _v3 = (_jv3 or {}).get("stdout") or ""
+    s.check("O3 kill --all 收掉" + "无目录活会话" + "（进程与 tmux 会话都没了）",
+            bool(_ja3) and "proc=0" in _v3 and "sess=0" in _v3, repr(_v3))
+    s.check("O3 孤儿字段仍恒空", _ja3.get("orphans") == [] and _ja3.get("orphans_total") == 0,
+            repr(_ja3)[:200])
+
+    # O4：幂等 —— 反复 kill --all 不报错、不留东西
+    rc, _j4a, _ = _live_run(["session", "kill", tgt, "--all"], timeout=120)
+    rc, _j4b, _ = _live_run(["session", "kill", tgt, "--all"], timeout=120)
+    rc, _jj4, _ = _live_run(["session", "kill", tgt, "--name", name + "never"], timeout=120)
+    s.check("O4 kill --all 幂等（连做两次都 ok、remaining_total=0）",
+            bool(_j4a) and bool(_j4b) and _j4b.get("ok") is True
+            and _j4b.get("remaining_total") == 0, repr(_j4b)[:200])
+    s.check("O4 对不存在的会话 kill 也不报错（清理是幂等的）",
+            bool(_jj4) and _jj4.get("ok") is True, repr(_jj4)[:200])
 
 def suite_live_session_bugs(s):
     if _missing_env(_REQ_EXEC):
@@ -1870,23 +2044,24 @@ def suite_live_session_bugs(s):
     finally:
         _sh2.rmtree(_cdir2, ignore_errors=True)
 
-    # B1+B2：长等待不被 SFTP 看门狗误杀（>30s）+ --no-pty 降级路径可用
+    # B1：会话长等待不被 SFTP/回收误杀（>30s）
     rc, jb1s, _ = _live_run(["session", "start", tgt, "--name", name + "b1"], timeout=90)
     _t1 = time.time()
     rc, jb1, _ = _live_run(["session", "run", tgt, "--name", name + "b1", "--cmd",
                             "sleep 32; echo SLEPT32", "--wait-rc", "60"], timeout=180)
     _dt1 = time.time() - _t1
-    s.check("B1 会话长等待 >30s 不被看门狗误杀（sleep 32 跑完）",
+    s.check("B1 会话长等待 >30s 不被误杀（sleep 32 跑完）",
             bool(jb1) and jb1.get("status") == "done" and jb1.get("exit_code") == 0
             and "SLEPT32" in (jb1.get("stdout") or ""),
             "%.1fs status=%s" % (_dt1, (jb1 or {}).get("status")))
     _live_run(["session", "kill", tgt, "--name", name + "b1"], timeout=60)
 
+    # B2（v2.4.0 语义变化）：--no-pty 已废弃 → 仍是真 PTY + 一条 warning，但命令/状态/退出码必须正常
     rc, jbnp, _ = _live_run(["session", "start", tgt, "--name", name + "np", "--no-pty"],
                             timeout=90)
-    s.check("B2 --no-pty 会话就绪（ready=True，pty=False）",
-            bool(jbnp) and jbnp.get("pty") is False and jbnp.get("ready") is True,
-            repr(jbnp)[:160])
+    s.check("B2 --no-pty 变成 no-op：pty=True + ready=True + 明确 warning",
+            bool(jbnp) and jbnp.get("pty") is True and jbnp.get("ready") is True
+            and any("no-pty" in w for w in (jbnp.get("warnings") or [])), repr(jbnp)[:220])
     rc, jbnp2, _ = _live_run(["session", "run", tgt, "--name", name + "np", "--cmd",
                               "echo NOPTY_OK", "--wait-rc", "15"], timeout=60)
     s.check("B2 --no-pty 下 run 能拿到输出与退出码（曾静默挂死）",
@@ -1924,17 +2099,17 @@ SUITES = [
     ("live_exec_field", "exec+field（真机）", suite_live_exec_field),
     ("live_transfer", "传输往返（真机：默认/并行/续传/排除）", suite_live_transfer),
     ("live_session", "会话 core（真机：PTY/状态保留/退出码/ctrl-c/keys/kill）", suite_live_session),
-    # v2.3.0：live_session 按"改动路径"拆块——开发时只跑动过的那块（`--suite live_session_watchdog`），
+    # v2.4.0：live_session 按"改动路径"拆块——开发时只跑动过的那块（`--suite live_session_engine`），
     # 全量（--session / --all）仍是这些块全跑（发布前用）
-    ("live_session_ttl", "会话空闲回收 TTL/attach（真机）", suite_live_session_ttl),
-    ("live_session_watchdog", "会话看门狗（单进程/护栏，真机）", suite_live_session_watchdog),
-    ("live_session_lifecycle", "看门狗临终带走/自证闸门/同名接管（真机）", suite_live_session_lifecycle),
-    ("live_session_orphan", "argv 扫孤儿（真机）", suite_live_session_orphan),
+    ("live_session_ttl", "会话空闲回收（惰性扫 + reaper）/attach（真机）", suite_live_session_ttl),
+    ("live_session_engine", "tmux 引擎（socket 隔离/输出镜像/无残留/开销，真机）", suite_live_session_engine),
+    ("live_session_lifecycle", "会话消亡/外部删目录/旧引擎遗留/同名重建（真机）", suite_live_session_lifecycle),
+    ("live_session_orphan", "孤儿字段恒空 + kill --all 幂等（真机）", suite_live_session_orphan),
     ("live_session_bugs", "B1~B5 回归护栏（真机）", suite_live_session_bugs),
 ]
 
 #: `--session` 展开成哪些套件（保持"全部会话用例"的语义）
-_SESSION_SUITES = ["live_session", "live_session_ttl", "live_session_watchdog",
+_SESSION_SUITES = ["live_session", "live_session_ttl", "live_session_engine",
                    "live_session_lifecycle", "live_session_orphan", "live_session_bugs"]
 
 
@@ -1992,11 +2167,12 @@ def main():
     ap.add_argument("--transfer", action="store_true")
     ap.add_argument("--session", action="store_true", help="会话真机集（= 下面 6 块全跑）")
     ap.add_argument("--suite", help="按名字选套件（逗号分隔，见 --list）——开发时只跑动过的路径，"
-                                   "例如 --suite live_session_watchdog,live_session_lifecycle")
+                                   "例如 --suite live_session_engine,live_session_lifecycle")
     ap.add_argument("--fast", action="store_true",
-                    help="快跑：把看门狗检查周期调到 %ds（PYAISSH_SESSION_TTL_TICK），"
-                         "并把用例里「等一个 tick」的等待按比例缩短（默认 15s，真实生产值）"
-                         % _FAST_TICK)
+                    help="快跑：把每主机 reaper 的检查间隔调到 %ds（PYAISSH_SESSION_REAP_INTERVAL），"
+                         "把「等 reaper 收会话」的等待按比例缩短（默认 300s，真实生产值）。"
+                         "注：回收主路径是惰性扫（任何会话命令都触发），多数回收用例本来就只需几秒"
+                         % _FAST_REAP)
     ap.add_argument("--release", action="store_true",
                     help="发布前全量（**唯一**允许 --all / --session 的场合；也可用 "
                          "PYAISSH_TEST_RELEASE=1）。开发期禁止全量与整个模式测试——见 AGENTS.md")
@@ -2015,13 +2191,13 @@ def main():
         for i, (name, desc, _) in enumerate(SUITES, 1):
             print("  %2d) %-26s %s" % (i, name, desc))
         print("\n  常用组合：")
-        print("   开发（只跑动过的路径，示例）：--suite live_session_watchdog,live_session_lifecycle --fast")
+        print("   开发（只跑动过的路径，示例）：--suite live_session_engine,live_session_lifecycle --fast")
         print("   发布前全量：                    --all")
         return 0
     if a.fast:
-        os.environ["PYAISSH_SESSION_TTL_TICK"] = str(_FAST_TICK)
-        globals()["_TICK"] = _FAST_TICK
-        print("[fast] 看门狗 tick=%ds（默认 15s），等待按比例缩短" % _FAST_TICK)
+        os.environ["PYAISSH_SESSION_REAP_INTERVAL"] = str(_FAST_REAP)
+        globals()["_REAP"] = _FAST_REAP
+        print("[fast] reaper 间隔=%ds（默认 300s），等待按比例缩短" % _FAST_REAP)
     if a.all:
         order = list(range(len(SUITES)))
     elif a.unit:

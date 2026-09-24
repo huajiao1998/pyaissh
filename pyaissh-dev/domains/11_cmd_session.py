@@ -8,11 +8,17 @@
   像人在终端里那样；cd/export/函数等状态都在，所以重发时上下文与上次完全一致；执行中的命令**可中断**（ctrl-c）
 
 实测依据（v2.3 开发期真机验证，详见 docs/session.md）：
-- util-linux `script` 给出真 PTY：`test -t 0` 为真、`tty` = /dev/pts/N，可应答 `read -p` 提示
-- PTY 下 bash 有 job control → **每条命令独立进程组** → `kill -INT -- -<pgid>` 即 Ctrl-C 语义
-- 往 FIFO 写 0x03 想靠 pty 行规程转 SIGINT **实测无效** ⇒ 本实现只用进程组信号
-- 只杀会话 leader 的进程组会留下 job 自己的进程组（实测踩过孤儿）
-  ⇒ kill 按**进程树闭包**清（不是按 sid：见 `_session_kill_cmd` docstring）
+- **引擎 = tmux**（v2.4.0 起，见 `pyaissh-dev/SPEC_session_tmux.md`）：PTY、进程生命周期、
+  输出镜像（`pipe-pane`）都归 tmux；pyaissh 只保留契约层（哨兵/退出码/字节级 offset/
+  清洗/JSON 字段）。旧引擎（setsid + nohup + script + FIFO + 自研看门狗）整体删除。
+- 为什么换：旧引擎的复杂度几乎全在"自己实现终端"——FIFO 写入的阻塞/半行、看门狗的
+  判闲与自杀式清理、argv 扫孤儿的自证、pid 复用误杀……这些在 tmux 里都是现成的、
+  被千万台机器验证过的行为。换掉后每个会话不再需要常驻辅助进程（每主机一个 reaper）。
+- 关键实测（S1~S13，SPEC 里逐条有命令与结论）：tmux 会**静默改写会话名里的 `.`/`:`**
+  ⇒ 名字映射成 `py-<hex>`；pane 级 target 必须写 `=NAME:`；`load-buffer`+`paste-buffer`
+  灌命令（零引号风险、二进制安全）；`send-keys C-c` 即 Ctrl-C；`--force` 用内核给的
+  前台进程组 `tpgid` 发 SIGKILL（不用会 core dump 的 SIGQUIT）；`out.log` 被外部删除后
+  管道会继续往已 unlink 的 inode 写 ⇒ 探测时**不带 `-o`** 重新 arm。
 """
 
 _SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")  # 防路径穿越
@@ -24,48 +30,56 @@ _SESSION_MARK_RE = re.compile(r"__PYAISSH_SESS__([A-Z_]+)=(\S*)")
 # list 里对"挂了超过这个时长还活着"的会话给一条提醒（用久了忘 kill 的护栏）
 _SESSION_STALE_HINT = 86400
 
-# 空闲回收（v2.3.0 空闲 TTL，用户设计）：会话是远端常驻进程，**不会自己退出**；
+# 空闲回收（v2.3.0 用户设计；v2.4.0 起由 tmux 引擎承载）：会话是远端常驻进程，**不会自己退出**；
 # 但"没人用的会话"不该白占远端资源。规则（两个条件同时成立才回收）：
-#   ① 提示符空闲——没有前台子进程在跑（`pgrep -P <会话 shell>` 为空），所以构建/安装不会被误杀；
-#   ② 距上次 pyaissh 交互（beat 文件 mtime）超过 TTL。
+#   ① 提示符空闲——没有前台命令在跑（tmux 的 `#{pane_current_command}` 是 shell 本身），
+#      所以构建/安装不会被误杀；**判不出就视为忙**（宁可不收也不误杀）；
+#   ② 距上次 pyaissh 交互（beat 文件里是 **epoch 秒**）超过 TTL。
 # 交互即续期：send/run/read/ctrl-c/keys/start(attach) 都刷新 beat；`list` 不算（看一眼≠在用）。
-# `--ttl 0` 关闭回收；环境变量 PYAISSH_SESSION_TTL 改默认值；看门狗每 _SESSION_TTL_TICK 秒查一次，
-# 所以实际回收时间在 TTL..TTL+TICK 之间。
+# `--ttl 0` 关闭回收；环境变量 PYAISSH_SESSION_TTL 改默认值。
+# 回收有两个入口（见 SPEC_session_tmux.md REAP）：
+#   ① **惰性扫**：`_session_load`（send/run/read/ctrl-c/keys 的前置）与 `list` 会先给目标续期、
+#      再扫一遍其它会话；`kill` 不需要扫（它本来就是清理）；
+#   ② **每主机 reaper**：`<root>/reap.sh --loop` 每 `_SESSION_REAP_INTERVAL` 秒扫一遍，
+#      无会话目录时下一轮自退；由 `start`（仅 --ttl>0）幂等拉起，会话全清后由 `kill` 停掉。
+# 所以"没人再回来"的会话最迟在 TTL + 间隔内被收掉（旧引擎是 TTL..TTL+TICK）。
 _SESSION_TTL_DEFAULT = 600
 
 
-def _session_tick_default():
-    """看门狗检查周期（秒，**整数**）。默认 15；`PYAISSH_SESSION_TTL_TICK` 可覆盖（**测试用**：
-    设 3 可让"等一个 tick"的用例快 5 倍；生产别乱调——周期越短 fork 越多、回收越及时）。
-    非法值（非数字/小于 1/大于 600）只打 WARN 并回落默认 15。
-
-    只接受整数：脚本里用 `TICK=%d` 与 `sleep "$TICK"` 落值，小数会被 `%d` 截成 0 ⇒
-    `read -t 0` 立刻返回，看门狗会退化成忙循环（护栏能兜住，但没必要冒这个险）。
+def _session_reap_interval():
+    """reaper 常驻循环的检查间隔（秒，**整数**）。默认 300；`PYAISSH_SESSION_REAP_INTERVAL` 可覆盖
+    （**测试用**：设 3 可让"等 reaper 收会话"的用例快 100 倍；生产别乱调——越短 fork 越多）。
+    非法值（非数字/小于 1/大于 86400）只打 WARN 并回落默认 300。
     """
-    raw = (os.environ.get("PYAISSH_SESSION_TTL_TICK") or "").strip()
+    raw = (os.environ.get("PYAISSH_SESSION_REAP_INTERVAL") or "").strip()
     if not raw:
-        return 15
+        return SESSION_TMUX_LOOP_INTERVAL
     try:
         v = int(raw)
     except ValueError:
-        log("[WARN] PYAISSH_SESSION_TTL_TICK 值 %r 非整数，用默认 15" % raw)
-        return 15
-    if v < 1 or v > 600:
-        log("[WARN] PYAISSH_SESSION_TTL_TICK 值 %r 超范围（1~600 秒），用默认 15" % raw)
-        return 15
+        log("[WARN] PYAISSH_SESSION_REAP_INTERVAL 值 %r 非整数，用默认 %d"
+            % (raw, SESSION_TMUX_LOOP_INTERVAL))
+        return SESSION_TMUX_LOOP_INTERVAL
+    if v < 1 or v > 86400:
+        log("[WARN] PYAISSH_SESSION_REAP_INTERVAL 值 %r 超范围（1~86400 秒），用默认 %d"
+            % (raw, SESSION_TMUX_LOOP_INTERVAL))
+        return SESSION_TMUX_LOOP_INTERVAL
     return v
 
 
-_SESSION_TTL_TICK = _session_tick_default()
-
-
 def _session_files(root, name):
-    """会话远端路径表（与作业同款：一个会话一个 0700 目录）。"""
+    """会话远端路径表（一个会话一个 0700 目录）。
+
+    tmux 引擎真正使用的只有 `out.log`/`meta`/`beat`/`last.token`/`tmux` 五个；
+    `fifo`/`pid`/`bash`/`watch` 是**旧引擎（setsid+script+FIFO+看门狗）的记账路径**，
+    保留只为识别"旧引擎遗留目录"（UPG-01：不自动接管，也不被 reaper 误删）。
+    """
     d = "%s/%s" % (root.rstrip("/"), name)
-    return {"dir": d, "fifo": d + "/in", "log": d + "/out.log", "err": d + "/err.log",
-            "pid": d + "/sess.pid", "meta": d + "/meta", "bash": d + "/bash.pid",
-            "token": d + "/last.token", "beat": d + "/beat", "watch": d + "/watch.pid",
-            "wdlog": d + "/wd.log", "wdfifo": d + "/wd.fifo",
+    return {"dir": d, "log": d + "/out.log", "meta": d + "/meta",
+            "token": d + "/last.token", "beat": d + "/beat", "tmux": d + "/tmux",
+            # 旧引擎遗留标记（只识别，不再写入）：
+            "fifo": d + "/in", "pid": d + "/sess.pid", "bash": d + "/bash.pid",
+            "watch": d + "/watch.pid", "err": d + "/err.log",
             "name": name, "root": root.rstrip("/")}
 
 
@@ -125,8 +139,8 @@ def _session_unescape(s):
 def _session_run(client, cmd, stdin_data=None, timeout=30):
     """跑一条远端辅助命令，返回 (rc, stdout, stderr)；可选把**字节**写进它的 stdin。
 
-    会话的 FIFO 写入必须走这条（SFTP 打开 FIFO 会阻塞/失败）；base64 载荷也走 stdin，
-    避开 argv 长度与引号问题。辅助命令输出量都很小，直接 read() 不会死锁。
+    两处用到 stdin：tmux `load-buffer -`（命令/按键载荷，原样字节）与 base64 传输。
+    辅助命令输出量都很小，直接 read() 不会死锁。
     """
     stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
     if stdin_data is not None:
@@ -145,222 +159,506 @@ def _session_run(client, cmd, stdin_data=None, timeout=30):
     return rc, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
 
 
-def _session_watchdog_script(f, ttl):
-    """空闲回收看门狗脚本（v2.3.0 空闲 TTL）：以独立 setsid 进程跑，两个条件同时成立才回收。
+# ---------------------------------------------------------------- tmux 引擎
+# 设计决策与实测依据见 `pyaissh-dev/SPEC_session_tmux.md`（spike 事实 S1~S13）。
+# 一句话：**tmux 只当引擎**（PTY + 进程生命周期 + 输出镜像），pyaissh 的契约层
+# （哨兵 / 每条命令独立退出码 / 字节级 offset 读 / CRLF·ANSI 清洗 / JSON 字段）原样保留。
+# 依赖：远端 tmux ≥ 3.0（实测 3.5a / Debian 13）；没有则 session 不可用并给出安装命令。
+SESSION_TMUX_SOCKET = "pyaissh"        # 专用 socket：与用户自己的 tmux 完全隔离
+SESSION_TMUX_PREFIX = "py-"            # 会话名映射前缀（见 _session_tmux_name）
+SESSION_TMUX_MIN_MAJOR = 3             # 主版本下限（依赖 window-size manual 与 #{pane_pipe}）
+SESSION_TMUX_BUFFER = "pyaissh-buf"    # load-buffer/paste-buffer 的缓冲名
+SESSION_TMUX_LOOP_INTERVAL = 300       # reaper --loop 的检查间隔（秒）
+SESSION_TMUX_REAP_LOG_MAX = 65536      # .reaper.log 超过此大小就截断（只留尾 200 行）
+_SESSION_TMUX = "tmux -L %s -f /dev/null" % SESSION_TMUX_SOCKET
 
-      ① 提示符空闲：`pgrep -P <会话 shell>` 为空（没有前台命令在跑）——构建/安装不会被误杀；
-      ② 距上次 pyaissh 交互超过 TTL：beat 文件里存的是 **epoch 秒**（每次交互由 `_session_touch` 写入）。
-    为什么独立进程而不是会话树内的一员：
-      - 会话是 `setsid nohup` 起的，看门狗也必须脱离发起它的那次 SSH 连接（否则 start 一返回
-        就随连接收到 SIGHUP 而死）；
-      - 独立进程不在会话树闭包内 ⇒ 它做清理时不会把自己先杀掉（能走完 TERM→KILL→校验）。
-    回收动作与 `kill` 同款：**自证**闭包（argv 含本会话目录才认，防 pid 回收误杀）→ 先删目录
-    （即使自己被信号打断也不留残留目录）→ TERM → 宽限 → KILL。
-    退出条件：会话目录消失（已被 kill/回收）就退，**不留常驻循环**。
-    beat 缺失/内容非法时只续期不回收（宁可多留也不误杀）。
 
-    **单进程实现（v2.3.0，设计 C）**：不再用外部 `sleep`，改用 bash 内建的
-    `read -t "$TICK" -u 9`（fd 9 = 自持读写的 `wd.fifo`，写端握在自己手里所以永不 EOF）——
-    每个会话因此只多 **1 个**进程（省掉 `sleep` 那 1.9 MB）。同时尽量用内建少 fork：
-    `B=$(<"$BPID")`（不 fork `cat`）、时间用 `$EPOCHSECONDS`（bash≥5，不 fork `date`；
-    老 bash 自动回落 `date +%s`）。回收路径每轮只剩 1 次 `pgrep`（`ps`/`awk` 只在真正回收时跑）。
+def _tpl(s, **kw):
+    """`@@KEY@@` 占位替换（bash 脚本模板专用：避开 `%` 与 `{}` 在 shell 文本里的坑）。"""
+    for k, v in kw.items():
+        s = s.replace("@@%s@@" % k, str(v))
+    return s
 
-    **防 spin 护栏**：`read -t` 若因 fd 异常而**立刻返回**，循环会变成忙循环（实测无护栏时
-    5 秒烧掉 ≈6 秒 CPU = 跑满一个核）。所以每轮用内建 `$SECONDS` 量耗时，连续 3 次"立刻返回"
-    就写一行 `wd.log` 并**退回外部 `sleep`**（此后再出问题也只是回到"2 个进程"的老形态，不会烧 CPU）。
 
-    **判闲的两个前提（都是实测踩出来的）**：
-      - shell pid 要在**判闲前重新读**一次：第一轮 tick 在 `read` 之前（约 0.4 s）`bash.pid` 还没写出来，
-        用空值会判成"没有命令在跑"——实测把正在 `sleep 40` 的会话误回收了（`--ttl 5`）。
-      - **pid 未知一律视为忙**（不回收）：没有 shell pid 就无法证明空闲，宁可多留也不误杀；
-        这种降级会话（init payload 没写成功）不会被空闲回收，`list` 会提示 shell pid 缺失。
+def _session_tmux_name(name):
+    """pyaissh 会话名 → tmux 会话名（纯函数，便于单测）。
+
+    为什么不能直接用原名：实测（S1）tmux 会把名字里的 `.`/`:` **静默改写成 `_`**——
+    `a.b` 建出来的会话在 `ls` 里叫 `a_b`，既与真实名字 `a_b` 撞名，又让 `=NAME` 精确匹配失效。
+    `py-<utf-8 hex>` 可逆、无碰撞、无 tmux 特殊字符。
     """
-    q = _sh_quote
-    return (
-        "#!/bin/bash\n"
-        "# pyaissh 空闲回收看门狗（自动生成；TTL=%d 秒，每 %d 秒检查一次；单进程实现）\n"
-        "D=%s; BEAT=%s; BPID=%s; SPID=%s; WPID=%s; META=%s; TTL=%d; TICK=%d; WDFIFO=%s\n"
-        "mkfifo -m 600 \"$WDFIFO\" 2>/dev/null || true\n"
-        "exec 9<>\"$WDFIFO\"          # 自持读写端：read -t 才有阻塞语义（写端在自己手里，不会 EOF）\n"
-        "FAST=0; P=\"\"; B=\"\"; M0=\"\"\n"
-        "\n"
-        "# 共用清理（TTL 到期与\"临终带走\"都走这里，只有一套实现）：\n"
-        "#   自证闭包（argv 必须仍含本会话目录**加斜杠** ⇒ 防 pid 被内核复用后误杀无关进程）→ 可选删目录 → TERM→KILL\n"
-        "#   用 \"$D/\" 而不是 \"$D\"：会话名互为前缀时（work 与 work2）后者会误匹配到另一个会话的进程\n"
-        "#   参数 rm ⇒ 连目录一起删（TTL 到期路径）；不带参数 ⇒ 目录已不在，只收进程（临终路径）\n"
-        "cleanup_tree() {\n"
-        "  T=\"\"; SEEN=\"\"; ROOTS=0; SNAP=$(ps -eo pid=,ppid=)\n"
-        "  for r in \"$P\" \"$B\" \"$(ps -o ppid= -p \"$B\" 2>/dev/null | tr -d ' ')\"; do\n"
-        "    [ -n \"$r\" ] || continue\n"
-        "    [ \"$r\" = \"$$\" ] && continue\n"
-        "    [ \"$r\" = 1 ] && continue\n"
-        "    case \" $SEEN \" in *\" $r \"*) continue ;; esac\n"
-        "    kill -0 \"$r\" 2>/dev/null || continue\n"
-        "    A=$(ps -o args= -p \"$r\" 2>/dev/null)\n"
-        "    case \"$A\" in *\"$D/\"*) ;; *) continue ;; esac\n"
-        "    SEEN=\"$SEEN $r\"; ROOTS=$((ROOTS+1))\n"
-        "    T=\"$T $(echo \"$SNAP\" | %s)\"\n"
-        "  done\n"
-        "  [ \"$ROOTS\" -gt 0 ] || return 1\n"
-        "  T=$(echo $T | tr ' ' '\\n' | sort -u -n | tr '\\n' ' ')\n"
-        "  [ \"$1\" = rm ] && rm -rf \"$D\"\n"
-        "  kill -TERM $T 2>/dev/null; sleep 0.5\n"
-        "  K=\"\"; for p in $T; do kill -0 \"$p\" 2>/dev/null && K=\"$K $p\"; done\n"
-        "  [ -n \"$K\" ] && kill -KILL $K 2>/dev/null\n"
-        "  return 0\n"
-        "}\n"
-        "\n"
-        "while :; do\n"
-        "  # ① 记 pid/meta（含第一轮，所以\"启动后 ~0 秒\"就记住了；$(<) 内建不 fork；\n"
-        "  #    空读不覆盖旧值——一次抖动不能丢掉临终带走的能力）\n"
-        "  if [ -r \"$SPID\" ]; then _pv=$(<\"$SPID\"); [ -n \"$_pv\" ] && P=$_pv; fi\n"
-        "  if [ -r \"$BPID\" ]; then _pv=$(<\"$BPID\"); [ -n \"$_pv\" ] && B=$_pv; fi\n"
-        "  if [ -r \"$META\" ]; then _pv=$(<\"$META\"); [ -n \"$_pv\" ] && [ -z \"$M0\" ] && M0=$_pv; fi\n"
-        "  # ② 归属自检（两道）：名字被新会话接管（watch.pid 在但不是自己）/ 会话被重建（meta 变了）\n"
-        "  #    ⇒ 立刻退出，绝不碰别人的会话（否则同名重建的老看门狗会把新会话收回）\n"
-        "  W=\"\"; [ -r \"$WPID\" ] && W=$(<\"$WPID\")\n"
-        "  [ -n \"$W\" ] && [ \"$W\" != \"$$\" ] && exit 0\n"
-        "  M=\"\"; [ -r \"$META\" ] && M=$(<\"$META\")\n"
-        "  [ -n \"$M0\" ] && [ -n \"$M\" ] && [ \"$M\" != \"$M0\" ] && exit 0\n"
-        "  # ③ 目录消失（且没被上述自检判定为\"别人的会话\"）⇒ 临终带走：\n"
-        "  #    有人 rm -rf 了会话目录时，把 starter/script/bash -i 一起收掉再自退，不留孤儿\n"
-        "  if [ ! -d \"$D\" ]; then cleanup_tree; exit 0; fi\n"
-        "  # ④ 正常一轮：内建睡眠（read -t + 自持 fd）+ 防 spin 护栏\n"
-        "  T0=$SECONDS\n"
-        "  read -t \"$TICK\" -r -u 9 _x\n"
-        "  if [ $((SECONDS - T0)) -lt 1 ]; then\n"
-        "    FAST=$((FAST+1))\n"
-        "    if [ \"$FAST\" -ge 3 ]; then\n"
-        "      echo \"guard: read -t 立刻返回，本会话退回 sleep\" >> \"$D/wd.log\" 2>/dev/null\n"
-        "      sleep \"$TICK\"; FAST=0\n"
-        "    fi\n"
-        "    continue\n"
-        "  fi\n"
-        "  NOW=${EPOCHSECONDS:-$(date +%%s)}\n"
-        "  # 判闲前**重新读一次** shell pid：第一轮在 read 之前（约 0.4s）bash.pid 还没被 init\n"
-        "  # payload 写出来，用那时的空值会判成\"没有命令在跑\"——实测把正在 sleep 40 的会话误回收了。\n"
-        "  # 另外：**pid 未知时一律视为忙**（没有 shell pid 就无法证明空闲，宁可多留也不误杀）\n"
-        "  if [ -r \"$BPID\" ]; then _pv=$(<\"$BPID\"); [ -n \"$_pv\" ] && B=$_pv; fi\n"
-        "  if [ -z \"$B\" ]; then printf '%%s\\n' \"$NOW\" > \"$BEAT\"; continue; fi\n"
-        "  if [ -n \"$(pgrep -P \"$B\" 2>/dev/null)\" ]; then printf '%%s\\n' \"$NOW\" > \"$BEAT\"; continue; fi\n"
-        "  LAST=\"\"; [ -r \"$BEAT\" ] && LAST=$(<\"$BEAT\")\n"
-        "  case \"$LAST\" in ''|*[!0-9]*) printf '%%s\\n' \"$NOW\" > \"$BEAT\"; continue ;; esac\n"
-        "  [ $((NOW - LAST)) -gt \"$TTL\" ] || continue\n"
-        "  cleanup_tree rm\n"
-        "  exit 0\n"
-        "done\n"
-        % (int(ttl), _SESSION_TTL_TICK, q(f["dir"]), q(f["beat"]), q(f["bash"]), q(f["pid"]),
-           q(f["watch"]), q(f["meta"]), int(ttl), _SESSION_TTL_TICK, q(f["wdfifo"]),
-           _SESSION_TREE_AWK % "$r"))
+    return SESSION_TMUX_PREFIX + name.encode("utf-8").hex()
 
 
-def _session_watchdog_launch_cmd(f, ttl):
-    """把看门狗脚本落成文件并以 setsid 独立进程启动（base64 传输，绕开所有引号问题）。
+def _session_tmux_decode(tmux_name):
+    """tmux 会话名 → pyaissh 会话名（不是本工具建的返回 None）。"""
+    if not tmux_name or not tmux_name.startswith(SESSION_TMUX_PREFIX):
+        return None
+    h = tmux_name[len(SESSION_TMUX_PREFIX):]
+    if not h or len(h) % 2:
+        return None
+    try:
+        nm = bytes.fromhex(h).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return nm if _SESSION_NAME_RE.match(nm) else None
 
-    TTL<=0 时返回空串（不装看门狗）。脚本落在会话目录内，随目录一起被清掉。
 
-    **两段式**（实测教训，两版都踩过）：
-      - 早先写成"整组后台任务"`{ printf ...; chmod ...; setsid ...; } &`：组里的 `printf | base64`
-        /`chmod` 继承了 SSH 通道的 stderr ⇒ 通道永不 EOF ⇒ paramiko 的 `recv_exit_status()` 一直等，
-        `session start` 20 秒超时误报 `session_failed`（会话其实起好了）。
-      - 改用 `{ ...; } >/dev/null 2>&1 </dev/null &` 修好了超时，但 `&&` 链整体被 `&` 后台化会多留一个
-        **wrapper 进程**（argv 继承 start 命令原文、以 init 为父、还要等看门狗退出才结束），
-        `watch.pid` 记的也是这个 wrapper 而不是看门狗本身 —— 实测 `ps --ppid` 才看见真正的看门狗。
-      ⇒ 现在：**先在前台把脚本写好**（管道 stderr 直接丢 /dev/null，写完全部进程即退出，不占通道），
-        再用**一条**自带三个重定向的后台命令启动看门狗。两段之间必须用 `;` 而不是 `&&` ——
-        写成 `printf … && chmod … && setsid … &` 时 `&` 会把整条 `&&` 链一起后台化，
-        又会变回"多一个 wrapper + 挂住通道"（实测踩过）。这样每个会话只多 **1 个**进程，
-        `watch.pid` 就是看门狗本人。
+def _session_tmux_pair(name):
+    """返回 (tmux 会话名, 会话级 target, pane 级 target)。
+
+    实测（S2）：pane 级命令（`pipe-pane`/`paste-buffer`/`display-message`/`send-keys`）
+    必须用 `=NAME:`，只给 `=NAME` 会报 `can't find pane`；而 `has-session`/`kill-session`
+    用 `=NAME`。`=` 前缀 = 精确匹配（防前缀误配）。
     """
-    if not ttl or ttl <= 0:
-        return ""
-    q = _sh_quote
-    b64 = base64.b64encode(_session_watchdog_script(f, ttl).encode("utf-8")).decode("ascii")
-    w = f["dir"] + "/watch.sh"
-    return ("printf %%s '%s' | base64 -d > %s 2>/dev/null; chmod 700 %s; "
-            "setsid nohup bash %s >/dev/null 2>&1 </dev/null & echo $! > %s; "
-            % (b64, q(w), q(w), q(w), q(f["watch"])))
+    tn = _session_tmux_name(name)
+    return tn, "=" + tn, "=" + tn + ":"
+
+
+# 所有远端操作共用的前置：tmux 存在性 + 版本闸门（不满足就打标记后 exit 0，
+# 由 Python 统一翻译成 tmux_missing / tmux_unsupported / tmux_failed）。
+_SESSION_TMUX_PROLOGUE = (
+    "command -v tmux >/dev/null 2>&1 || { echo __PYAISSH_SESS__TMUX=missing; exit 0; }; "
+    "TMV=$(tmux -V 2>/dev/null); TMV=${TMV#tmux }; MAJ=${TMV%%.*}; "
+    "case \"$MAJ\" in ''|*[!0-9]*) echo __PYAISSH_SESS__TMUX=badver; "
+    "echo \"__PYAISSH_SESS__TMUXV=$TMV\"; exit 0 ;; esac; "
+    "[ \"$MAJ\" -ge " + str(SESSION_TMUX_MIN_MAJOR) + " ] || { echo __PYAISSH_SESS__TMUX=oldver; "
+    "echo \"__PYAISSH_SESS__TMUXV=$TMV\"; exit 0; }; "
+    "TM=\"" + _SESSION_TMUX + "\"; "
+)
+
+
+def _session_tmux_gate(use_json, marks, extra=None):
+    """tmux 预检闸门：不满足就发错误并返回退出码；满足返回 None。
+
+    三种失败各自的 message 都**可直接执行**（装/升级 tmux 的确切命令），因为
+    session 模式现在显式依赖 tmux（用户 2026-09-24 决定）；装不了的环境用
+    `exec` / `exec --detach` 跑长任务（UPG-02）。
+    """
+    v = marks.get("TMUX")
+    if v in (None, "ok"):
+        return None
+    ver = marks.get("TMUXV") or "?"
+    ex = dict(extra or {})
+    if v == "missing":
+        emit_error(use_json, "tmux_missing",
+                   "远端没有 tmux：session 模式依赖 tmux（≥ %d.0）提供 PTY 与进程生命周期。"
+                   "装一个即可：Debian/Ubuntu `apt-get install -y tmux`｜"
+                   "RHEL/CentOS `dnf install -y tmux`｜Alpine `apk add tmux`；"
+                   "装不了（无包管理器/不可变系统）请改用 `exec` 或 `exec --detach` 跑长任务。"
+                   % SESSION_TMUX_MIN_MAJOR,
+                   extra=dict(ex, install_hint="apt-get install -y tmux",
+                              required="tmux >= %d.0" % SESSION_TMUX_MIN_MAJOR))
+        return 255
+    if v == "oldver":
+        emit_error(use_json, "tmux_unsupported",
+                   "远端 tmux 版本过低（%s，需要 ≥ %d.0）：本引擎依赖 `window-size manual` "
+                   "与 `#{pane_pipe}`。升级后重试（`apt-get install -y --only-upgrade tmux`）。"
+                   % (ver, SESSION_TMUX_MIN_MAJOR),
+                   extra=dict(ex, tmux_version=ver,
+                              required="tmux >= %d.0" % SESSION_TMUX_MIN_MAJOR))
+        return 255
+    emit_error(use_json, "tmux_failed", "无法解析远端 tmux 版本（`tmux -V` → %r）" % (ver,),
+               extra=dict(ex, tmux_version=ver))
+    return 255
+
+
+_SESSION_LS_TPL = """\
+@@PROLOGUE@@
+$TM ls -F '#{session_name}|#{pane_pid}|#{pane_current_command}|#{pane_pipe}|#{pane_tty}|#{session_created}|#{pane_width}|#{pane_height}' 2>/dev/null || echo __PYAISSH_SESS__NOSERVER=1
+"""
+
+
+def _session_ls_cmd():
+    """列本 socket 下所有 tmux 会话（带格式串）。没有 server 时打 NOSERVER 标记。"""
+    return _tpl(_SESSION_LS_TPL, PROLOGUE=_SESSION_TMUX_PROLOGUE)
+
+
+def _session_tmux_ls(client, timeout=20):
+    """一次 `tmux ls` → ({pyaissh 名: 会话信息}, 标记字典)。
+
+    名字反解失败（不是 `py-<hex>` 或 hex 非法）的一律无视——同一个 socket 上
+    只可能是本工具建的会话，但防御性过滤比误操作强。
+    """
+    rc, out, _err = _session_run(client, _session_ls_cmd(), timeout=timeout)
+    marks = dict(_SESSION_MARK_RE.findall(out))
+    sessions = {}
+
+    def _i(x):
+        return int(x) if (x or "").isdigit() else None
+
+    for ln in (out or "").splitlines():
+        parts = ln.strip().split("|")
+        if len(parts) < 5 or not parts[0].startswith(SESSION_TMUX_PREFIX):
+            continue
+        nm = _session_tmux_decode(parts[0])
+        if not nm:
+            continue
+        sessions[nm] = {"tmux": parts[0], "pane_pid": _i(parts[1]),
+                        "cur": (parts[2] or None), "pipe": (parts[3] or ""),
+                        "tty": (parts[4] or None),
+                        "created": _i(parts[5]) if len(parts) > 5 else None,
+                        "cols": _i(parts[6]) if len(parts) > 6 else None}
+    return sessions, marks
+
+
+_SESSION_START_TPL = """\
+@@PROLOGUE@@
+D='@@DIR@@'
+mkdir -p "$D" 2>/dev/null && chmod 700 "$D" 2>/dev/null || { echo __PYAISSH_SESS__MKDIR_FAIL=1; exit 0; }
+TN='@@TMUX@@'
+if $TM has-session -t "$TN" 2>/dev/null; then
+  echo __PYAISSH_SESS__EXISTS=1
+  echo "__PYAISSH_SESS__PID=$($TM display-message -p -t "$TN:" '#{pane_pid}' 2>/dev/null)"
+  echo "__PYAISSH_SESS__EXTTL=$(@@TTLREAD@@)"
+  exit 0
+fi
+@@SETENV@@
+rm -f '@@LOG@@' 2>/dev/null
+: > '@@LOG@@' 2>/dev/null; chmod 600 '@@LOG@@' 2>/dev/null
+printf '%s\\n' "$(date +%s)" > '@@BEAT@@' 2>/dev/null; chmod 600 '@@BEAT@@' 2>/dev/null
+printf '%s' '@@TMUX@@' > '@@TMFILE@@' 2>/dev/null; chmod 600 '@@TMFILE@@' 2>/dev/null
+printf '%s %s %s %s\\n' 1 @@COLS@@ "$(date +%s)" @@TTL@@ > '@@META@@' 2>/dev/null; chmod 600 '@@META@@' 2>/dev/null
+$TM new-session -d -s "$TN" -x @@COLS@@ -y 50 'bash -i' 2>/dev/null || { echo __PYAISSH_SESS__NEW_FAIL=1; exit 0; }
+$TM set-window-option -t "$TN:" window-size manual 2>/dev/null
+$TM pipe-pane -o -t "$TN:" 'cat >> @@LOG@@' 2>/dev/null || echo __PYAISSH_SESS__PIPE_FAIL=1
+sleep 0.3
+echo "__PYAISSH_SESS__PID=$($TM display-message -p -t "$TN:" '#{pane_pid}' 2>/dev/null)"
+echo __PYAISSH_SESS__CREATED=1
+"""
+
+
+def _session_start_cmd(f, tmux, cols, ttl, env_items):
+    """起会话的远端脚本：目录/记账文件 → 环境注入 → new-session → window-size → pipe-pane。
+
+    环境注入必须在 `new-session` **之前**（tmux server 的环境在 server 启动时冻结，
+    新会话继承 server 的全局环境）。实测（S12）：tmux 仍会强制 pane 的 `TERM`
+    （`tmux-256color`），这个我们不干预——它比继承来的空 TERM 更准确。
+    """
+    setenv = "".join("$TM set-environment -g %s %s 2>/dev/null; " % (_sh_quote(k), _sh_quote(v))
+                     for k, v in env_items)
+    return _tpl(_SESSION_START_TPL,
+                PROLOGUE=_SESSION_TMUX_PROLOGUE,
+                DIR=f["dir"], LOG=f["log"], BEAT=f["beat"], META=f["meta"],
+                TMUX=tmux, TMFILE=f["tmux"], COLS=int(cols), TTL=int(ttl or 0),
+                SETENV=setenv,
+                TTLREAD="awk '{print $4}' '%s' 2>/dev/null" % f["meta"])
 
 
 def _session_touch(client, f):
-    """刷新会话的"最后交互时间"——把 **epoch 秒写进 beat 文件**（空闲回收据此判断"没人用了"）。
+    """刷新会话的"最后交互时间"——beat 里写 **epoch 秒**（空闲回收据此判"没人用了"）。
 
-    v2.3.0 起写的是时间戳内容而不是单纯 `touch` mtime：看门狗可以用 bash 内建 `$(<beat)` 读它，
-    省掉每轮一次 `stat`（少一个 fork、也少一处 GNU `stat -c` 依赖）；`list` 仍按 mtime 计算
-    `idle_seconds`（写文件同样会更新 mtime，两边都成立）。
-
-    失败不致命（旧会话没有 beat 文件、或远端写入异常）：只记一条 WARN 到 stderr，
-    绝不让它影响正常调用。`list` 不算交互（看一眼不代表在用），故不调用本函数。
+    绝大多数命令的续期由 `_session_probe_cmd` 顺带完成（同一次 exec，不额外往返）；
+    本函数只给 `start --attach` 用。失败不致命（只记一条 stderr WARN）。
     """
-    rc, out, err = _session_run(
-        client,
-        "printf '%%s\\n' \"$(date +%%s)\" > %s 2>/dev/null || true" % _sh_quote(f["beat"]),
-        timeout=10)
-    if rc != 0 and err.strip():
+    rc, out, err = _session_run(client, _tpl(
+        "printf '%s\\n' \"$(date +%s)\" > @@BEAT@@ 2>/dev/null; "
+        "chmod 600 @@BEAT@@ 2>/dev/null", BEAT=_sh_quote(f["beat"])), timeout=10)
+    if rc != 0 and (err or "").strip():
         log("[WARN] 刷新会话活动时间失败（不影响本次调用）：%s" % err.strip()[:160])
     return rc == 0
 
 
-def _session_start_cmd(f, cols, no_pty=False, ttl=0):
-    """启动常驻会话的远端脚本（成功时输出 __PYAISSH_SESS__PID__<pid>__PTY__<0|1>）。
+_SESSION_PROBE_TPL = """\
+@@PROLOGUE@@
+TN='@@TMUX@@'
+if $TM has-session -t "$TN" 2>/dev/null; then
+  echo __PYAISSH_SESS__ALIVE=1
+  echo "__PYAISSH_SESS__PID=$($TM display-message -p -t "$TN:" '#{pane_pid}' 2>/dev/null)"
+  echo "__PYAISSH_SESS__TTY=$($TM display-message -p -t "$TN:" '#{pane_tty}' 2>/dev/null)"
+  echo "__PYAISSH_SESS__CUR=$($TM display-message -p -t "$TN:" '#{pane_current_command}' 2>/dev/null)"
+  PP=$($TM display-message -p -t "$TN:" '#{pane_pipe}' 2>/dev/null)
+  echo "__PYAISSH_SESS__PIPE=$PP"
+  if [ -f '@@LOG@@' ]; then
+    [ "$PP" = 1 ] || $TM pipe-pane -o -t "$TN:" 'cat >> @@LOG@@' 2>/dev/null
+  else
+    $TM pipe-pane -t "$TN:" 'cat >> @@LOG@@' 2>/dev/null && echo __PYAISSH_SESS__LOG_REARM=1
+  fi
+  @@TOUCH@@
+else
+  echo __PYAISSH_SESS__GONE=1
+fi
+"""
 
-    - setsid + nohup：脱离本连接，SSH 断开不影响
-    - `exec 9<>FIFO`：以**读写**方式持有 FIFO（否则写端每次关闭都会让读循环 EOF 退出）
-    - script -qfc：给会话真 PTY（stty -echo 关输入回显、固定列宽；exec bash -i 交互壳）
-    - 无 script 时降级为非 PTY 常驻 bash（状态与退出码都在，但没有 tty）
-    - ttl > 0：另起一个空闲回收看门狗（见 `_session_watchdog_script`），meta 第四字段记 TTL
+
+def _session_probe_cmd(f, tmux, touch=True):
+    """会话探测（ALIVE/GONE + pane pid/tty/前台命令/管道状态），可选顺手续期。
+
+    顺带自愈两件在服务器上可能发生的事（都实测过）：
+      - 管道死了（`#{pane_pipe}` != 1）⇒ `-o` 重新 arm（已有管道时是 no-op）；
+      - `out.log` 被外部删了（S5：管道还活着但在往已 unlink 的 inode 写，输出会静默丢）
+        ⇒ **不带 `-o`** 重新 arm，让 `cat >>` 重建文件；上层据此给 `log_recreated` 提示。
+    """
+    touch_cmd = ("printf '%s\\n' \"$(date +%s)\" > '@@BEAT@@' 2>/dev/null; "
+                 "chmod 600 '@@BEAT@@' 2>/dev/null")
+    return _tpl(_SESSION_PROBE_TPL, PROLOGUE=_SESSION_TMUX_PROLOGUE, TMUX=tmux,
+                LOG=f["log"], BEAT=f["beat"],
+                TOUCH=(_tpl(touch_cmd, BEAT=f["beat"]) if touch else ":"))
+
+
+_SESSION_PASTE_TPL = """\
+@@PROLOGUE@@
+TN='@@TMUX@@'
+if ! $TM has-session -t "$TN" 2>/dev/null; then echo __PYAISSH_SESS__GONE=1; exit 0; fi
+$TM load-buffer -b @@BUF@@ - 2>/dev/null || { echo __PYAISSH_SESS__LOAD_FAIL=1; exit 0; }
+$TM paste-buffer -b @@BUF@@ -d -t "$TN:" 2>/dev/null || { echo __PYAISSH_SESS__PASTE_FAIL=1; exit 0; }
+echo __PYAISSH_SESS__SENT=1
+"""
+
+
+def _session_paste_cmd(f, tmux, buffer_name=None):
+    """把 **stdin 的字节**灌进会话（命令载荷与 `keys` 共用这一条路径）。
+
+    为什么用 `load-buffer` + `paste-buffer` 而不是 `send-keys -l`：tmux 命令行会被它
+    自己再解析一遍（`;`、`#{`、引号都是它的语法），缓冲区内容则是纯数据、零引号风险，
+    而且二进制安全（`keys --cmd-file` 可以喂任意字节）。`-d` 用完即删缓冲，不在 server 里堆积。
+    """
+    return _tpl(_SESSION_PASTE_TPL, PROLOGUE=_SESSION_TMUX_PROLOGUE, TMUX=tmux,
+                BUF=(buffer_name or SESSION_TMUX_BUFFER))
+
+
+_SESSION_CTRL_C_TPL = """\
+@@PROLOGUE@@
+TN='@@TMUX@@'
+if ! $TM has-session -t "$TN" 2>/dev/null; then echo __PYAISSH_SESS__GONE=1; exit 0; fi
+PP=$($TM display-message -p -t "$TN:" '#{pane_pid}' 2>/dev/null)
+echo "__PYAISSH_SESS__PID=$PP"
+echo "__PYAISSH_SESS__SID=$PP"
+case "$PP" in ''|*[!0-9]*) echo __PYAISSH_SESS__NOPID=1; echo __PYAISSH_SESS__SIGNALED=0; echo __PYAISSH_SESS__DONE=1; exit 0;; esac
+FG=$(ps -o tpgid= -p "$PP" 2>/dev/null | tr -d ' ')
+CH=''; G=''; N=0
+if [ -n "$FG" ] && [ "$FG" != "$PP" ]; then
+  G="$FG"
+  CH=$(ps -eo pid=,pgid= 2>/dev/null | awk -v g="$FG" -v me="$PP" '$2==g && $1!=me {printf "%s ", $1}')
+  @@ACTION@@
+fi
+echo "__PYAISSH_SESS__GROUPS=$G"
+echo "__PYAISSH_SESS__CHILDREN=$CH"
+echo "__PYAISSH_SESS__SIGNALED=$N"
+echo __PYAISSH_SESS__DONE=1
+"""
+
+
+def _session_ctrl_c_cmd(f, tmux, force=False):
+    """中断会话里正在执行的命令。
+
+    实测（S8/S9）：`send-keys C-c` 由 pane 的 tty 行规程把 SIGINT 送到**前台进程组**，
+    这正是 Ctrl-C 的语义（`pane_current_command` 从 sleep 回到 bash）。
+    `--force` 走内核给出的前台进程组：`ps -o tpgid= -p <pane_pid>` + `kill -KILL -- -PGID`，
+    只杀那个作业、**会话与状态保留**（比 `C-\\`(SIGQUIT) 干净：不会 core dump 出大文件）。
+    """
+    action = ('kill -KILL -- "-$FG" 2>/dev/null && N=1 || N=0' if force
+              else '$TM send-keys -t "$TN:" C-c 2>/dev/null && N=1 || N=0')
+    return _tpl(_SESSION_CTRL_C_TPL, PROLOGUE=_SESSION_TMUX_PROLOGUE, TMUX=tmux, ACTION=action)
+
+
+_SESSION_KILL_TPL = """\
+@@PROLOGUE@@
+D='@@DIR@@'; HAD=0; [ -d "$D" ] && HAD=1
+TN='@@TMUX@@'; T=''; LEFT=0; SWEPT=0; ROOTS=0; KILLED=0; LEGACY=0
+if [ -e '@@LEGACY_FIFO@@' ] || [ -e '@@LEGACY_PID@@' ]; then LEGACY=1; fi
+P='@@PANE_PID@@'
+if [ -n "$P" ] && kill -0 "$P" 2>/dev/null; then
+  SNAP=$(ps -eo pid=,ppid= 2>/dev/null)
+  T=$(echo "$SNAP" | @@AWK@@)
+  T=$(echo $T | tr ' ' '\\n' | sort -u -n | tr '\\n' ' ')
+  SWEPT=$(echo $T | wc -w | tr -d ' ')
+  [ "$SWEPT" -gt 0 ] && ROOTS=1
+fi
+$TM kill-session -t "$TN" 2>/dev/null && KILLED=1
+i=0
+while $TM has-session -t "$TN" 2>/dev/null && [ "$i" -lt 20 ]; do sleep 0.1; i=$((i+1)); done
+if $TM has-session -t "$TN" 2>/dev/null; then echo __PYAISSH_SESS__STILL=1; fi
+if [ -n "$T" ]; then
+  kill -TERM $T 2>/dev/null; sleep 0.5
+  K=''; for p in $T; do kill -0 "$p" 2>/dev/null && K="$K $p"; done
+  if [ -n "$K" ]; then kill -KILL $K 2>/dev/null; sleep 0.3; fi
+  for p in $T; do kill -0 "$p" 2>/dev/null && LEFT=$((LEFT+1)); done
+fi
+rm -f '@@TMFILE@@' '@@TOKEN@@' 2>/dev/null
+@@RM@@
+echo "__PYAISSH_SESS__SWEPT=$SWEPT"
+echo "__PYAISSH_SESS__LEFT=$LEFT"
+echo "__PYAISSH_SESS__ROOTS=$ROOTS"
+echo "__PYAISSH_SESS__HAD=$HAD"
+echo "__PYAISSH_SESS__KILLED=$KILLED"
+echo "__PYAISSH_SESS__LEGACY=$LEGACY"
+echo __PYAISSH_SESS__CLEANED=1
+"""
+
+
+def _session_kill_cmd(f, tmux, keep_dir=False, pane_pid=None):
+    """结束会话：进程树闭包快照 → `kill-session` → 对幸存者 TERM→KILL → 校验 → 删目录。
+
+    闭包快照在 `kill-session` **之前**算（父进程被杀后子进程会被 reparent，事后再算会漏），
+    根用 tmux 给的 `pane_pid`（权威、无需自证）；快照覆盖 shell 与它的作业。
+    实测（S10）：已经 reparent 到 1 的脱离进程（`nohup setsid ...`）不在闭包里——与旧引擎
+    同款盲区，文档写明（BND-01）。
+    """
+    rm = "" if keep_dir else "rm -rf '%s' 2>/dev/null" % f["dir"]
+    return _tpl(_SESSION_KILL_TPL, PROLOGUE=_SESSION_TMUX_PROLOGUE, TMUX=tmux,
+                DIR=f["dir"], TMFILE=f["tmux"], TOKEN=f["token"],
+                LEGACY_FIFO=f["fifo"], LEGACY_PID=f["pid"],
+                PANE_PID=(pane_pid if pane_pid else ""),
+                AWK=(_SESSION_TREE_AWK % "$P"), RM=rm)
+
+
+_SESSION_REAP_BODY_TPL = """\
+ROOT='@@ROOT@@'
+TM="@@TM@@"
+NOW=$(date +%s)
+for d in "$ROOT"/*/; do
+  [ -d "$d" ] || continue
+  D=${d%/}; N=${D##*/}
+  case "$N" in ''|*[!A-Za-z0-9._-]*) continue ;; esac
+  TTL=0
+  [ -r "$D/meta" ] && TTL=$(awk '{print $4}' "$D/meta" 2>/dev/null)
+  case "$TTL" in ''|*[!0-9]*) continue ;; esac
+  [ "$TTL" -gt 0 ] || continue
+  B=''
+  [ -r "$D/beat" ] && B=$(cat "$D/beat" 2>/dev/null)
+  case "$B" in ''|*[!0-9]*) continue ;; esac
+  [ $((NOW - B)) -gt "$TTL" ] || continue
+  TN=''
+  [ -r "$D/tmux" ] && TN=$(cat "$D/tmux" 2>/dev/null)
+  if [ -z "$TN" ]; then continue; fi
+  if $TM has-session -t "=$TN" 2>/dev/null; then
+    CUR=$($TM display-message -p -t "=$TN:" '#{pane_current_command}' 2>/dev/null)
+    case "$CUR" in bash|sh|dash|zsh|ksh|-bash) ;; *) continue ;; esac
+    $TM kill-session -t "=$TN" 2>/dev/null
+  fi
+  rm -rf "$D" 2>/dev/null
+  printf '%s\\n' "reclaim $N idle=$((NOW - B))s ttl=${TTL}s at $NOW" >> "$ROOT/.reaper.log" 2>/dev/null
+done
+if [ -f "$ROOT/.reaper.log" ] && [ "$(wc -c < "$ROOT/.reaper.log" 2>/dev/null || echo 0)" -gt @@LOGMAX@@ ]; then
+  tail -n 200 "$ROOT/.reaper.log" > "$ROOT/.reaper.log.tmp" 2>/dev/null && mv "$ROOT/.reaper.log.tmp" "$ROOT/.reaper.log" 2>/dev/null
+fi
+"""
+
+
+def _session_reap_body(root, body=None):
+    """reaper 的单次清扫逻辑（纯文本生成，便于单测与内联复用）。
+
+    判据（与惰性扫一致）：`meta` 第 4 字段 TTL > 0；`beat` 过期 > TTL；
+    `tmux` 名文件存在（否则视为**旧引擎遗留目录**，不碰——UPG-01）；
+    会话里的前台命令是 shell（空闲）才回收，判不出就不收（宁可多留）。
+    """
+    return _tpl(body or _SESSION_REAP_BODY_TPL, ROOT=root, TM=_SESSION_TMUX,
+                LOGMAX=SESSION_TMUX_REAP_LOG_MAX)
+
+
+_SESSION_REAP_SCRIPT_TPL = """\
+#!/bin/bash
+# pyaissh 每主机 reaper（自动生成，勿手改；生成方：pyaissh session start）
+# 用法：reap.sh --once（扫一遍就退）｜reap.sh --loop（常驻，每 @@INTERVAL@@ 秒一遍，无会话目录自退）
+ROOT='@@ROOT@@'
+INTERVAL=@@INTERVAL@@
+LOOP=0
+[ "$1" = "--loop" ] && LOOP=1
+reap_once() {
+@@BODY@@
+}
+if [ "$LOOP" = 0 ]; then reap_once; exit 0; fi
+# pid 文件带**指纹**（pid + 间隔）：间隔变了说明这是上一代 reaper，由 ensure 侧收掉重起
+printf '%s %s\\n' "$$" "$INTERVAL" > "$ROOT/.reaper.pid" 2>/dev/null
+while :; do
+  reap_once
+  n=0
+  for d in "$ROOT"/*/; do [ -d "$d" ] && n=$((n+1)); done
+  if [ "$n" -eq 0 ]; then rm -f "$ROOT/.reaper.pid" 2>/dev/null; exit 0; fi
+  sleep "$INTERVAL"
+done
+"""
+
+
+def _session_reap_script(root):
+    """reaper 脚本全文（`--once` / `--loop` 两用）。"""
+    body = "\n".join("  " + ln for ln in _session_reap_body(root).splitlines())
+    return _tpl(_SESSION_REAP_SCRIPT_TPL, ROOT=root, BODY=body,
+                INTERVAL=_session_reap_interval())
+
+
+def _session_reap_sweep_cmd(root):
+    """惰性扫：把同一份 reaper 逻辑内联进 `bash -s` 跑一次（不依赖 reap.sh 是否存在）。"""
+    return _SESSION_TMUX_PROLOGUE + _session_reap_body(root) + "\necho __PYAISSH_SESS__REAPED=1\n"
+
+
+def _session_reaper_ensure_cmd(root, script_b64, interval):
+    """幂等拉起每主机 reaper，并**收敛到恰好一个**。
+
+    为什么需要收敛（实测踩到）：`start` 会重写 `reap.sh`（间隔/内容可能变），但**旧代的
+    reaper 进程还在 `sleep`**——它们既用旧间隔，又会同时扫同一批会话；反复 start 会攒出
+    好几个 reaper（实测一次冒烟里攒了 4 个），互相看不出对方。所以这里做三件事：
+      1. 落盘最新脚本；
+      2. 把**其它**正在跑的 `<root>/reap.sh --loop` 停掉（按 argv 自证是本 root 的，不是就跳过）；
+      3. 只有当"记名的 pid 活着 **且** argv 确实是本 root 的 reap.sh **且** 指纹（间隔）一致"
+         才认它活着；否则起新一代并写 pid 文件。
+
+    注意 `%` 只作用于后半段：prologue 里有 `${TMV%%.*}`，整段去格式化会把 `%%` 吃掉。
     """
     q = _sh_quote
-    pty_pref = "0" if no_pty else "1"
-    inner = ("exec 9<>%s; script -qfc 'stty -echo; stty cols %d rows 50; exec bash -i' %s <&9"
-             % (q(f["fifo"]), cols, q(f["log"])))
-    plain = ("exec 9<>%s; while IFS= read -r __l <&9; do eval \"$__l\"; done" % q(f["fifo"]))
-    return (
-        "umask 077; D=%s; " % q(f["dir"]) +
-        "if [ -f %s ] && kill -0 \"$(cat %s)\" 2>/dev/null; then "
-        "echo \"__PYAISSH_SESS__EXISTS=$(cat %s)\"; exit 0; fi; " % (q(f["pid"]), q(f["pid"]),
-                                                                    q(f["pid"])) +
-        "mkdir -p \"$D\" && chmod 700 \"$D\" || { echo __PYAISSH_SESS__MKDIR_FAIL=1; exit 1; }; " +
-        "[ -p %s ] || mkfifo -m 600 %s || { echo __PYAISSH_SESS__FIFO_FAIL=1; exit 1; }; " % (
-            q(f["fifo"]), q(f["fifo"])) +
-        "rm -f %s; : > %s; chmod 600 %s; " % (q(f["log"]), q(f["log"]), q(f["log"])) +
-        "if [ %s = 0 ]; then PTY=0; elif command -v script >/dev/null 2>&1; then PTY=1; else PTY=0; fi; " % pty_pref +
-        "if [ \"$PTY\" = 1 ]; then setsid nohup bash -c \"%s\" >>%s 2>&1 </dev/null & " % (
-            inner, q(f["err"])) +
-        # 非 PTY 分支必须把会话输出写进 out.log（早期误写成 err.log ⇒ out.log 永远为空、
-        # read/run 永远 running+空输出——实测 --no-pty 完全不可用）
-        "else setsid nohup bash -c '%s' >>%s 2>&1 </dev/null & fi; " % (plain, q(f["log"])) +
-        "echo $! > %s; sleep 0.4; " % q(f["pid"]) +
-        # beat 里写 epoch 秒（不是空文件）：看门狗用 $(<beat) 内建读它判闲，省掉每轮 stat
-        "printf '%%s\\n' \"$(date +%%s)\" > %s; chmod 600 %s 2>/dev/null; " % (
-            q(f["beat"]), q(f["beat"])) +
-        "printf '%%s %%s %%s %%s\\n' \"$PTY\" %d \"$(date +%%s)\" %d > %s; " % (cols, int(ttl or 0),
-                                                                               q(f["meta"])) +
-        "chmod 600 %s 2>/dev/null; " % q(f["meta"]) +
-        _session_watchdog_launch_cmd(f, ttl) +
-        "if kill -0 \"$(cat %s)\" 2>/dev/null; then "
-        "echo \"__PYAISSH_SESS__PID=$(cat %s)\"; echo \"__PYAISSH_SESS__PTY=$PTY\"; "
-        "else echo __PYAISSH_SESS__DEAD=1; exit 1; fi"
-        % (q(f["pid"]), q(f["pid"])))
+    body = ("D=%s; mkdir -p \"$D\" 2>/dev/null; chmod 700 \"$D\" 2>/dev/null; "
+            "printf %%s '%s' | base64 -d > \"$D/reap.sh\" 2>/dev/null; chmod 700 \"$D/reap.sh\"; "
+            "P=''; OLD=''; "
+            "if [ -r \"$D/.reaper.pid\" ]; then read -r P OLD < \"$D/.reaper.pid\" 2>/dev/null; fi; "
+            "ALIVE=0; "
+            "if [ -n \"$P\" ] && kill -0 \"$P\" 2>/dev/null && "
+            "ps -o args= -p \"$P\" 2>/dev/null | grep -qF \"$D/reap.sh\"; then ALIVE=1; fi; "
+            "KILLED=0; "
+            "for q in $(ps -eo pid=,args= 2>/dev/null | awk -v pat=\"$D/reap.sh --loop\" "
+            "'index($0, pat) {print $1}'); do "
+            "[ \"$q\" = \"$P\" ] && [ \"$ALIVE\" = 1 ] && continue; "
+            "kill \"$q\" 2>/dev/null && KILLED=$((KILLED+1)); done; "
+            "if [ \"$ALIVE\" = 1 ] && [ \"$OLD\" = \"%d\" ]; then echo __PYAISSH_SESS__REAPER=alive; "
+            "else [ -n \"$P\" ] && kill \"$P\" 2>/dev/null; "
+            "setsid nohup bash \"$D/reap.sh\" --loop </dev/null >/dev/null 2>&1 & "
+            "echo __PYAISSH_SESS__REAPER=started; fi; "
+            "echo \"__PYAISSH_SESS__REAPER_KILLED=$KILLED\"; "
+            "echo __PYAISSH_SESS__DONE=1"
+            % (q(root), script_b64, int(interval)))
+    return _SESSION_TMUX_PROLOGUE + body
 
 
-def _session_probe_cmd(f):
-    """会话状态探测：ALIVE / DEAD / MISSING（+ pid）。"""
+def _session_start_followup_cmd(root, script_b64):
+    """start 收尾（一次 exec 干两件事）：惰性扫一遍过期空闲会话 + 幂等拉起每主机 reaper。"""
+    return (_session_reap_sweep_cmd(root) + "\n"
+            + _session_reaper_ensure_cmd(root, script_b64, _session_reap_interval()) + "\n")
+
+
+def _session_sweep(client, root, timeout=25):
+    """惰性扫一遍：回收"过期且提示符空闲"的会话（REAP-02）。
+
+    为什么内联同一份 reaper 逻辑而不是调 `reap.sh`：脚本可能还没落盘（老会话/手工删过），
+    内联保证"任何一条会话子命令都能顺带回收"。失败只记 stderr，绝不影响本次调用。
+    """
+    try:
+        rc, out, err = _session_run(client, _session_reap_sweep_cmd(root), timeout=timeout)
+        if rc != 0 and (err or "").strip():
+            log("[WARN] 空闲回收扫描未完成（不影响本次调用）：%s" % err.strip()[:160])
+        return out
+    except Exception as e:
+        log("[WARN] 空闲回收扫描异常（不影响本次调用）：%s" % str(e)[:160])
+        return ""
+
+
+def _session_reaper_stop_cmd(root):
+    """没有任何会话了 ⇒ 把本主机的 reaper 收掉（"用完即净"）。
+
+    不做这一步的话，reaper 要等**下一轮**（最长一个间隔，默认 5 分钟）才发现"没会话了"而自退；
+    虽然只有 1 个进程，但收尾留一个后台进程不符合本工具的习惯。
+    只按 pid（且 argv 自证是本 root 的 `reap.sh`）与 argv 精确匹配停——不用 pkill 模式杀。
+    """
     q = _sh_quote
-    return ("if [ -f %s ]; then P=$(cat %s 2>/dev/null); "
-            "if [ -n \"$P\" ] && kill -0 \"$P\" 2>/dev/null; then echo \"__PYAISSH_SESS__ALIVE=$P\"; "
-            "else echo \"__PYAISSH_SESS__DEAD=$P\"; fi; else echo __PYAISSH_SESS__MISSING=1; fi"
-            % (q(f["pid"]), q(f["pid"])))
-
-
-def _session_send_cmd(f):
-    """从 stdin 读 base64 载荷写入 FIFO（timeout 5 兜住"无读者时 open 阻塞"）。"""
-    return 'timeout 5 sh -c "base64 -d > %s"' % _sh_quote(f["fifo"])
-
-
-def _session_keys_cmd(f):
-    """从 stdin 读**原始字节**写入 FIFO（应答提示、Ctrl-D 等）。"""
-    return 'timeout 5 sh -c "cat > %s"' % _sh_quote(f["fifo"])
+    body = ("D=%s; P=''; "
+            "if [ -r \"$D/.reaper.pid\" ]; then read -r P _ < \"$D/.reaper.pid\" 2>/dev/null; fi; "
+            "if [ -n \"$P\" ] && kill -0 \"$P\" 2>/dev/null && "
+            "ps -o args= -p \"$P\" 2>/dev/null | grep -qF \"$D/reap.sh\"; then "
+            "kill \"$P\" 2>/dev/null && echo __PYAISSH_SESS__REAPER=stopped; fi; "
+            "rm -f \"$D/.reaper.pid\" 2>/dev/null; "
+            "for q in $(ps -eo pid=,args= 2>/dev/null | awk -v pat=\"$D/reap.sh --loop\" "
+            "'index($0, pat) {print $1}'); do kill \"$q\" 2>/dev/null; done; "
+            "echo __PYAISSH_SESS__DONE=1" % q(root))
+    return _SESSION_TMUX_PROLOGUE + body
 
 
 # awk：求"以 root 为根的进程树闭包"（一次性快照；父进程被杀后孤儿会被 reparent，
@@ -374,144 +672,6 @@ _SESSION_TREE_AWK = (
     "for(i=0;i<12;i++){ for(k in pid){ p=pid[k]; if (p==root || s[pp[p]]==1) s[p]=1 } } "
     "for(k in pid){ p=pid[k]; if (s[p]==1) printf \"%%s \", p } }'"
 )
-
-
-def _session_ctrl_c_cmd(f, sig, escalate=True):
-    """中断会话里**正在执行的命令**：先对它的进程组发信号，幸存者升级为 TERM/KILL。
-
-    发现路径（不依赖 sid —— 实测 `script` 的子 shell 自己 setsid 成新会话，
-    starter 的 sid 与 pty 会话无关）：
-      bash.pid（会话 shell，start 时写入）→ `pgrep -P` 取**直接子进程**（= 前台 job）
-      → 若该子进程有独立进程组（PTY 下 job control）则整组发信号，否则按 pid 发
-
-    升级是必需的：实测 `kill -INT <sleep pid>` 返回成功但进程没死
-    （会话树由 `setsid nohup` 起，SIGINT 处置被继承为忽略），所以默认升级为 TERM。
-    """
-    q = _sh_quote
-    esc = ("sleep 0.7; K=\"\"; for p in $T; do kill -0 \"$p\" 2>/dev/null && K=\"$K $p\"; done; "
-           "if [ -n \"$K\" ]; then kill -TERM $K 2>/dev/null; echo \"__PYAISSH_SESS__ESCALATED=$K\"; "
-           "sleep 0.5; fi; "
-           if escalate else "")
-    return ("B=$(cat %s 2>/dev/null); "
-            "if [ -z \"$B\" ] || ! kill -0 \"$B\" 2>/dev/null; then echo __PYAISSH_SESS__DEAD=1; exit 0; fi; "
-            "S=$(ps -o sid= -p \"$B\" 2>/dev/null | tr -d ' '); "
-            "T=$(pgrep -P \"$B\" 2>/dev/null | tr '\\n' ' '); "
-            "echo \"__PYAISSH_SESS__CHILDREN=$T\"; "
-            "G=\"\"; N=0; "
-            "for c in $T; do g=$(ps -o pgid= -p \"$c\" 2>/dev/null | tr -d ' '); "
-            "if [ -n \"$g\" ] && [ \"$g\" != \"$S\" ]; then "
-            "case \" $G \" in *\" $g \"*) ;; *) G=\"$G $g\"; kill -%s -- \"-$g\" 2>/dev/null && N=$((N+1));; esac; "
-            "else kill -%s \"$c\" 2>/dev/null && N=$((N+1)); fi; done; "
-            "echo \"__PYAISSH_SESS__SID=$S\"; echo \"__PYAISSH_SESS__GROUPS=$G\"; "
-            "echo \"__PYAISSH_SESS__SIGNALED=$N\"; %s"
-            "echo __PYAISSH_SESS__DONE=1"
-            % (q(f["bash"]), sig, sig, esc))
-
-
-def _session_kill_cmd(f, keep_dir=False):
-    """结束会话：以**自证的会话进程**为根算进程树闭包 → TERM → 对幸存者 KILL → 校验。
-
-    为什么不用 sid：实测 `script` 的子 shell 自己 setsid 成**新会话**，starter 的 sid
-    与 pty 会话无关（早期版本按 sid 清理 ⇒ 会话其实没死、留下 sleep 孤儿）。
-    为什么先算集合：父进程被杀后子进程会被 reparent，事后再按树算会漏。
-
-    v2.3.0 加固（R1：不再无声误报"清干净"）：
-    - 根候选三个：`sess.pid`(starter) / `bash.pid`(会话 shell) / 会话 shell 的父进程(`script`)。
-      为什么加后两个：starter 若被 OOM/外力杀掉，`script` 与 `bash -i` 会被 reparent 到 1 号进程，
-      只按 sess.pid 算闭包得空集 ⇒ 旧版会报 swept=0/remaining=0/cleaned=true 而会话仍在跑；
-      此时从 `script`（argv 里带 out.log 路径）做根，闭包仍覆盖 script + bash -i + 正在跑的命令。
-    - 根必须**自证**：`ps -o args=` 里含本会话目录（bash -i 自己的 argv 没路径，故看它父进程）。
-      这同时堵住 pid 回收误杀——陈旧 pid 被无关进程复用时，argv 不含本会话目录 → 不作为根。
-    - `ROOTS=0`（三个候选都不可用/都不自证）时**不猜不杀**，输出 ROOTS=0 让上层把
-      `verified` 置 false 并给 warning（附自查命令），而不是宣称已清理。
-    - `HAD=1`（目录还在）：上层据此区分"会话本来就没起过"（不必告警）与"可能有孤儿"（告警）。
-    """
-    q = _sh_quote
-    rm = "" if keep_dir else "rm -rf %s" % q(f["dir"])
-    return ("D=%s; HAD=0; [ -d \"$D\" ] && HAD=1; "
-            "P=$(cat %s 2>/dev/null); B=$(cat %s 2>/dev/null); W=$(cat %s 2>/dev/null); "
-            "T=\"\"; SEEN=\"\"; ROOTS=0; SWEPT=0; LEFT=0; SNAP=$(ps -eo pid=,ppid=); "
-            "for r in \"$P\" \"$B\" \"$W\" \"$(ps -o ppid= -p \"$B\" 2>/dev/null | tr -d ' ')\"; do "
-            "[ -n \"$r\" ] || continue; [ \"$r\" = 1 ] && continue; "
-            "case \" $SEEN \" in *\" $r \"*) continue ;; esac; "
-            "kill -0 \"$r\" 2>/dev/null || continue; "
-            "A=$(ps -o args= -p \"$r\" 2>/dev/null); "
-            "case \"$A\" in *\"$D/\"*) ;; *) continue ;; esac; "
-            "SEEN=\"$SEEN $r\"; ROOTS=$((ROOTS+1)); T=\"$T $(echo \"$SNAP\" | %s)\"; "
-            "done; "
-            "T=$(echo $T | tr ' ' '\\n' | sort -u -n | tr '\\n' ' '); "
-            "SWEPT=$(echo $T | wc -w | tr -d ' '); "
-            "if [ -n \"$T\" ]; then "
-            "kill -TERM $T 2>/dev/null; sleep 0.6; "
-            "K=\"\"; for p in $T; do kill -0 \"$p\" 2>/dev/null && K=\"$K $p\"; done; "
-            "if [ -n \"$K\" ]; then kill -KILL $K 2>/dev/null; sleep 0.4; fi; "
-            "for p in $T; do kill -0 \"$p\" 2>/dev/null && LEFT=$((LEFT+1)); done; "
-            "fi; "
-            "echo \"__PYAISSH_SESS__SWEPT=$SWEPT\"; echo \"__PYAISSH_SESS__LEFT=$LEFT\"; "
-            "echo \"__PYAISSH_SESS__ROOTS=$ROOTS\"; echo \"__PYAISSH_SESS__HAD=$HAD\"; "
-            "rm -f %s %s %s; %s; echo __PYAISSH_SESS__CLEANED=1"
-            % (q(f["dir"]), q(f["pid"]), q(f["bash"]), q(f["watch"]), _SESSION_TREE_AWK % "$r",
-               q(f["pid"]), q(f["bash"]), q(f["watch"]), rm))
-
-
-def _session_orphan_candidates(ps_text, root, live_dirs):
-    """从 `ps -eo pid=,args=` 输出里挑出"**目录已不在**、但 argv 里还带着会话路径"的会话进程。
-
-    纯函数（便于单测）。三条同时成立才算孤儿：
-      ① argv 里出现 `<root>/<名字>/`，且名字过 `_SESSION_NAME_RE`（防路径穿越/误判）；
-      ② **看起来真是会话进程**——含 `script -qfc`（PTY 包装）／`<root>/<名字>/in`（starter 的 FIFO
-         路径）／`<root>/<名字>/watch.sh`（空闲回收看门狗）之一。
-         ③ 该名字的目录**不在** `live_dirs` 里（目录还在 ⇒ 走正常 kill 路径，不在这里重复处理）。
-
-    为什么②不能省：argv 里"提到"会话路径的进程很多（人肉 `tail -f .../out.log`、编辑器、
-    备份脚本），只按路径匹配就会误杀无关进程——这正是自证原则的延伸（argv 必须**以会话身份**出现）。
-
-    返回 `[(pid, 名字, 类型)]`（pid 去重）。
-    """
-    pref = root.rstrip("/") + "/"
-    out, seen = [], set()
-    for line in (ps_text or "").splitlines():
-        parts = line.strip().split(None, 1)
-        if len(parts) != 2 or not parts[0].isdigit():
-            continue
-        pid, args = int(parts[0]), parts[1]
-        if pid in seen or pref not in args:
-            continue
-        name = args.split(pref, 1)[1].split("/", 1)[0]
-        if not _SESSION_NAME_RE.match(name) or name in live_dirs:
-            continue
-        d = pref + name
-        if "script -qfc" in args:
-            kind = "pty-wrapper"
-        elif d + "/in" in args:
-            kind = "starter"
-        elif d + "/watch.sh" in args:
-            kind = "watchdog"
-        else:
-            continue            # 只是"提到"路径的无关进程：不动
-        seen.add(pid)
-        out.append((pid, name, kind))
-    return out
-
-
-def _session_pid_kill_cmd(pid):
-    """按给定 pid 的**进程树闭包** TERM→KILL（孤儿清理用）。
-
-    pid 已经由 argv 扫描自证过身份，所以这里不需要再判一遍；闭包是为了连带清掉
-    `script` 的 pty 子 shell 与它正在跑的命令（孤儿场景里这些正是残留主体）。
-    """
-    return ("SNAP=$(ps -eo pid=,ppid=); T=$(echo \"$SNAP\" | %s); "
-            "T=$(echo $T | tr ' ' '\\n' | sort -u -n | tr '\\n' ' '); "
-            "SWEPT=$(echo $T | wc -w | tr -d ' '); LEFT=0; "
-            "if [ -n \"$T\" ]; then "
-            "kill -TERM $T 2>/dev/null; sleep 0.5; "
-            "K=\"\"; for p in $T; do kill -0 \"$p\" 2>/dev/null && K=\"$K $p\"; done; "
-            "[ -n \"$K\" ] && kill -KILL $K 2>/dev/null; sleep 0.3; "
-            "for p in $T; do kill -0 \"$p\" 2>/dev/null && LEFT=$((LEFT+1)); done; "
-            "fi; "
-            "echo \"__PYAISSH_SESS__SWEPT=$SWEPT\"; echo \"__PYAISSH_SESS__LEFT=$LEFT\"; "
-            "echo __PYAISSH_SESS__DONE=1"
-            % (_SESSION_TREE_AWK % str(int(pid))))
 
 
 def _session_clean_text(s, strip_ansi=True):
@@ -676,12 +836,13 @@ def _fmt_age(sec):
     return "%.1f 小时" % (sec / 3600.0)
 
 
-def _session_info(client, f, sftp=None):
+def _session_info(client, f, sftp=None, tmux_info=None):
     """读会话元信息：pid / pty / cols / started_at / age_seconds / ttl_seconds /
     idle_seconds（距上次交互）/ log_bytes / mtime —— `list` 与 `start --attach` 共用。
 
-    缺什么就少什么字段，**绝不抛**（会话可能正好被回收/删除）。`alive`/`status` 由调用方补
-    （list 用一次批量探测，attach 分支已由 EXISTS 证明存活）。
+    缺什么就少什么字段，**绝不抛**（会话可能正好被回收/删除）。`alive`/`status` 由调用方补。
+    `tmux_info` 是 `_session_tmux_ls` 给的那条会话记录：pid/shell_pid 由它来（tmux 权威），
+    `meta` 只负责 pty/cols/started_at/ttl（字段格式与旧引擎一致）。
     """
     info = {}
     own = sftp is None
@@ -691,12 +852,11 @@ def _session_info(client, f, sftp=None):
         except Exception:
             return info
     try:
-        try:
-            with sftp.open(f["pid"], "r") as fh:
-                t = fh.read().decode("utf-8", "replace").strip()
-            info["pid"] = int(t) if t.isdigit() else t
-        except Exception:
-            pass
+        if tmux_info:
+            info["pid"] = tmux_info.get("pane_pid")
+            info["shell_pid"] = tmux_info.get("pane_pid")
+            if tmux_info.get("cur"):
+                info["current_command"] = tmux_info["cur"]
         try:
             with sftp.open(f["meta"], "r") as fh:
                 parts = fh.read().decode("utf-8", "replace").split()
@@ -705,7 +865,7 @@ def _session_info(client, f, sftp=None):
                 if len(parts) > 1 and parts[1].isdigit():
                     info["cols"] = int(parts[1])
                 if len(parts) > 2 and parts[2].isdigit():
-                    # meta 第三字段 = start 时的 epoch 秒（此前只用于 age，现在也报 TTL）
+                    # meta 第三字段 = start 时的 epoch 秒（用于 age）
                     info["started_at"] = int(parts[2])
                     info["age_seconds"] = max(0, int(time.time()) - int(parts[2]))
                 if len(parts) > 3 and parts[3].isdigit():
@@ -714,15 +874,21 @@ def _session_info(client, f, sftp=None):
         except Exception:
             pass
         try:
-            st = sftp.stat(f["beat"])
-            info["idle_seconds"] = max(0, int(time.time()) - int(st.st_mtime or 0))
+            with sftp.open(f["beat"], "r") as fh:
+                b = fh.read().decode("utf-8", "replace").strip()
+            info["idle_seconds"] = max(0, int(time.time()) - int(b)) if b.isdigit() else None
+        except Exception:
+            try:
+                # 兼容：早期/异常情况下 beat 只有 mtime 语义
+                st = sftp.stat(f["beat"])
+                info["idle_seconds"] = max(0, int(time.time()) - int(st.st_mtime or 0))
+            except Exception:
+                pass
+        try:
+            with sftp.open(f["tmux"], "r") as fh:
+                info["tmux_session"] = fh.read().decode("utf-8", "replace").strip() or None
         except Exception:
             pass
-        try:
-            with sftp.open(f["bash"], "r") as fh:
-                info["shell_pid"] = fh.read().decode("utf-8", "replace").strip() or None
-        except Exception:
-            info["shell_pid"] = None      # 降级会话：看门狗判不了闲（它把"pid 未知"视为忙）
         try:
             st = sftp.stat(f["log"])
             info["log_bytes"] = st.st_size
@@ -738,8 +904,49 @@ def _session_info(client, f, sftp=None):
     return info
 
 
+def _session_env_items():
+    """当前 SSH 通道环境里值得注入 tmux 全局环境的变量（tmux server 环境在启动时冻结）。"""
+    out = []
+    for k in ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TZ", "TERM"):
+        v = os.environ.get(k)
+        if v:
+            out.append((k, v))
+    return out
+
+
+def _session_ready_wait(client, f, tmux, init, timeout):
+    """发初始化载荷并等它的哨兵；失败时**自愈一次**（探测重 arm 管道 → 重发 → 再等）。
+
+    返回 (ready, wait_seconds, warnings)。第一次等不到就探测一下：`out.log` 被删/管道
+    死掉时探测会重新 arm（实测 S5：管道活着但文件被删会静默丢输出），然后再给一次机会。
+    """
+    warns = []
+    for attempt in (1, 2):
+        token = _session_send_payload(client, f, tmux, init)
+        if not token:
+            warns.append("初始化载荷未能写入会话（tmux load-buffer/paste-buffer 失败）")
+            return False, 0.0, warns
+        sftp = open_sftp(client)
+        try:
+            _d, _sz, rc_r, _tok, el = _session_poll_sentinel(
+                sftp, f["log"], 0, token, timeout, interval=0.2)
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+        if rc_r is not None:
+            return True, el, warns
+        if attempt == 1:
+            _prc, pout, _perr = _session_run(client, _session_probe_cmd(f, tmux, touch=False),
+                                             timeout=15)
+            if "LOG_REARM" in dict(_SESSION_MARK_RE.findall(pout)):
+                warns.append("out.log 曾被删除，已重建输出镜像（log_recreated）")
+    return False, 0.0, warns
+
+
 def cmd_session_start(args):
-    """起一个常驻会话（真 PTY）：setsid + script + FIFO（v2.3.0 起带空闲回收 TTL）。
+    """起一个常驻会话（真 PTY；引擎 = tmux，见 SPEC_session_tmux.md）。
 
     `--attach`：同名会话还活着就**接上**（不新建），返回 attached=true + pid/age；
     会话不存在（或被空闲回收）则正常新建并返回 attached=false。
@@ -755,29 +962,38 @@ def cmd_session_start(args):
         emit_error(args.json, "bad_args", terr)
         return 2
     f = _session_files(root, name)
+    tmux, _tgt_s, _tgt_p = _session_tmux_pair(name)
     conn, client, conn_ec = _connect_exec(args)
     if conn_ec is not None:
         return conn_ec
     try:
-        rc, out, err = _session_run(client, _session_start_cmd(f, args.cols, args.no_pty, ttl),
-                                    timeout=max(20, args.timeout + 10))
-        marks = _SESSION_MARK_RE.findall(out)
-        kinds = [k for k, _ in marks]
-        if "EXISTS" in kinds:
-            ex_pid = dict((k, v) for k, v in marks).get("EXISTS")
+        rc, out, err = _session_run(
+            client, _session_start_cmd(f, tmux, args.cols, ttl, _session_env_items()),
+            timeout=max(20, args.timeout + 10))
+        marks = dict(_SESSION_MARK_RE.findall(out))
+        ec = _session_tmux_gate(args.json, marks, {"session": name, "dir": f["dir"]})
+        if ec is not None:
+            return ec
+        warnings = []
+        if args.no_pty:
+            warnings.append("--no-pty 已废弃（tmux 引擎永远提供 PTY）：本次仍是 **PTY** 会话")
+        if "EXISTS" in marks:
+            ex_pid = marks.get("PID")
             if args.attach:
                 # 接上旧会话：刷新活动时间（别让它刚接上就被空闲回收）
                 _session_touch(client, f)
-                extra = _session_info(client, f)
+                extra = _session_info(client, f,
+                                      tmux_info={"pane_pid": int(ex_pid) if str(ex_pid).isdigit()
+                                                 else None})
                 result = {
                     "ok": True, "action": "session", "version": VERSION, "session": name,
-                    "attached": True, "dir": f["dir"], "fifo": f["fifo"], "log": f["log"],
+                    "attached": True, "dir": f["dir"], "fifo": None, "log": f["log"],
                     "pid": int(ex_pid) if str(ex_pid).isdigit() else ex_pid,
                     "ready": True, "ttl_seconds": extra.get("ttl_seconds"),
                     "age_seconds": extra.get("age_seconds"),
                     "idle_seconds": extra.get("idle_seconds"),
                     "host": conn["host"], "user": conn["user"], "port": conn["port"],
-                    "warnings": [],
+                    "warnings": warnings,
                     "next_action": ("已接上仍在运行的会话 %r（状态——cwd/变量——都保留）："
                                     "直接 session run/send/read 继续；要重开先 session kill"
                                     % name),
@@ -796,48 +1012,40 @@ def cmd_session_start(args):
                        extra={"session": name, "dir": f["dir"], "pid": ex_pid,
                               "attach_hint": "session start --attach 可自动接上"})
             return 2
-        for bad, why in (("MKDIR_FAIL", "无法创建会话目录（权限/磁盘）"),
-                         ("FIFO_FAIL", "无法创建 FIFO"), ("DEAD", "会话进程启动后立即退出")):
-            if bad in kinds:
-                emit_error(args.json, "session_failed", "启动会话失败：%s" % why,
+        for bad, why, etype in (("MKDIR_FAIL", "无法创建会话目录（权限/磁盘）", "session_failed"),
+                                ("NEW_FAIL", "tmux 无法创建会话（server 起不来？）", "tmux_failed")):
+            if bad in marks:
+                emit_error(args.json, etype, "启动会话失败：%s" % why,
                            extra={"session": name, "dir": f["dir"], "stderr": err[-400:]})
                 return 255
-        pid = dict((k, v) for k, v in marks).get("PID")
-        pty = dict((k, v) for k, v in marks).get("PTY", "1") == "1"
-        if pid is None:
+        pid = marks.get("PID")
+        if not pid:
             emit_error(args.json, "session_failed",
                        "启动会话失败：未取得会话进程号（远端输出见 stderr）",
                        extra={"session": name, "stdout": out[-400:], "stderr": err[-400:]})
             return 255
+        if "PIPE_FAIL" in marks:
+            warnings.append("输出镜像（tmux pipe-pane）未能建立：session read/run 可能读不到输出；"
+                            "可 session kill 后重开，或检查 tmux 的临时目录权限")
 
-        # 就绪确认：发一条初始化命令并等它的哨兵（同时验证 FIFO 通路、记录会话 shell pid）
-        init = "PS1=; PS2=; stty -echo 2>/dev/null || true; echo $$ > %s" % _sh_quote(f["bash"])
-        token = _session_send_payload(client, f, init, plain=not pty)
-        ready, wait_s = False, 0.0
-        if token:
-            sftp = open_sftp(client)
-            try:
-                off = 0
-                _d, _sz, rc_r, _tok, el = _session_poll_sentinel(
-                    sftp, f["log"], off, token, max(2, args.wait_ready), interval=0.2)
-                ready = rc_r is not None
-                wait_s = el
-            finally:
-                try:
-                    sftp.close()
-                except Exception:
-                    pass
+        # 就绪确认：初始化载荷（关回显/去 bracketed paste 噪音）+ 等它的哨兵
+        init = ('PS1=; PS2=; stty -echo 2>/dev/null || true; '
+                'bind "set enable-bracketed-paste off" 2>/dev/null || true')
+        ready, wait_s, w2 = _session_ready_wait(client, f, tmux, init, max(2, args.wait_ready))
+        warnings.extend(w2)
+
         result = {
             "ok": True, "action": "session", "version": VERSION, "session": name,
             "attached": False,
-            "dir": f["dir"], "fifo": f["fifo"], "log": f["log"],
+            "dir": f["dir"], "fifo": None, "log": f["log"],
             "pid": int(pid) if str(pid).isdigit() else pid,
-            "pty": pty, "cols": args.cols, "ready": ready, "ready_wait_ms": int(wait_s * 1000),
+            "pty": True, "cols": args.cols, "ready": ready, "ready_wait_ms": int(wait_s * 1000),
             "ttl_seconds": ttl if ttl and ttl > 0 else None,
             "idle_seconds": 0,
             "host": conn["host"], "user": conn["user"], "port": conn["port"],
-            "permissions": {"dir": "0700", "fifo": "0600", "out.log": "0600", "meta": "0600"},
-            "warnings": [],
+            "permissions": {"dir": "0700", "out.log": "0600", "meta": "0600",
+                            "beat": "0600", "tmux": "0600"},
+            "warnings": warnings,
             "next_action": ("会话已就绪。逐条执行：pyaissh session send <target> --name %s --cmd '...'，"
                             "再用 session read 读结果（见 next_offset）；中断执行中的命令：session ctrl-c；"
                             "收尾：session kill" % name),
@@ -847,16 +1055,19 @@ def cmd_session_start(args):
             result["next_action"] += ("。**空闲回收**：提示符空闲且 %s 内没有任何 pyaissh 交互"
                                       "（send/run/read/ctrl-c/keys）就会自动回收（进程 + 目录），"
                                       "需要保活就 --ttl 0" % _fmt_age(ttl))
+            # 拉起每主机 reaper（幂等）+ 顺手惰性扫一遍过期空闲会话（REAP-02/03）
+            try:
+                b64 = base64.b64encode(_session_reap_script(root).encode("utf-8")).decode("ascii")
+                _session_run(client, _session_start_followup_cmd(root, b64), timeout=40)
+            except Exception as e:
+                result["warnings"].append("空闲回收 reaper 未能拉起（不影响本次会话）：%s"
+                                          % str(e)[:120])
         else:
             result["warnings"].append("空闲回收已关闭（--ttl 0）：会话会一直留着，用完记得 session kill")
-        if not pty:
-            result["warnings"].append(
-                "远端没有 util-linux `script`（或指定了 --no-pty）：本次为**非 PTY** 会话——"
-                "状态与退出码照常，但没有 tty（需要 TTY 的程序不可用；ctrl-c 退化为对子进程发信号）")
         if not ready:
             result["warnings"].append("会话就绪确认超时（哨兵未出现）：请用 session read 查看 out.log 首屏")
-        _emit_result(args, result, header="[SESSION %s pid=%s pty=%s] %s"
-                     % (name, pid, pty, f["dir"]))
+        _emit_result(args, result, header="[SESSION %s pid=%s tmux=%s] %s"
+                     % (name, pid, tmux, f["dir"]))
         return 0
     except KeyboardInterrupt:
         emit_error(args.json, "interrupted", _interrupt_msg())
@@ -871,54 +1082,38 @@ def cmd_session_start(args):
         close_all(client)
 
 
-def _session_payload_text(cmd, token, plain=False):
-    """命令 → 写入 FIFO 的载荷文本（纯函数，便于单测）。
+def _session_payload_text(cmd, token):
+    """命令 → 灌进会话的载荷文本（纯函数，便于单测）。
 
-    两种形态（v2.3.0 修正）：
-    - **PTY 模式**（默认）：`{ ...; }; echo 哨兵`。要点：哨兵必须与命令**在同一行被 shell 解析**，
-      否则命令里从终端读取的语句（`read -p`）会把紧随其后的哨兵行当输入吃掉（实测踩过）。
-      用 `{}` 而非 `()`：大括号是同一个 shell，cd/export 状态照常保留。
-      多行形态在 PTY 下没问题——但**行的长度必须短**（tty 规范模式单行上限 ~4096B），
-      所以长命令不要拼成一行。
-    - **非 PTY 降级模式**（`plain=True`）：`eval "$(printf %s '<b64>' | base64 -d)"; echo 哨兵`。
-      降级模式的读取循环是**逐行 eval**，多行载荷会被拆成多段（`{` 单独一行直接 syntax error，
-      哨兵永不出现 —— 实测 `--no-pty` 完全不可用）。base64 保证是**一行**，且 eval 在同一 shell
-      里执行 ⇒ 状态保留 + 多行命令 + 长命令都不受限。
+    形态：`\\n{\\n<命令>\\n}; echo "哨兵__$?"\\n`。要点（两条都是实测踩出来的）：
+    - 哨兵必须与命令**在同一行被 shell 解析**（`}; echo 哨兵` 那一行）：命令里从终端读取的
+      语句（`read -p`）会把紧随其后的**独立行**当输入吃掉，哨兵就永不出现（`run` 卡在 running）。
+    - 用 `{}` 而非 `()`：大括号是同一个 shell，`cd`/`export`/函数等状态照常保留。
 
-    v2.3.0 加固（R2）：载荷**以换行开头**。本地如果在上一次写入的**半途**断线（关机/断网/被杀），
-    远端的 tty 行规程里会留下**没有换行的半行**；下一次写入会与它**串成同一行**——
-    实测后果是语法错误且**哨兵永不出现**（`run` 只能回 running/无 exit_code，AI 被卡住）。
+    R2 加固：载荷**以换行开头**。本地若在上一次写入的半途断线（关机/断网/被杀），远端 tty 的
+    行规程里会留下**没有换行的半行**，下一次写入会与它串成同一行 ⇒ 语法错误且哨兵永不出现。
     前置一个换行先把那半行终结掉（它作为一条垃圾命令执行、报错留在 out.log），
-    之后真正的载荷在干净的输入行里解析 ⇒ 哨兵照常出现，AI 至少能拿到退出码并从输出看出异常。
+    之后真正的载荷在干净的输入行里解析 ⇒ 哨兵照常出现，AI 至少能拿到退出码。
+
+    （tmux 引擎下这一层完全不变：载荷经 `paste-buffer` 原样灌入 pane 的输入流，
+    与旧引擎写 FIFO 的字节流等价。）
     """
     body = cmd.rstrip("\n")
-    if plain:
-        b64 = base64.b64encode(body.encode("utf-8")).decode("ascii")
-        return "\neval \"$(printf %%s '%s' | base64 -d)\"; echo \"%s%s__$?\"\n" % (
-            b64, SESSION_RC_PREFIX, token)
     return "\n{\n%s\n}; echo \"%s%s__$?\"\n" % (body, SESSION_RC_PREFIX, token)
 
 
-def _session_pty_mode(sftp, f):
-    """会话是否 PTY 模式（读 start 时写的 meta：`<pty> <cols> <started_at>`）。
+def _session_send_payload(client, f, tmux, cmd, token=None):
+    """把「命令 + 退出码哨兵」灌进会话（tmux `load-buffer` + `paste-buffer`）。返回 token。
 
-    读不到（老会话/异常）时按 PTY 处理（默认路径）。
+    与旧引擎的差别只有传输方式：以前是 base64 写 FIFO，现在是**原样字节**走 tmux 缓冲区
+    （tmux 缓冲区是数据通道，不经过它自己的命令行解析，二进制安全）。
     """
-    try:
-        with sftp.open(f["meta"], "r") as fh:
-            parts = fh.read().decode("utf-8", "replace").split()
-        return parts[0] == "1" if parts else True
-    except Exception:
-        return True
-
-
-def _session_send_payload(client, f, cmd, token=None, plain=False):
-    """把「命令 + 退出码哨兵」写进会话 FIFO。返回 token（失败返回 None）。"""
     token = token or os.urandom(4).hex()
-    payload = _session_payload_text(cmd, token, plain=plain)
-    b64 = base64.b64encode(payload.encode("utf-8"))
-    rc, _out, _err = _session_run(client, _session_send_cmd(f), stdin_data=b64, timeout=15)
-    return token if rc == 0 else None
+    payload = _session_payload_text(cmd, token)
+    rc, out, _err = _session_run(client, _session_paste_cmd(f, tmux),
+                                 stdin_data=payload.encode("utf-8"), timeout=20)
+    marks = dict(_SESSION_MARK_RE.findall(out))
+    return token if (rc == 0 and "SENT" in marks) else None
 
 
 def _session_tail_lines(text, n):
@@ -936,38 +1131,72 @@ def _session_tail_lines(text, n):
 
 
 def _session_load(args, root, name, need_alive=True):
-    """公共前置：校验名字 → 连接 → 探测会话。返回 (conn, client, f, pid, alive, ec)。"""
+    """公共前置：校验名字 → 连接 → 探测会话（顺手续期）→ 惰性扫。
+
+    返回 `(conn, client, f, tmux, pid, alive, ec)`（tmux = tmux 会话名）。
+
+    「会话不在」分两种（字段口径与旧引擎一致）：
+      - 目录里连 `meta` 都没有 ⇒ `session_not_found`（从没起过，或已被空闲回收）；
+      - `meta` 在但 tmux 会话没了 ⇒ `session_dead`（在会话里敲了 `exit`、被人 `kill-session`、
+        或旧引擎遗留目录）——状态不可恢复，提示用 `kill` 清目录后重开。
+    """
     if not _session_check_name(args.json, name):
-        return None, None, None, None, False, 2
+        return None, None, None, None, None, False, 2
     f = _session_files(root, name)
+    tmux, _tgt_s, _tgt_p = _session_tmux_pair(name)
     conn, client, conn_ec = _connect_exec(args)
     if conn_ec is not None:
-        return None, None, None, None, False, conn_ec
-    rc, out, _err = _session_run(client, _session_probe_cmd(f), timeout=15)
+        return None, None, None, None, None, False, conn_ec
+    rc, out, _err = _session_run(client, _session_probe_cmd(f, tmux), timeout=15)
     marks = dict(_SESSION_MARK_RE.findall(out))
-    if "MISSING" in marks:
-        emit_error(args.json, "session_not_found",
-                   "找不到会话 %r（%s 不存在）：可能从没起过，或**已被空闲回收**"
-                   "（默认提示符空闲 %s 就自动收，`--ttl 0` 可关）——"
-                   "用 pyaissh session start --name %s 重建（要接上还活着的旧会话用 --attach），"
-                   "或先用 pyaissh session list 看现有会话"
-                   % (name, f["pid"], _fmt_age(_SESSION_TTL_DEFAULT), name),
-                   extra={"session": name, "dir": f["dir"],
-                          "ttl_default_seconds": _SESSION_TTL_DEFAULT})
+    ec = _session_tmux_gate(args.json, marks, {"session": name, "dir": f["dir"]})
+    if ec is not None:
         close_all(client)
-        return None, None, None, None, False, 2
+        return None, None, None, None, None, False, ec
+    if "LOG_REARM" in marks:
+        log("[WARN] 会话 %r 的 out.log 曾被删除，已重建输出镜像（log_recreated）" % name)
+    if "PIPE" in marks and marks["PIPE"] not in ("1", ""):
+        log("[WARN] 会话 %r 的输出镜像未生效（pane_pipe=%s），已尝试重新 arm"
+            % (name, marks["PIPE"]))
     alive = "ALIVE" in marks
-    pid = marks.get("ALIVE") or marks.get("DEAD")
-    if need_alive and not alive:
-        emit_error(args.json, "session_dead",
-                   "会话 %r 的进程已消失（pid %s）：会话状态不可恢复，"
-                   "用 pyaissh session kill 清理残留目录后重新 start" % (name, pid),
-                   extra={"session": name, "pid": int(pid) if str(pid).isdigit() else pid,
-                          "dir": f["dir"]})
+    pid = marks.get("PID")
+    if not alive:
+        sftp = open_sftp(client)
+        try:
+            has_meta = _session_remote_exists(sftp, f["meta"])
+            legacy = (_session_remote_exists(sftp, f["pid"])
+                      or _session_remote_exists(sftp, f["fifo"]))
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+        if not has_meta:
+            emit_error(args.json, "session_not_found",
+                       "找不到会话 %r（%s 不存在）：可能从没起过，或**已被空闲回收**"
+                       "（默认提示符空闲 %s 就自动收，`--ttl 0` 可关）——"
+                       "用 pyaissh session start --name %s 重建（要接上还活着的旧会话用 --attach），"
+                       "或先用 pyaissh session list 看现有会话"
+                       % (name, f["dir"], _fmt_age(_SESSION_TTL_DEFAULT), name),
+                       extra={"session": name, "dir": f["dir"],
+                              "ttl_default_seconds": _SESSION_TTL_DEFAULT})
+            close_all(client)
+            return None, None, None, None, None, False, 2
+        msg = ("会话 %r 的 tmux 会话已消失（在会话里 `exit`、被人 kill-session，或宿主重启）："
+               "会话状态不可恢复——用 pyaissh session kill --name %s 清理残留目录后重新 start"
+               % (name, name))
+        if legacy:
+            msg += ("。（检测到**旧引擎遗留目录**：sess.pid/in 但没有 tmux 会话——"
+                    "这台机器上的会话是 tmux 引擎迁移之前起的，pyaissh 不接管它）")
+        emit_error(args.json, "session_dead", msg,
+                   extra={"session": name, "dir": f["dir"], "pid": None})
         close_all(client)
-        return None, None, None, None, False, 2
-    _session_touch(client, f)      # 交互即续期：别让正在用的会话被空闲回收
-    return conn, client, f, pid, alive, None
+        return None, None, None, None, None, False, 2
+    if need_alive is False:
+        return conn, client, f, tmux, pid, alive, None
+    # 目标已续期（探测脚本里写 beat）⇒ 现在扫其它会话是安全的（REAP-02：先续期再扫）
+    _session_sweep(client, root)
+    return conn, client, f, tmux, pid, alive, None
 
 
 def cmd_session_send(args):
@@ -977,7 +1206,7 @@ def cmd_session_send(args):
     cmd = _session_resolve_cmd(args)
     if cmd is None:
         return 2
-    conn, client, f, pid, _alive, ec = _session_load(args, root, args.name or "main")
+    conn, client, f, tmux, pid, _alive, ec = _session_load(args, root, args.name or "main")
     if ec is not None:
         return ec
     try:
@@ -987,12 +1216,11 @@ def cmd_session_send(args):
                 log_bytes = _session_sftp_read(sftp, f["log"], 0, 0)[1]
             except Exception:
                 log_bytes = 0
-            token = _session_send_payload(client, f, cmd,
-                                          plain=not _session_pty_mode(sftp, f))
+            token = _session_send_payload(client, f, tmux, cmd)
             if token is None:
                 emit_error(args.json, "send_failed",
-                           "命令未能写入会话 FIFO（会话可能刚退出或 FIFO 无读者）",
-                           extra={"session": args.name, "fifo": f["fifo"]})
+                           "命令未能灌进会话（tmux load-buffer/paste-buffer 失败：会话可能刚退出）",
+                           extra={"session": args.name, "tmux": tmux})
                 return 255
             # 记下"最近这条命令"的 token：read --wait-rc 不带 --token 时用它定位，
             # 否则会拿历史哨兵立刻返回"已完成"（实测踩过）；写失败要在结果里留痕——
@@ -1099,7 +1327,7 @@ def cmd_session_run(args):
                    "--wait-rc 上限 %d 秒（宿主单次调用约 600s；更久请稍后 read 轮询）"
                    % SESSION_WAIT_MAX)
         return 2
-    conn, client, f, pid, _alive, ec = _session_load(args, root, args.name or "main")
+    conn, client, f, tmux, pid, _alive, ec = _session_load(args, root, args.name or "main")
     if ec is not None:
         return ec
     try:
@@ -1109,12 +1337,11 @@ def cmd_session_run(args):
                 offset = _session_sftp_read(sftp, f["log"], 0, 0)[1]
             except Exception:
                 offset = 0
-            token = _session_send_payload(client, f, cmd,
-                                          plain=not _session_pty_mode(sftp, f))
+            token = _session_send_payload(client, f, tmux, cmd)
             if token is None:
                 emit_error(args.json, "send_failed",
-                           "命令未能写入会话 FIFO（会话可能刚退出或 FIFO 无读者）",
-                           extra={"session": args.name, "fifo": f["fifo"]})
+                           "命令未能灌进会话（tmux load-buffer/paste-buffer 失败：会话可能刚退出）",
+                           extra={"session": args.name, "tmux": tmux})
                 return 255
             _session_write_token(sftp, f, token)
             wait = 0 if args.no_wait else (args.wait_rc or SESSION_RUN_WAIT)
@@ -1197,7 +1424,7 @@ def cmd_session_read(args):
         emit_error(args.json, "bad_args",
                    "--wait-rc 上限 %d 秒（宿主单次调用约 600s；更久请稍后轮询）" % SESSION_WAIT_MAX)
         return 2
-    conn, client, f, pid, _alive, ec = _session_load(args, root, args.name or "main")
+    conn, client, f, tmux, pid, _alive, ec = _session_load(args, root, args.name or "main")
     if ec is not None:
         return ec
     try:
@@ -1297,21 +1524,48 @@ def cmd_session_read(args):
 
 
 def cmd_session_ctrl_c(args):
-    """中断会话里正在执行的命令（对它的进程组发 SIGINT；--force 用 SIGKILL）。"""
+    """中断会话里正在执行的命令（tmux 注入 C-c；`--force` = SIGKILL 前台进程组）。"""
     start = time.time()
     root = getattr(args, "session_dir", None) or DEFAULT_SESSION_DIR
     name = args.name or "main"
-    conn, client, f, pid, _alive, ec = _session_load(args, root, name)
+    conn, client, f, tmux, pid, _alive, ec = _session_load(args, root, name)
     if ec is not None:
         return ec
     try:
         sig = "KILL" if args.force else "INT"
-        rc, out, err = _session_run(client, _session_ctrl_c_cmd(f, sig), timeout=20)
+        rc, out, err = _session_run(client, _session_ctrl_c_cmd(f, tmux, force=args.force),
+                                    timeout=20)
         marks = dict(_SESSION_MARK_RE.findall(out))
         groups = [g for g in (marks.get("GROUPS") or "").split() if g]
         children = [p for p in (marks.get("CHILDREN") or "").split() if p]
+        # tmux 引擎不再需要"INT 无效就升级 TERM"那条路（tty 行规程会正确投递 SIGINT），
+        # 但字段保留且恒空——AI 侧零感知（见 SPEC C3）。
         escalated = [p for p in (marks.get("ESCALATED") or "").split() if p]
         n = int(marks.get("SIGNALED") or 0)
+        injected = None
+        if n:
+            # 被中断的命令**不会自己产出哨兵**（bash 收到 SIGINT 后丢弃当前命令行，实测两次），
+            # 于是正等着 `read --wait-rc --token X` 的调用方会一直 running。这里**代它补一条**
+            # 哨兵（退出码与信号一致：INT→130、KILL→137），让等待方收敛——保持旧引擎的可用体感。
+            # 只对 `last.token`（最近一条命令）补：中断的几乎总是它。
+            code = 137 if args.force else 130
+            try:
+                sftp = open_sftp(client)
+                try:
+                    lt = _session_last_token(sftp, f)
+                finally:
+                    try:
+                        sftp.close()
+                    except Exception:
+                        pass
+                if lt:
+                    raw = '\necho "%s%s__%d"\n' % (SESSION_RC_PREFIX, lt, code)
+                    _irc, iout, _ierr = _session_run(client, _session_paste_cmd(f, tmux),
+                                                     stdin_data=raw.encode("utf-8"), timeout=20)
+                    if "SENT" in dict(_SESSION_MARK_RE.findall(iout)):
+                        injected = {"token": lt, "exit_code": code}
+            except Exception as e:
+                log("[WARN] 补发被中断命令的哨兵失败（不影响中断本身）：%s" % str(e)[:120])
         result = {
             "ok": True, "action": "session", "version": VERSION, "session": name,
             "signal": sig, "signaled_groups": groups, "signaled_children": children,
@@ -1321,19 +1575,18 @@ def cmd_session_ctrl_c(args):
             "host": conn["host"], "user": conn["user"], "port": conn["port"],
             "warnings": [], "duration_ms": int((time.time() - start) * 1000),
         }
-        if escalated:
-            result["warnings"].append(
-                "SIGINT 后仍有存活进程（%s），已升级为 SIGTERM——本会话树由 setsid+nohup 起，"
-                "SIGINT 处置可能被继承为忽略；要更狠用 --force（SIGKILL）" % " ".join(escalated))
         if n == 0:
-            result["hint"] = ("会话内当前没有前台命令在跑（可能空闲）——用 session read 确认输出；"
-                              "命令若刚被中断，其退出码（130/143）会在哨兵里")
+            result["hint"] = ("会话内当前没有前台命令在跑（可能空闲）——用 session read 确认输出")
             result["next_action"] = "先 session read --offset <上次 next_offset> 看当前状态"
         else:
-            result["next_action"] = ("已向 %d 个进程组发 %s；用 session read 确认命令已中止、"
-                                     "会话仍存活（状态保留，可直接发下一条）" % (n, sig))
-        _emit_result(args, result, header="[SESSION %s] %s -> %d groups"
-                     % (name, sig, n))
+            tail = ""
+            if injected:
+                tail = ("。已代被中断的命令补发退出码哨兵（token=%s，exit=%d）——"
+                        "正在等它的 read --wait-rc 会收敛" % (injected["token"], injected["exit_code"]))
+            result["next_action"] = ("已中断 %s 个前台进程组（%s）：用 session read 看输出后直接发下一条%s"
+                                     % (len(groups) or n, sig, tail))
+        _emit_result(args, result, header="[SESSION %s] %s -> %s groups"
+                     % (name, sig, len(groups) or n))
         return 0
     except KeyboardInterrupt:
         emit_error(args.json, "interrupted", _interrupt_msg())
@@ -1372,15 +1625,16 @@ def cmd_session_keys(args):
     else:
         emit_error(args.json, "bad_args", "需 --data '文本'（支持 \\n \\r \\t \\xNN 转义）或 --cmd-file")
         return 2
-    conn, client, f, pid, _alive, ec = _session_load(args, root, name)
+    conn, client, f, tmux, pid, _alive, ec = _session_load(args, root, name)
     if ec is not None:
         return ec
     try:
-        rc, _out, _err = _session_run(client, _session_keys_cmd(f), stdin_data=payload, timeout=15)
-        if rc != 0:
+        rc, out, _err = _session_run(client, _session_paste_cmd(f, tmux),
+                                     stdin_data=payload, timeout=20)
+        if rc != 0 or "SENT" not in dict(_SESSION_MARK_RE.findall(out)):
             emit_error(args.json, "keys_failed",
-                       "按键/文本未能写入会话（会话可能刚退出或 FIFO 无读者）",
-                       extra={"session": name, "fifo": f["fifo"]})
+                       "按键/文本未能灌进会话（tmux load-buffer/paste-buffer 失败：会话可能刚退出）",
+                       extra={"session": name, "tmux": tmux})
             return 255
         result = {
             "ok": True, "action": "session", "version": VERSION, "session": name,
@@ -1413,32 +1667,56 @@ def cmd_session_list(args):
     if conn_ec is not None:
         return conn_ec
     try:
+        # 先扫再取数据：否则"刚被扫掉的会话"还会出现在后面合并进来的 tmux 列表里
+        # （表现为"目录缺失的活会话"假警报——实测踩过）
+        _session_sweep(client, root)
+        ls_map, marks = _session_tmux_ls(client)
+        ec = _session_tmux_gate(args.json, marks, {})
+        if ec is not None:
+            return ec
         sftp = open_sftp(client)
         try:
             try:
                 entries = sftp.listdir_attr(root)
             except IOError:
                 entries = []
-            sessions, pids = [], []
+            names = []
             for e in sorted(entries, key=lambda x: x.filename):
-                if not stat.S_ISDIR(e.st_mode or 0):
-                    continue
-                name = e.filename
-                if not _SESSION_NAME_RE.match(name):
-                    continue
+                if stat.S_ISDIR(e.st_mode or 0) and _SESSION_NAME_RE.match(e.filename):
+                    names.append(e.filename)
+            sessions = []
+            for name in names:
                 f = _session_files(root, name)
-                s = _session_info(client, f, sftp=sftp)
+                ent = ls_map.get(name)
+                s = _session_info(client, f, sftp=sftp, tmux_info=ent)
                 s.update({"session": name, "log": f["log"], "dir": f["dir"]})
-                sessions.append(s)
-                if isinstance(s.get("pid"), int):
-                    pids.append(s["pid"])
-            alive = _alive_map(client, pids) if pids else {}
-            for s in sessions:
-                s["alive"] = alive.get(s["pid"]) if isinstance(s["pid"], int) else None
-                s["status"] = ("running" if s["alive"] else "dead") if s["pid"] else "unknown"
+                s["alive"] = bool(ent)
+                s["status"] = "running" if ent else "dead"
+                if ent:
+                    s.setdefault("pid", ent.get("pane_pid"))
+                    s.setdefault("shell_pid", ent.get("pane_pid"))
+                else:
+                    s.setdefault("pid", None)
+                    s.setdefault("shell_pid", None)
+                    # 旧引擎遗留（sess.pid/in 还在）与"正常退出"要分开说，处置建议不同
+                    if (_session_remote_exists(sftp, f["pid"])
+                            or _session_remote_exists(sftp, f["fifo"])):
+                        s["legacy_engine"] = True
                 # 空闲回收进度（AI 据此判断"还能放多久"）：ttl - idle 就是剩余保活时间
                 if s.get("ttl_seconds") and s.get("idle_seconds") is not None:
                     s["expires_in_seconds"] = max(0, s["ttl_seconds"] - s["idle_seconds"])
+                sessions.append(s)
+            # tmux 里有、目录却没有（会话目录被外部删过）：也要能看见，否则"看不见的活会话"
+            for name in sorted(set(ls_map) - set(names)):
+                ent = ls_map[name]
+                fx = _session_files(root, name)
+                sessions.append({"session": name, "alive": True, "status": "running",
+                                 "pid": ent.get("pane_pid"), "shell_pid": ent.get("pane_pid"),
+                                 "cols": ent.get("cols"), "pty": True,
+                                 "tmux_session": ent.get("tmux"),
+                                 "current_command": ent.get("cur"),
+                                 "dir": fx["dir"], "log": fx["log"],
+                                 "session_dir_missing": True})
             result = {"ok": True, "action": "session", "version": VERSION,
                       "session_dir": root, "sessions": sessions, "count": len(sessions),
                       "host": conn["host"], "user": conn["user"], "port": conn["port"],
@@ -1463,13 +1741,23 @@ def cmd_session_list(args):
                         "会话 %s 即将因空闲被回收（剩余 %s；想留住就发一条命令或 --ttl 0 重开）"
                         % (",".join("%s(%s)" % (s["session"], _fmt_age(s["expires_in_seconds"]))
                                     for s in near), _fmt_age(near[0]["expires_in_seconds"])))
-                degraded = [s for s in sessions if s.get("status") == "running"
-                            and not s.get("shell_pid")]
-                if degraded:
+                legacy = [s["session"] for s in sessions if s.get("legacy_engine")]
+                if legacy:
                     result["warnings"].append(
-                        "会话 %s 缺 shell pid（bash.pid）——看门狗无法判断\"命令是否在跑\"，"
-                        "因此**空闲回收对它不生效**（宁可不收也不误杀）：用完请 session kill"
-                        % ",".join(s["session"] for s in degraded))
+                        "会话 %s 的目录是**旧引擎（tmux 迁移之前）遗留**的（有 sess.pid/in 却没有 "
+                        "tmux 会话）：pyaissh 不接管它，用 session kill 清掉后重新 start"
+                        % ",".join(legacy))
+                dead = [s["session"] for s in sessions
+                        if s.get("status") == "dead" and not s.get("legacy_engine")]
+                if dead:
+                    result["warnings"].append(
+                        "会话 %s 的 tmux 会话已不存在（在会话里 `exit` 过？）："
+                        "用 session kill 清理残留目录" % ",".join(dead))
+                nodir = [s["session"] for s in sessions if s.get("session_dir_missing")]
+                if nodir:
+                    result["warnings"].append(
+                        "会话 %s 还活着但目录缺失（会话目录被外部删了）：read/run 可能读不到输出，"
+                        "建议 kill 后重开" % ",".join(nodir))
             else:
                 result["next_action"] = "还没有会话：session start <target> [--name main]"
         finally:
@@ -1493,7 +1781,11 @@ def cmd_session_list(args):
 
 
 def cmd_session_kill(args):
-    """结束会话：按进程树闭包（sess.pid + bash.pid + script，各自证）TERM→校验→KILL，默认连目录一起删。"""
+    """结束会话：tmux `kill-session` + 进程树闭包 TERM→KILL→校验，默认连目录一起删。
+
+    `orphans` / `orphans_total` / `orphan_remaining_total` **恒返回且恒空**：tmux 引擎下
+    "目录没了但进程还在"的结构性孤儿不复存在（进程归 tmux 管），但字段保留——AI 侧零感知。
+    """
     start = time.time()
     root = getattr(args, "session_dir", None) or DEFAULT_SESSION_DIR
     if not args.all and not args.name:
@@ -1503,6 +1795,10 @@ def cmd_session_kill(args):
     if conn_ec is not None:
         return conn_ec
     try:
+        ls_map, marks0 = _session_tmux_ls(client)
+        ec = _session_tmux_gate(args.json, marks0, {})
+        if ec is not None:
+            return ec
         if args.all:
             names = []
             sftp = open_sftp(client)
@@ -1511,11 +1807,13 @@ def cmd_session_kill(args):
                     for e in sftp.listdir_attr(root):
                         if not _SESSION_NAME_RE.match(e.filename):
                             continue
-                        # 只认"看起来真是会话"的目录（有 sess.pid 或 FIFO），
+                        # 只认"看起来真是会话"的目录（tmux 名文件 / meta / 旧引擎 sess.pid 或 FIFO），
                         # 避免把 --session-dir 指向共享目录时误删别人的东西
                         f = _session_files(root, e.filename)
-                        if _session_remote_exists(sftp, f["pid"]) or \
-                                _session_remote_exists(sftp, f["fifo"]):
+                        if (_session_remote_exists(sftp, f["tmux"])
+                                or _session_remote_exists(sftp, f["meta"])
+                                or _session_remote_exists(sftp, f["pid"])
+                                or _session_remote_exists(sftp, f["fifo"])):
                             names.append(e.filename)
                 except IOError:
                     names = []
@@ -1524,86 +1822,93 @@ def cmd_session_kill(args):
                     sftp.close()
                 except Exception:
                     pass
+            # tmux 里活着但目录缺失的会话也要一并收掉（否则 --all 之后还留着活会话）
+            names.extend(n for n in ls_map if n not in names)
         else:
             if not _session_check_name(args.json, args.name):
                 return 2
             names = [args.name]
-        killed, results = 0, []
+        results = []
         for name in names:
             f = _session_files(root, name)
-            rc, out, kerr = _session_run(client, _session_kill_cmd(f, args.keep_dir), timeout=40)
+            tmux, _s, _p = _session_tmux_pair(name)
+            pane_pid = (ls_map.get(name) or {}).get("pane_pid")
+            rc, out, kerr = _session_run(
+                client, _session_kill_cmd(f, tmux, args.keep_dir, pane_pid=pane_pid), timeout=40)
             marks = dict(_SESSION_MARK_RE.findall(out))
+            ec2 = _session_tmux_gate(args.json, marks, {"session": name, "dir": f["dir"]})
+            if ec2 is not None:
+                return ec2
             left = int(marks.get("LEFT") or 0)
             swept = int(marks.get("SWEPT") or 0)
             roots = int(marks.get("ROOTS") or 0)
             had_dir = marks.get("HAD") == "1"
-            killed += 1
+            legacy = marks.get("LEGACY") == "1"
             entry = {"session": name, "swept": swept, "remaining": left, "roots": roots,
                      "dir": f["dir"],
                      "cleaned": (marks.get("CLEANED") == "1") and not args.keep_dir,
-                     # verified=真的确认过"会话进程已不在"：找到过自证的根、且没有幸存者。
-                     # swept=0 不再等于"清干净"（旧版会因此误报，见 _session_kill_cmd docstring）
+                     # verified=真的确认过"会话进程已不在"：拿到过 pane_pid 且没有幸存者。
+                     # swept=0 不等于"清干净"（旧版会因此误报）
                      "verified": bool(roots) and left == 0}
-            if not roots and had_dir:
-                entry["note"] = ("没找到可自证的会话进程（sess.pid/bash.pid 缺失或进程已消失）："
-                                 "可能有 reparent 后的孤儿，请自查 "
-                                 "ps -eo pid,ppid,tty,args | grep -E 'script -qfc|pyaissh-sessions'")
+            if marks.get("KILLED") == "1":
+                entry["tmux_killed"] = True
+            if legacy:
+                entry["legacy_engine"] = True
+                entry["note"] = ("该目录来自**旧引擎（tmux 迁移之前）**：没有 tmux 会话可关，"
+                                 "只清理了目录；若疑似还有旧进程，请自查 "
+                                 "`ps -eo pid,args | grep -E 'script -qfc|pyaissh-sessions'`")
+            elif not roots and had_dir:
+                entry["note"] = ("没拿到 pane pid（会话已先一步消失/被外部 kill）：无法核对进程树，"
+                                 "按 tmux/会话语义应已无残留；如需自查："
+                                 "`ps -eo pid,ppid,tty,args | grep pyaissh-sessions`")
             results.append(entry)
             if rc != 0 and not marks:
                 results[-1]["note"] = (kerr or out or "")[-200:]
 
-        # ---- 按 argv 扫孤儿（v2.3.0）：目录已不在、但命令行里还带着会话路径的会话进程 ----
-        # 为什么需要：手工 `rm -rf` 掉会话目录（或半清理）后，进程失去 pid 记录，而上面的
-        # 逐目录枚举看不见它们 ⇒ 永久残留。这里按 argv **自证身份**（starter 的 FIFO 路径 /
-        # `script -qfc` / `watch.sh`）挑出来，再用"该 pid 的进程树闭包" TERM→KILL。
-        # 只为"目录已不在"的会话做（目录还在 = 正常路径已处理，避免重复杀与误杀）。
+        # 会话全清了就把 reaper 也收掉（否则它要挂到下一轮才发现"没会话了"）
+        try:
+            _sftp2 = open_sftp(client)
+            try:
+                left_dirs = [e.filename for e in _sftp2.listdir_attr(root)
+                             if stat.S_ISDIR(e.st_mode or 0)
+                             and _SESSION_NAME_RE.match(e.filename)]
+            finally:
+                try:
+                    _sftp2.close()
+                except Exception:
+                    pass
+        except Exception:
+            left_dirs = ["?"]        # 读不到就保守处理：不动 reaper
+        if not left_dirs:
+            try:
+                _rrc, rout, _rerr = _session_run(client, _session_reaper_stop_cmd(root), timeout=15)
+                if "REAPER=stopped" in (rout or ""):
+                    log("[SESSION KILL] 已停掉本主机的空闲回收 reaper（没有会话了）")
+            except Exception:
+                pass
+
+        # 结构性孤儿在 tmux 引擎下不复存在（进程生命周期归 tmux）；字段保留且恒空
         orphans = []
-        scan_rc, scan_out, _scan_err = _session_run(client, "ps -eo pid=,args=", timeout=20)
-        if scan_rc == 0:
-            _cands = _session_orphan_candidates(scan_out, root, set(names))
-            if args.name:
-                _cands = [c for c in _cands if c[1] == args.name]
-            for _pid, _nm, _kind in _cands:
-                rc2, out2, _ = _session_run(client, _session_pid_kill_cmd(_pid), timeout=30)
-                marks2 = dict(_SESSION_MARK_RE.findall(out2))
-                orphans.append({"session": _nm, "via": "argv-scan", "kind": _kind, "pid": _pid,
-                                "swept": int(marks2.get("SWEPT") or 0),
-                                "remaining": int(marks2.get("LEFT") or 0),
-                                "verified": marks2.get("DONE") == "1"
-                                            and int(marks2.get("LEFT") or 0) == 0})
-                if rc2 != 0 and not marks2:
-                    orphans[-1]["note"] = (out2 or "")[-160:]
         result = {"ok": True, "action": "session", "version": VERSION,
                   "sessions": results, "count": len(results),
                   "remaining_total": sum(r["remaining"] for r in results),
                   "verified_total": sum(1 for r in results if r.get("verified")),
+                  "orphans": orphans, "orphans_total": 0, "orphan_remaining_total": 0,
                   "host": conn["host"], "user": conn["user"], "port": conn["port"],
                   "warnings": [], "duration_ms": int((time.time() - start) * 1000)}
-        if orphans:
-            result["orphans"] = orphans
-            result["orphans_total"] = len(orphans)
-            result["orphan_remaining_total"] = sum(o["remaining"] for o in orphans)
         if result["remaining_total"]:
             result["warnings"].append(
                 "仍有 %d 个进程属于被结束会话的进程树（可能正在退出或有 SIGKILL 也杀不掉的状态）"
                 % result["remaining_total"])
-        if orphans and result.get("orphan_remaining_total"):
-            result["warnings"].append(
-                "按 argv 扫到的 %d 个孤儿里仍有 %d 个进程没死（SIGKILL 也杀不掉的状态？）："
-                "ps -eo pid,args | grep pyaissh-sessions 自查"
-                % (len(orphans), result["orphan_remaining_total"]))
         unverified = [r["session"] for r in results if r.get("note") and not r.get("verified")]
         if unverified:
             result["warnings"].append(
-                "会话 %s 的清理**未获确认**（没找到活着的会话进程，可能仍有孤儿）："
+                "会话 %s 的清理**未获确认**（没拿到 pane pid，或没找到活着的会话进程）："
                 "按 note 里的 ps 自查，必要时手工 kill 或 pyaissh session kill --all"
                 % ",".join(unverified))
         result["next_action"] = ("会话已清理。重开：session start <target> --name <name>"
-                                 if names else
-                                 ("已按 argv 清掉 %d 个孤儿会话进程" % len(orphans) if orphans
-                                  else "没有需要清理的会话"))
-        _emit_result(args, result, header="[SESSION KILL] %d 个会话%s"
-                     % (len(results), "，孤儿 %d" % len(orphans) if orphans else ""))
+                                 if names else "没有需要清理的会话")
+        _emit_result(args, result, header="[SESSION KILL] %d 个会话" % len(results))
         return 0
     except KeyboardInterrupt:
         emit_error(args.json, "interrupted", _interrupt_msg())

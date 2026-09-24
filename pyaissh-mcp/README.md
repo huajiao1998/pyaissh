@@ -70,7 +70,7 @@ PYAISSH_HOST_PROD=<user>@<host>:<port>      # 之后工具里用 target: "@PROD"
 | `pyaissh_ls` | `ls` | 列目录，`entries[]` 结构化字段 |
 | `pyaissh_upload` / `pyaissh_download` | `upload` / `download` | SFTP 传输，**零 token 消耗**（文件内容永不回传，只回元数据）；支持并行分片/断点续传 |
 | `pyaissh_log` | `log` | 读**后台作业**日志：默认尾部 100 行；`offset` 增量读（返回 `next_offset` 续读不重复）；`wait_rc` 等结束拿 `exit_code`；`kill` 整组停掉；`cleanup` 清理；`list` 列作业。载荷字段 `stdout`（2>&1 合并流）。配合 `pyaissh_exec(detach=true)` 做准流式 |
-| `pyaissh_session` | `session` | **常驻会话（真 PTY）**：多步且带状态的远端操作——`action` = `start`/`send`/`read`/`ctrl-c`/`keys`/`list`/`kill`。逐条喂命令、`cd`/`export` 跨命令保留、**每条独立退出码**、**可中断执行中的命令**（`ctrl-c`）、**可应答交互提示**（`keys`）。载荷字段 `stdout`/`next_offset`/`status`/`exit_code` |
+| `pyaissh_session` | `session` | **常驻会话（真 PTY）**：多步且带状态的远端操作——**引擎 = 远端 tmux**（专用 socket `pyaissh`，与用户自己的 tmux 隔离；**需远端 tmux ≥ 3.0**，没有就报 `tmux_missing` 并给安装命令）——`action` = `start`/`run`/`send`/`read`/`ctrl-c`/`keys`/`list`/`kill`。逐条喂命令、`cd`/`export` 跨命令保留、**每条独立退出码**、**可中断执行中的命令**（`ctrl-c`）、**可应答交互提示**（`keys`）。载荷字段 `stdout`/`next_offset`/`status`/`exit_code` |
 
 **结果就是 pyaissh CLI 的原生单行 JSON 契约**：`ok`=工具操作成功、`exit_success`=远程命令成败、错误看 `error`+`message`+`retryable`。完整契约见 [`skills/pyaissh/SKILL.md`](../skills/pyaissh/SKILL.md) 与 `docs/`。
 
@@ -125,9 +125,9 @@ MCP 客户端 ──stdio JSON-RPC──> pyaissh_mcp.py ──进程内 main()�
 
 ### 会话归属与退出清理 / Session ownership (v0.3.1)
 
-`pyaissh_session` 起的常驻会话是**远端进程**（`setsid+nohup`，SSH 断开、本地关机都不影响它——这正是它能在两次工具调用之间活下来的原因）。CLI 路径下没有"本地长命进程"可以依附，所以会话**不会自己退出**；MCP 路径补上了这一环：
+`pyaissh_session` 起的常驻会话是**远端进程**（由远端 tmux 常驻，SSH 断开、本地关机都不影响它——这正是它能在两次工具调用之间活下来的原因）。CLI 路径下没有"本地长命进程"可以依附，所以会话**不会自己退出**；MCP 路径补上了这一环：
 
-- **空闲回收（v0.3.1）**：`start` 时会在会话里放一个看门狗进程，**提示符空闲（没有命令在跑）且 `ttl`（默认 600s）内没有任何工具交互**就自动回收（进程 + 目录）。`send/run/read/ctrl-c/keys` 都算交互并续期，`list` 不算；`ttl=0` 关闭。默认值可用 `PYAISSH_SESSION_TTL` 改。
+- **空闲回收（v0.3.1；v2.4.0 起引擎换成 tmux，回收语义随之更新）**：**提示符空闲（没有命令在跑）且 `ttl`（默认 600s）内没有任何工具交互**就自动回收（tmux 会话 + 目录）。回收由两条路触发：**会话子命令（`send`/`run`/`read`/`ctrl-c`/`keys`/`list`）入口的惰性扫**（先给本次目标续期、再扫其它；`kill` 不走这条，`list` 不续期但会顺手扫，`start` 仅在 `ttl>0` 时扫并拉起 reaper）与**每主机一个 reaper**（`reap.sh --loop`，默认 300 秒一轮，没有会话目录时自退；`kill` 清空会话后会立刻停掉它）——没人再回来时最迟 `TTL + 5 分钟`被收掉。`send/run/read/ctrl-c/keys` 都算交互并续期，`list` 不算；`ttl=0` 关闭。默认值可用 `PYAISSH_SESSION_TTL` 改。
 - **`attach=true`**：同名会话还活着就接上（返回 `attached: true` + pid/age/idle，状态全保留），不存在或被回收才新建；不带 `attach` 时撞名仍报 `session_exists`（安全：不静默接上别的 agent 的同名会话）。
 - **MCP 进程退出时，自动清掉它自己 `start` 过的会话**（stdin EOF / 客户端关 stdio / `SIGINT` / `SIGTERM` 都会走到 `finally`）——本地 agent 会话结束 = 这轮工作结束，正好是清理时机。
 - **只清自己起的**：`start` 返回 `session_exists` 时不登记归属；别的 agent / 用 CLI 直接起的会话**绝不触碰**（真机用例 S2 就是这条安全断言）。

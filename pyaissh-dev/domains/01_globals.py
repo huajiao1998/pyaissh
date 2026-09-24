@@ -6,7 +6,7 @@
 被 00_head（信号区）、各 cmd_*（超时/常量）引用；拼接后与本包其余域同模块共享命名空间。
 """
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -135,5 +135,8 @@ _RETRYABLE_ERRORS = {
     # 失败；信号中断已单独归 interrupted）——与 connection_lost 同类，可重试
     "test_failed",
     "exec_idle_timeout", "exec_total_timeout", "exec_timeout",
+    # session（v2.4.0 tmux 引擎）：server/socket 起不来这类是环境/资源问题，值得重试；
+    # tmux_missing / tmux_unsupported 是"必须先改环境"（装/升级 tmux），不列为可重试
+    "tmux_failed",
 }
 

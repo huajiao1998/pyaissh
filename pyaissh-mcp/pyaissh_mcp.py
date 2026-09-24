@@ -421,7 +421,7 @@ TOOLS = [
     },
     {
         "name": "pyaissh_session",
-        "description": "常驻会话（真 PTY）：多步且带状态的远端操作——逐条喂命令、cd/export 跨命令保留、每条独立退出码、可中断执行中的命令、可应答交互提示。action 取值与用法：start（起会话，返回 pid/pty/ready）→ run（跑一条并等结果，一步一次调用；--wait-rc 超时回 status=running，--no-wait 只发送）→ read（读输出：offset 增量 / wait_rc 等这条结束拿 exit_code；载荷字段 stdout）→ ctrl-c（中断执行中的命令，会话不死；force=true 用 SIGKILL）→ keys（注入按键文本应答提示，data 支持 \\n \\r \\t \\xNN）→ list（列会话：status/age_seconds/log_bytes，挂了超过 24 小时会提醒）→ kill（结束会话，进程树全清+删目录；结果带 swept/remaining/verified，不会无声误报「清干净」）。**会话是 setsid+nohup 起的远端常驻进程、不会自己退出（SSH 断开、本地关机/断网都不影响它和正在跑的命令——连回来 read wait_rc 能续拿 exit_code 与输出，cwd/变量还在）**：① **空闲回收**——提示符空闲且 ttl（默认 600s）内没有任何交互就自动回收（进程+目录）；send/run/read/ctrl-c/keys 都算交互并续期，有命令在跑时不回收，`ttl=0` 关闭；② 也可以（或提前）用 kill 显式结束（all=true 清该主机全部；结果带 swept/remaining/verified，不会无声误报「清干净」）；③ `start attach=true` 可接上还活着的同名会话（返回 attached=true + age/idle）。**本 MCP 进程正常退出时也会自动清掉它自己启动过的会话**（stdio 关闭 / SIGINT / SIGTERM 都会触发；SIGKILL、断电不会）；别人启动的会话不受影响。典型：start → send 'cd /opt/app' → send 'git pull' → read wait_rc=45 → send 'make -j8' → （错了）ctrl-c → send 'make -j4' → kill。",
+        "description": "常驻会话（真 PTY）：多步且带状态的远端操作——逐条喂命令、cd/export 跨命令保留、每条独立退出码、可中断执行中的命令、可应答交互提示。action 取值与用法：start（起会话，返回 pid/pty/ready）→ run（跑一条并等结果，一步一次调用；--wait-rc 超时回 status=running，--no-wait 只发送）→ read（读输出：offset 增量 / wait_rc 等这条结束拿 exit_code；载荷字段 stdout）→ ctrl-c（中断执行中的命令：向 pane 注入 Ctrl-C，会话不死；force=true 用 SIGKILL 打内核给出的前台进程组；**被中断的命令自己不会产出哨兵**（bash 收到 SIGINT 丢弃当前命令行），所以 ctrl-c 会**代它补一条**（INT→exit_code=130、force→137）——正等它的 read wait_rc 会正常收敛）→ keys（注入按键文本应答提示，data 支持 \\n \\r \\t \\xNN）→ list（列会话：status/age_seconds/log_bytes，挂了超过 24 小时会提醒）→ kill（结束会话：tmux kill-session + 进程树闭包 TERM→KILL→校验 + 删目录；结果带 swept/remaining/verified，不会无声误报「清干净」；orphans 系列字段恒返回且恒空——tmux 引擎下「目录没了进程还在」的结构性孤儿不存在）。**会话由远端 tmux 常驻（专用 socket `pyaissh`，与用户自己的 tmux 隔离）、不会自己退出（SSH 断开、本地关机/断网都不影响它和正在跑的命令——连回来 read wait_rc 能续拿 exit_code 与输出，cwd/变量还在）**；**远端需要 tmux ≥ 3.0**（没有就报 tmux_missing 并给出安装命令，不自动安装；装不了就用 exec / exec --detach 跑长任务）。① **空闲回收**——提示符空闲且 ttl（默认 600s）内没有任何交互就自动回收（tmux 会话 + 目录）；send/run/read/ctrl-c/keys 都算交互并续期，有命令在跑时不回收，`ttl=0` 关闭；回收由**会话子命令（send/run/read/ctrl-c/keys/list）入口的惰性扫**与**每主机一个 reaper（默认 300 秒一轮）**触发（`kill` 不走惰性扫；`list` 不续期但会顺手扫；`start` 仅在 `ttl>0` 时扫并拉起 reaper），没人再回来时最迟 TTL+5 分钟被收掉；② 也可以（或提前）用 kill 显式结束（all=true 清该主机全部；结果带 swept/remaining/verified，不会无声误报「清干净」）；③ `start attach=true` 可接上还活着的同名会话（返回 attached=true + age/idle）。**本 MCP 进程正常退出时也会自动清掉它自己启动过的会话**（stdio 关闭 / SIGINT / SIGTERM 都会触发；SIGKILL、断电不会）；别人启动的会话不受影响。典型：start → send 'cd /opt/app' → send 'git pull' → read wait_rc=45 → send 'make -j8' → （错了）ctrl-c → send 'make -j4' → kill。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -438,14 +438,14 @@ TOOLS = [
                 "lines": {"type": "integer", "description": "read：回传尾部 N 行（与 offset 互斥）"},
                 "wait_rc": {"type": "integer", "description": "read：阻塞等待某条命令结束最多 N 秒（MCP 层上限 45s），结束即返回 exit_code；不带 token 时等最近一次 send 的那条"},
                 "token": {"type": "string", "description": "read：只等这个 token 的哨兵（send 返回）"},
-                "force": {"type": "boolean", "description": "ctrl-c：用 SIGKILL（默认 SIGINT→自动升级 SIGTERM）"},
-                "all": {"type": "boolean", "description": "kill：结束该主机全部会话；并**按 argv 自证身份扫一遍孤儿**（目录已被删、只剩进程的会话）——只认 starter/`script -qfc`/watch.sh 这类会话进程，不误杀只是提到路径的旁观进程"},
+                "force": {"type": "boolean", "description": "ctrl-c：用 SIGKILL 打内核给出的前台进程组（tpgid）；默认是向 pane 注入 Ctrl-C（tty 行规程交给前台进程组）"},
+                "all": {"type": "boolean", "description": "kill：结束该主机全部会话（含会话目录已被外部删掉、只剩 tmux 会话的）"},
                 "keep_dir": {"type": "boolean", "description": "kill：只杀进程、保留会话目录（便于事后看 out.log）"},
                 "cols": {"type": "integer", "description": "start：PTY 列宽（默认 200，防折行）"},
-                "no_pty": {"type": "boolean", "description": "start：强制非 PTY（无 tty，但状态与退出码照常）"},
+                "no_pty": {"type": "boolean", "description": "start：**已废弃**（tmux 引擎永远提供 PTY）——保留参数，仅回一条 warning，结果恒 pty=true"},
                 "keep_ansi": {"type": "boolean", "description": "read：保留 ANSI 颜色码（默认剥离，便于解析）"},
                 "no_wait": {"type": "boolean", "description": "run：只发送不等待（等价 send，之后自己 read）"},
-                "ttl": {"type": "string", "description": "start：空闲回收秒数（默认 600=10 分钟；可写 30s/10m/2h；0 = 关闭）。规则：**提示符空闲（没有命令在跑）**且 TTL 内没有任何 pyaissh 交互（send/run/read/ctrl-c/keys）才回收（进程 + 目录）；list 不算交互"},
+                "ttl": {"type": "string", "description": "start：空闲回收秒数（默认 600=10 分钟；可写 30s/10m/2h；0 = 关闭）。规则：**提示符空闲（没有命令在跑）**且 TTL 内没有任何 pyaissh 交互（send/run/read/ctrl-c/keys）才回收（tmux 会话 + 目录）；list 不算交互。回收由会话子命令（send/run/read/ctrl-c/keys/list）入口的惰性扫 + 每主机一个 reaper（默认 300 秒一轮）触发（kill 不走惰性扫；list 不续期但会顺手扫；start 仅 ttl>0 时扫并拉起 reaper）"},
                 "attach": {"type": "boolean", "description": "start：同名会话还活着就接上（返回 attached=true + pid/age/idle_seconds，状态全保留），不存在（或被回收）才新建"},
                 "max_output": {"type": "integer", "description": "run/read：单次回传上限字节（默认 64KB）"},
                 "session_dir": {"type": "string", "description": "会话根目录（默认 /tmp/pyaissh-sessions）"},

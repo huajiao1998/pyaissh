@@ -886,3 +886,72 @@
   - `--suite live_session_watchdog,live_session_ttl --fast`：**14 PASS / 0 FAIL，105 秒**
     （对比整条 `--session --fast` 406 秒、默认 tick 下 ~10 分钟）；
   - `--suite live_session_lifecycle,live_session,live_session_bugs --fast`：见 tests/CHANGELOG。
+
+## [2.4.0] - 2026-09-24
+
+### 变更：`session` 进程引擎整体换成 tmux（契约层一字未改）
+
+- **一句话**：tmux 只当**引擎**（PTY / 进程生命周期 / 输出镜像），pyaissh 保留**契约层**
+  （哨兵协议、每条命令独立退出码、字节级 `--offset` 读、CRLF·ANSI 清洗、单行 JSON 字段集）。
+  **字段集不变**：契约基线 21 用例的键集原样保留，只按白名单新增 `orphans` / `orphans_total` /
+  `orphan_remaining_total`（恒返回且恒空，AI 侧零感知）。
+- **为什么换**：旧引擎的复杂度几乎全在"自己实现一个终端"——FIFO 写入的阻塞与半行、看门狗的判闲与
+  自杀式清理（含临终带走、防 spin 护栏）、`kill` 按 argv 扫孤儿的自证、pid 复用误杀……
+  这些在 tmux 里都是现成的、被验证过的行为。旧引擎代码**整体删除**（不留 `PYAISSH_SESSION_ENGINE`
+  开关、不双引擎）。换掉后**每会话不再有常驻辅助进程**（旧：每会话一个看门狗 bash）。
+- **依赖变成显式**（用户 2026-09-24 决定）：远端需要 **tmux ≥ 3.0**（实测 3.5a / Debian 13）。
+  没有 → `tmux_missing`（message/`next_action` 给可执行安装命令：`apt-get install -y tmux` /
+  `dnf install -y tmux` / `apk add tmux`）；版本过低 → `tmux_unsupported`；`tmux -V` 解析不出或
+  server 起不来 → `tmux_failed`。**不自动安装**；装不了的环境（不可变系统/无包管理器/air-gapped）
+  ⇒ session 不可用，长任务用 `exec` / `exec --detach`（这两条路不依赖 tmux）。
+- **引擎形态（实测决定，见 `pyaissh-dev/SPEC_session_tmux.md` S1~S13）**：
+  - 专用 socket `tmux -L pyaissh -f /dev/null`——与用户自己的 tmux **完全隔离**，不读用户 `~/.tmux.conf`；
+  - **名字映射** `py-<会话名 utf-8 的 hex>`（tmux 会静默改写名字里的 `.`/`:`：`a.b` 变 `a_b`，
+    且与真实存在的 `a_b` 撞名）；pane 级 target 必须写 `=NAME:`，会话级用 `=NAME`；
+  - 命令注入走 `load-buffer` + `paste-buffer`（缓冲区是**数据**、不经 tmux 自己的命令行解析 ⇒
+    零引号风险、二进制安全），哨兵协议与旧引擎逐字相同；
+  - 输出镜像 `pipe-pane -o 'cat >> out.log'`；`out.log` 被外部删/变小时**不带 `-o`** 重 arm
+    （否则 `cat` 继续往已 unlink 的 inode 写、新输出静默丢失）+ `log_recreated` 提示；
+  - `ctrl-c` = `send-keys C-c`（tty 行规程交给前台进程组）；`--force` = 对内核给出的前台进程组
+    `ps -o tpgid=` 发 SIGKILL（**不用 `C-\`(SIGQUIT)**：会 core dump）；被中断的命令自己不会产出
+    哨兵（bash 收到 SIGINT 丢弃当前命令行），所以 `ctrl-c` **代它补一条**（INT→`exit_code=130`、
+    `--force`→`137`）——正等它的 `read --wait-rc --token` 会正常收敛（`last.token` 那条）；
+  - `kill` = pane_pid 的**进程树闭包快照**（必须在 `kill-session` 之前算，父进程被杀后子进程会被
+    reparent）→ `tmux kill-session` → 幸存者 TERM→KILL→校验 → 删目录；权威根直接取 tmux 的
+    `pane_pid`，不再需要 argv 自证（pid 复用误杀风险一并消失）；
+  - 人类排障：`tmux -L pyaissh attach -t '=<会话目录里 tmux 文件的内容>'` 可看直播。
+- **空闲回收语义变化**：从"每会话看门狗准点回收（TTL..TTL+TICK）"改为**惰性扫 + 每主机一个 reaper**
+  ——会话子命令（send/run/read/ctrl-c/keys/list）入口**先给本次目标续期、再扫其它**（`kill` 本就是清理、不走惰性扫；`list` 不续期但会顺手扫；`start` 收尾扫一次
+  并拉起 reaper）；reaper 是 `reap.sh --loop`，默认 **300 秒**一轮、**没有会话目录时自退**，
+  `kill` 清空会话后**立刻**停掉它。没人再回来时最迟 **TTL + 5 分钟**被收；`--ttl 0` 关闭。
+  `list` 的 `ttl_seconds`/`idle_seconds`/`expires_in_seconds` **字段与口径不变**。
+- **会话目录内容变化**：**去掉** `in`(FIFO)/`err.log`/`sess.pid`/`bash.pid`/`watch.sh`/`watch.pid`/
+  `wd.fifo`/`wd.log`，**保留** `out.log`/`meta`/`beat`/`last.token`，**新增** `tmux`
+  （内容 = tmux 会话名，给 reaper 与人类 attach 用）；根目录新增 `reap.sh` / `.reaper.pid` / `.reaper.log`。
+- **升级路径**：旧引擎遗留目录（有 `sess.pid`/`in` 但没有同名 tmux 会话）**不自动接管**——
+  `run/send/read` 报 `session_dead`（message 说明是旧引擎遗留），`list` 标 `legacy_engine: true`
+  并给 warning，用 `session kill` 清目录后重新 `start`。
+- **既知行为变化（不是 bug）**：① `--no-pty` 变 no-op + warning，结果恒 `pty: true`；
+  ② 会话内 `TERM` = `tmux-256color`（tmux 强制决定，旧引擎继承 SSH 通道环境、常为空/dumb）；
+  ③ `kill` 结果**总是**含 `orphans: []`/`orphans_total: 0`/`orphan_remaining_total: 0`（旧：空时省略）；
+  ④ 空闲回收从"服务器端准点"变为"惰性扫 + 5 分钟一轮的 reaper"；⑤ 会话目录文件集变化（见上）；
+  ⑥ 依赖 tmux ≥ 3.0；⑦ `ctrl-c --force` 打的是内核给出的前台进程组（更准）；
+  ⑧ 多一个"服务器级"对象 tmux server（闲置时随最后一个会话退出，`list` 不受影响）。
+- **已知边界（写进文档、不当作 bug）**：会话内**自己 `setsid`/`nohup` 起的脱离进程不随 `kill`
+  消失**（与终端/tmux 语义一致，**旧引擎同款盲区**）；惰性扫与 reaper 都被绕过时残留的 tmux 会话
+  **对人类可见**（`tmux ls`），且每会话只是一个闲置 shell；人类 attach 时人工输入会回显进
+  `out.log`（日志变脏，不影响哨兵切片）；无 tmux 环境 session 不可用；会话里 `exit` 后目录仍在
+  （`list` 显示 `dead`，用 `kill` 清）。
+- **成本对比（真机实测，与旧引擎同机对比）**：3 个空闲会话常驻内存 **45.5 MB → 23.2 MB**（−49%）、
+  常驻进程 **12 → 5**（1 tmux server + 3 `bash -i` + 1 reaper）、每会话常驻辅助进程 **1 → 0**、
+  空闲 CPU 20 秒采样 5 进程合计 **1 jiffy**；单个空闲会话 15.4 MB / 3 进程（旧 ≈12 MB / 4 进程）
+  ——单会话内存略高（多了全主机共享的 tmux server），多会话明显更省。数字已回填
+  `docs/session.md` 的成本表（原先的 `TODO(perf)` 占位已替换）。
+- **测试**：会话测试块按 tmux 引擎重写（**惰性回收 + reaper** 取代看门狗 tick、孤儿扫描用例删除、
+  `PYAISSH_SESSION_TTL_TICK` → `PYAISSH_SESSION_REAP_INTERVAL`），详见 `tests/CHANGELOG.md`。
+  真机会话块 6 个（core/ttl/engine/lifecycle/orphan/bugs）全绿，其中 `live_session_engine` 含
+  socket 隔离、输出镜像、`log_recreated` 自愈、reaper 收敛与 PERF-01~04 实测断言。
+- **文档**：`docs/session.md` 的引擎/生命周期/回收/兼容性整段重写（新增「依赖」「为什么换成 tmux」
+  「进程与目录结构」「已知边界」）；`SKILL.md` 会话段、`pyaissh-mcp/pyaissh_mcp.py` 的
+  `pyaissh_session` 工具描述与参数说明、`pyaissh-mcp/README.md` 同步更新（FIFO/`script`/看门狗/
+  非 PTY 降级之类的旧措辞全部清掉）。

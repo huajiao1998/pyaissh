@@ -445,3 +445,21 @@
 - `--unit` 123 PASS；`--all` / `--session` 被闸门拒绝（exit 2）
 - `--suite live_session_watchdog,live_session_ttl --fast`：14 PASS / 0 FAIL（105 秒）
 - `--suite live_session_lifecycle,live_session,live_session_bugs --fast`：结果见下
+
+## [2026-09-24] v2.4.0：会话测试块按 tmux 引擎重写
+
+### 改动
+- 会话相关块按新引擎（tmux）重写：**惰性回收 + 每主机一个 reaper** 取代旧的看门狗 tick 等待——
+  `PYAISSH_SESSION_TTL_TICK` → **`PYAISSH_SESSION_REAP_INTERVAL`**（`--fast` 的语义随之变为
+  "把 reaper 间隔调小"，等待不再按看门狗周期算）
+- **孤儿扫描用例删除**：tmux 引擎下"目录没了进程还在"的结构性孤儿不复存在（进程生命周期归 tmux），
+  `kill` 的 `orphans`/`orphans_total`/`orphan_remaining_total` **恒返回且恒空** ⇒ 原 O1a~O1d
+  （手工 `rm -rf` 目录后按 argv 扫孤儿 + 诱饵旁观进程不被误杀）与对应的 unit 断言一并删除
+- 断言面同步到 tmux 语义：`--no-pty` 为 no-op（结果恒 `pty: true` + warning）、会话内
+  `TERM=tmux-256color`、`ctrl-c` 后被中断命令的退出码哨兵不会出现、会话目录文件集
+  （有 `tmux` 文件；无 `in`/`sess.pid`/`bash.pid`/`watch.*`/`wd.*`）、`kill` 走
+  pane_pid 闭包 + `tmux kill-session` + `swept`/`roots`/`verified` 校验
+
+### 说明
+- 用例数与跑批结果由本轮实现方填入——本文档**不预填未实测的数字**。
+
