@@ -642,3 +642,32 @@
 - **验证**：`--unit` +1（载荷以换行开头，93 PASS）；真机 `--session` **44 PASS / 0 FAIL**
   （新增「R2 半行残留后下一条命令仍拿得到退出码」）；另跑独立探针脚本覆盖 26s 无客户端、
   半行前后对比、收尾零残留三件事。
+
+### 新增：MCP 会话归属与退出清理（pyaissh-mcp v0.3.1）
+
+- **起因（用户设计质疑）**："session 是给交互任务用的，本地关了任务就结束了——服务端进程是不是该跟着关？
+  如果是后台任务，用之前的模式不就行了？" 结论分两层：
+  - **架构事实**：CLI 是"每次调用一条新连接"，两次调用之间本地**没有任何进程**存在，所以会话只能
+    `setsid+nohup` 脱离连接——否则 `session start` 一返回它就死了。"随本地进程关闭"在 CLI 路径
+    能落地的形式只有空闲 TTL/租约（本次未做，保持显式 `kill`）。
+  - **MCP 路径则真有"本地长命进程"**：`pyaissh-mcp` 就是。于是把"会话归属"落在它身上——
+    **MCP 正常退出时清掉它自己启动过的会话**，正好对应"本地这轮工作结束了"。
+- **实现（`pyaissh-mcp/pyaissh_mcp.py`）**：
+  - 归属表 `_OWNED`（target → 会话名集合 + 最小认证参数，仅内存）；`pyaissh_session` 的 `start`
+    成功才登记，`kill`（含 `all=true`）同步注销；`start` 回 `session_exists` 时**不登记**。
+  - `cleanup_owned_sessions()` 在 `main()` 的 `finally` 里、**关连接池之前**执行（清理要借池里的连接）：
+    逐会话发 `session kill --name X` 并透传原认证参数；best-effort，失败只记 stderr 日志，绝不拖住退出；
+    总时长预算 `PYAISSH_MCP_EXIT_CLEANUP_TIMEOUT`（默认 10s，`<=0` 关闭）。
+  - 覆盖范围诚实标注：`SIGKILL`/断电/宿主崩溃不执行 `finally` ⇒ 残留仍在，靠 `session list`
+    （`age_seconds`）与 `session kill all=true` 兜底。
+  - `SERVER_VERSION` 0.3.0 → 0.3.1；`pyaissh_session` 工具描述与 README 补该行为。
+- **安全边界（重点）**：只清**本进程自己起的**会话——别的 agent、别的 MCP 实例、用 CLI 直接起的
+  会话**一律不碰**（宁可留下也不误杀）。
+- **验证**：
+  - 离线（`test/test_offline.py` 41 → **49 PASS**）：T19a~T19h 覆盖登记去重 / 只留认证参数 /
+    按名注销 / 清理 argv 与认证透传 / 清理后清表 / 失败记 failed 不抛 / `<=0` 关闭 / 空表 no-op。
+  - 真机（新增 `test/test_live_session.py`，**12 PASS / 0 FAIL**）：MCP 起会话 → 关闭 MCP（等价本地
+    agent 会话结束）→ 该会话与目录都被清掉；**同时用 CLI 直接起的会话不受影响**（S2 安全断言）；
+    显式 `kill` 过的会话退出时不重复清（S1d）；收尾零残留目录、零 `script -qfc` 进程（S4b）。
+  - 文档同步：`docs/session.md` 增「MCP 通道的例外」一节；`pyaissh-mcp/README.md` 增
+    「会话归属与退出清理」一节。

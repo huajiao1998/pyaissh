@@ -123,6 +123,16 @@ MCP 客户端 ──stdio JSON-RPC──> pyaissh_mcp.py ──进程内 main()�
 
 配置（环境变量，均有默认值）：`PYAISSH_MCP_POOL`（默认开）、`PYAISSH_MCP_POOL_TTL=300`、`PYAISSH_MCP_POOL_KEEPALIVE=20`、`PYAISSH_MCP_POOL_PROBE=5`、`PYAISSH_MCP_POOL_MAX=8`。
 
+### 会话归属与退出清理 / Session ownership (v0.3.1)
+
+`pyaissh_session` 起的常驻会话是**远端进程**（`setsid+nohup`，SSH 断开、本地关机都不影响它——这正是它能在两次工具调用之间活下来的原因）。CLI 路径下没有"本地长命进程"可以依附，所以会话**不会自己退出**；MCP 路径补上了这一环：
+
+- **MCP 进程退出时，自动清掉它自己 `start` 过的会话**（stdin EOF / 客户端关 stdio / `SIGINT` / `SIGTERM` 都会走到 `finally`）——本地 agent 会话结束 = 这轮工作结束，正好是清理时机。
+- **只清自己起的**：`start` 返回 `session_exists` 时不登记归属；别的 agent / 用 CLI 直接起的会话**绝不触碰**（真机用例 S2 就是这条安全断言）。
+- **显式 `kill` 会同步注销归属**，退出时不重复清理。
+- **覆盖不到**：`SIGKILL`、断电、宿主崩溃（`finally` 不执行）——那时残留靠 `session list`（`age_seconds`/`log_bytes`，挂超 24h 有提醒）与 `session kill all=true` 兜底。
+- 预算：`PYAISSH_MCP_EXIT_CLEANUP_TIMEOUT`（默认 10s，`<=0` 关闭）；退出路径 best-effort——清理失败只写 stderr 日志，绝不拖住退出。
+
 ## 测试 / Tests
 
 ```bash
@@ -136,6 +146,9 @@ python test/test_env_creds.py
 # 真机功能测试：凭据写 test/local_creds.json（参考 .example，已 gitignore）
 #   或环境变量 PYAISSH_MCP_HOST1/PYAISSH_MCP_PW1、PYAISSH_MCP_HOST2/PYAISSH_MCP_PW2
 python test/test_live.py
+
+# 真机会话测试（MCP 通道）：MCP 退出清理自己起的会话；**不是它起的会话不受影响**
+python test/test_live_session.py
 
 # 真机聚焦套件：后台作业准流式（detach→增量读→wait_rc→list→cleanup→job_not_found）
 #   约 15 秒、单主机；开跑前自带单次 test 前置探活（凭据失败即 SKIP，不产生连续失败认证）

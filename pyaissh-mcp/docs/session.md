@@ -165,3 +165,11 @@ v2.3.0 起载荷**以换行开头**：先把那半行终结掉（它会被当**�
 
 **遇到卡住怎么办**：`session ctrl-c`（清掉未提交的输入行 + 打断前台命令）后重发即可——
 实测 `ctrl-c` 之后重发命令 `exit_code: 0`、输出正常。
+
+### MCP 通道的例外：进程退出时自动清理
+
+CLI 路径没有"本地长命进程"可以依附，所以会话只能显式 `kill`。**MCP 路径（`pyaissh_session`）不同**：
+`pyaissh-mcp` 是本地长命进程，它**正常退出时会自动清掉自己 `start` 过的会话**——stdin 关闭、
+`SIGINT`/`SIGTERM` 都会触发（`SIGKILL`、断电不会）。只清自己起的：别的 agent 或用 CLI 直接起的
+会话不受影响；显式 `kill` 过的会同步注销，退出时不重复清。预算
+`PYAISSH_MCP_EXIT_CLEANUP_TIMEOUT`（默认 10s，`<=0` 关闭），退出路径 best-effort。

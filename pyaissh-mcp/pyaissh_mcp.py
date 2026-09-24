@@ -47,7 +47,7 @@ import time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CLI_PATH = os.path.join(BASE_DIR, "pyaissh.py")
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.3.1"
 SERVER_NAME = "pyaissh-mcp"
 
 SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
@@ -421,7 +421,7 @@ TOOLS = [
     },
     {
         "name": "pyaissh_session",
-        "description": "常驻会话（真 PTY）：多步且带状态的远端操作——逐条喂命令、cd/export 跨命令保留、每条独立退出码、可中断执行中的命令、可应答交互提示。action 取值与用法：start（起会话，返回 pid/pty/ready）→ run（跑一条并等结果，一步一次调用；--wait-rc 超时回 status=running，--no-wait 只发送）→ read（读输出：offset 增量 / wait_rc 等这条结束拿 exit_code；载荷字段 stdout）→ ctrl-c（中断执行中的命令，会话不死；force=true 用 SIGKILL）→ keys（注入按键文本应答提示，data 支持 \\n \\r \\t \\xNN）→ list（列会话：status/age_seconds/log_bytes，挂了超过 24 小时会提醒）→ kill（结束会话，进程树全清+删目录；结果带 swept/remaining/verified，不会无声误报「清干净」）。**会话是 setsid+nohup 起的远端常驻进程、不会自己退出（SSH 断开、本地关机/断网都不影响它和正在跑的命令——连回来 read wait_rc 能续拿 exit_code 与输出，cwd/变量还在）——用完必须 kill**（或 all=true 清该主机全部会话）。典型：start → send 'cd /opt/app' → send 'git pull' → read wait_rc=45 → send 'make -j8' → （错了）ctrl-c → send 'make -j4' → kill。",
+        "description": "常驻会话（真 PTY）：多步且带状态的远端操作——逐条喂命令、cd/export 跨命令保留、每条独立退出码、可中断执行中的命令、可应答交互提示。action 取值与用法：start（起会话，返回 pid/pty/ready）→ run（跑一条并等结果，一步一次调用；--wait-rc 超时回 status=running，--no-wait 只发送）→ read（读输出：offset 增量 / wait_rc 等这条结束拿 exit_code；载荷字段 stdout）→ ctrl-c（中断执行中的命令，会话不死；force=true 用 SIGKILL）→ keys（注入按键文本应答提示，data 支持 \\n \\r \\t \\xNN）→ list（列会话：status/age_seconds/log_bytes，挂了超过 24 小时会提醒）→ kill（结束会话，进程树全清+删目录；结果带 swept/remaining/verified，不会无声误报「清干净」）。**会话是 setsid+nohup 起的远端常驻进程、不会自己退出（SSH 断开、本地关机/断网都不影响它和正在跑的命令——连回来 read wait_rc 能续拿 exit_code 与输出，cwd/变量还在）——用完必须 kill**（或 all=true 清该主机全部会话）。**本 MCP 进程正常退出时会自动清掉它自己启动过的会话**（stdio 关闭 / SIGINT / SIGTERM 都会触发；SIGKILL、断电不会，那时用 list 看 age_seconds 再 kill）；别人启动的会话不受影响。典型：start → send 'cd /opt/app' → send 'git pull' → read wait_rc=45 → send 'make -j8' → （错了）ctrl-c → send 'make -j4' → kill。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -675,6 +675,98 @@ def _handle_initialize(msg_id, params):
     })
 
 
+# =========================================================================
+# 会话归属：本进程启动过的 session —— 退出时清理，避免"用完不管"的远端残留
+# =========================================================================
+
+# target -> {"names": {会话名}, "auth": {flag: 值}}
+# 只记**本进程自己 start 成功**的会话：别的 agent / 别的 MCP 实例留下的不碰
+# （名字撞车时 start 回 session_exists，那种情况不记归属——宁可留下也不误杀）。
+_OWNED = {}
+_OWNED_LOCK = threading.Lock()
+_AUTH_KEEP = ("password", "key", "port", "timeout", "jump", "jump_password", "jump_key")
+
+
+def _owned_auth(args):
+    """留下重建连接所需的最小认证参数（只在内存里，与本进程已持有的凭据同级）。"""
+    return {k: args[k] for k in _AUTH_KEEP if args.get(k) not in (None, "")}
+
+
+def _owned_record(target, name, args):
+    with _OWNED_LOCK:
+        ent = _OWNED.setdefault(target, {"names": set(), "auth": {}})
+        ent["names"].add(name)
+        ent["auth"].update(_owned_auth(args))
+
+
+def _owned_forget(target, name=None):
+    """name=None ⇒ 该目标全部（对应 session kill all=true）。"""
+    with _OWNED_LOCK:
+        if name is None:
+            _OWNED.pop(target, None)
+            return
+        ent = _OWNED.get(target)
+        if not ent:
+            return
+        ent["names"].discard(name)
+        if not ent["names"]:
+            _OWNED.pop(target, None)
+
+
+def _owned_snapshot():
+    with _OWNED_LOCK:
+        return [(t, sorted(e["names"]), dict(e["auth"])) for t, e in _OWNED.items() if e["names"]]
+
+
+def cleanup_owned_sessions(budget_s=None):
+    """MCP 退出前**尽力**清掉本进程启动过的会话（best-effort，带总时长预算）。
+
+    为什么需要：CLI 路径下会话是远端常驻（`setsid+nohup`），AI"用完不管"就会留进程 + /tmp 目录；
+    而 MCP server 是本地**长命进程**，它退出（本地 agent 会话结束 / 客户端关 stdio / SIGINT/SIGTERM）
+    正好是"这轮工作结束了"的可靠信号 —— 这时把自己起的会话收掉。
+    覆盖不到的：**SIGKILL / 断电 / 宿主崩溃**（finally 不会执行）——那时残留仍在，
+    靠 `session list`（age_seconds）与 `session kill --all` 兜底。
+    预算：PYAISSH_MCP_EXIT_CLEANUP_TIMEOUT（默认 10s，<=0 关闭）；每次 kill 前检查，
+    超预算的会话跳过并记入 failed（绝不拖住退出）。
+    """
+    raw = os.environ.get("PYAISSH_MCP_EXIT_CLEANUP_TIMEOUT")
+    budget = _env_float("PYAISSH_MCP_EXIT_CLEANUP_TIMEOUT", 10.0) if budget_s is None else budget_s
+    if budget <= 0:
+        _log("退出清理：已关闭（PYAISSH_MCP_EXIT_CLEANUP_TIMEOUT=%s）" % (raw,))
+        return [], []
+    done, failed, t0 = [], [], time.monotonic()
+    for target, names, auth in _owned_snapshot():
+        for nm in names:
+            if time.monotonic() - t0 > budget:
+                failed.append("%s@%s(超预算 %.0fs 跳过)" % (nm, target, budget))
+                continue
+            argv = ["pyaissh", "session", "kill", target, "--name", nm]
+            for k, v in auth.items():
+                flag = _FLAG_MAP.get(k)
+                if flag:
+                    argv += [flag, str(v)]
+            try:
+                parsed, _o, _e, rc = _call_cli(argv)
+                if isinstance(parsed, dict) and parsed.get("ok") is True and rc == 0:
+                    row = ((parsed.get("sessions") or [{}])[0])
+                    _log("退出清理：会话 %s@%s 已结束（swept=%s remaining=%s verified=%s）"
+                         % (nm, target, row.get("swept"), row.get("remaining"),
+                            row.get("verified")))
+                    done.append("%s@%s" % (nm, target))
+                else:
+                    failed.append("%s@%s(%s)" % (nm, target,
+                                                 (parsed or {}).get("error") or ("rc=%s" % rc)))
+            except Exception as e:
+                failed.append("%s@%s(%r)" % (nm, target, e))
+            _owned_forget(target, nm)
+    if done or failed:
+        _log("退出清理汇总：已结束 %d 个本进程启动的会话%s"
+             % (len(done), ("；失败/跳过：%s" % ", ".join(failed)) if failed else ""))
+    else:
+        _log("退出清理：本进程没有留下会话")
+    return done, failed
+
+
 def _handle_tools_call(msg_id, params):
     if not isinstance(params, dict) or not isinstance(params.get("name"), str):
         return _reply(msg_id, error=_rpc_error(-32602, "无效参数：缺少 tool name"))
@@ -699,6 +791,21 @@ def _handle_tools_call(msg_id, params):
             for ln in err_text.strip().splitlines():
                 _log("[cli-stderr] %s" % ln)
         ok_flag = isinstance(parsed, dict) and parsed.get("ok") is False
+        # 会话归属登记（只记本进程自己起成功/自己关掉的，见 _OWNED 注释）
+        if name == "pyaissh_session" and isinstance(parsed, dict) and parsed.get("ok") is True:
+            _tgt = str(args.get("target"))
+            _act = str(args.get("action") or "")
+            if _act == "start":
+                _nm = str(parsed.get("session") or args.get("name") or "main")
+                _owned_record(_tgt, _nm, args)
+                _log("会话归属登记：%s@%s（本进程退出时会自动清理）" % (_nm, _tgt))
+            elif _act == "kill":
+                if args.get("all"):
+                    _owned_forget(_tgt)
+                else:
+                    for _row in (parsed.get("sessions") or []):
+                        if _row.get("session"):
+                            _owned_forget(_tgt, str(_row["session"]))
     if notes and isinstance(parsed, dict):
         # 容错改写要让模型看见（否则它会以为参数被无视）：并入结果 warnings + 打 server stderr
         warns = parsed.get("warnings")
@@ -777,6 +884,11 @@ def main():
     except SystemExit:
         pass  # 信号 handler 触发的退出
     finally:
+        # 先清会话再关池（清理要借池里的连接）；顺序反了就没连接可用了
+        try:
+            cleanup_owned_sessions()
+        except Exception as e:      # 退出路径绝不因清理失败而中断
+            _log("退出清理异常（忽略）：%r" % (e,))
         _log("关闭：清理连接池…")
         POOL.close_all()
         _log("已退出")
