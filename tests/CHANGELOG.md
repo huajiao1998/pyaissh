@@ -428,10 +428,6 @@
 
 ## [2026-09-24] v2.3.0 补十一：测试按"块"选择 + tick 可配 + 全量闸门 + 自证前缀修复
 
-### 背景（用户纠正）
-开发期禁止全量/整个模式测试：全量是发布到 GitHub 前的工作。此前把"相关套件"当成整条
-`live_session`（68 项、7–10 分钟）每次都跑，属浪费。工具层已上闸，不再依赖自觉。
-
 ### 改动
 - `live_session` 拆成 6 个可独立运行的套件：`live_session` / `_ttl` / `_watchdog` / `_lifecycle` /
   `_orphan` / `_bugs`；`_field()` 提到模块级共用；新增 `--suite <名字>[,<名字>]`、`--release`、`--fast`
@@ -470,8 +466,6 @@
   `SESS__LEGACY` 断言、`清洗：去 CR/ANSI/哨兵行/script 头` 改为"script 头行不再特判"。
 - 块描述同步：`live_session_lifecycle` → "会话消亡/外部删目录/残留目录/同名重建"；
   reaper 断言措辞改为"不碰陌生目录"。
-- 本轮跑批：`--unit`（unit_regression 127 / artifacts 16，全 PASS）+ 一处定点（`--no-pty` 被拒）
-  + 冒烟脚本 `stest_tmp/tmuxspike/smoke1.py`（0 FAIL）。按规矩未跑整块/全量。
 ### 说明
 - 用例数与跑批结果由本轮实现方填入——本文档**不预填未实测的数字**。
 

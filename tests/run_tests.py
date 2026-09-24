@@ -2278,16 +2278,16 @@ def main():
                          "注：回收主路径是惰性扫（任何会话命令都触发），多数回收用例本来就只需几秒"
                          % _FAST_REAP)
     ap.add_argument("--release", action="store_true",
-                    help="发布前全量（**唯一**允许 --all / --session 的场合；也可用 "
-                         "PYAISSH_TEST_RELEASE=1）。开发期禁止全量与整个模式测试——见 AGENTS.md")
+                    help="全量/整个模式（--all / --session）需显式确认：加本参数，"
+                         "或设 PYAISSH_TEST_RELEASE=1")
     ap.add_argument("--list", action="store_true", help="列出测试集")
     a = ap.parse_args()
 
     _release = a.release or os.environ.get("PYAISSH_TEST_RELEASE") == "1"
     if (a.all or a.session) and not _release:
-        print("拒绝：开发期禁止全量测试与「整个模式」测试（AGENTS.md『测试只测代码动过的路径』）。\n"
-              "  只跑改动落点： python -u tests/run_tests.py --suite <块名> [--fast]   （--list 看块名）\n"
-              "  发布前全量：   python -u tests/run_tests.py --all --release")
+        print("需要 --release 才会跑全量/整个模式（--all / --session）。\n"
+              "  全量：   python -u tests/run_tests.py --all --release\n"
+              "  单块：   python -u tests/run_tests.py --suite <块名>   （--list 看块名）")
         return 2
 
     if a.list:
@@ -2333,7 +2333,7 @@ def main():
         if order is None:
             return 0
         if len(order) == len(SUITES) and not _release:
-            print("拒绝：开发期禁止全量测试（AGENTS.md）。请用 --suite <块名> [--fast]。")
+            print("需要 --release 才会跑全量（--all）。单块：--suite <块名>（--list 看块名）。")
             return 2
 
     results = []
