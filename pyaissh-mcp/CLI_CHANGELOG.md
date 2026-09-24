@@ -924,7 +924,8 @@
   `wd.fifo`/`wd.log`，**保留** `out.log`/`meta`/`beat`/`last.token`，**新增** `tmux`
   （内容 = tmux 会话名，给 reaper 与人类 attach 用）；根目录新增 `reap.sh` / `.reaper.pid` / `.reaper.log`。
 - **升级路径**：tmux 迁移之前遗留的会话目录**不再识别**（没有 `tmux` 名文件的目录一律当陌生目录）——
-  `run/send/read` 按 `meta` 在不在分别报 `session_dead`/`session_not_found`
+  `run/send/read` 的报错取决于**目录里有没有 `meta`**：有 `meta`（正常起过的旧会话）⇒ `session_dead`；
+  只有 `sess.pid`/`in` 而没有 `meta`（旧引擎半成品/失败启动）⇒ `session_not_found`（与"从没起过"同一种）
   并给 warning，用 `session kill` 清目录后重新 `start`。
 - **既知行为变化（不是 bug）**：① `--no-pty` **参数已删除**（传了被 argparse 拒绝），结果恒 `pty: true`；
   ② 会话内 `TERM` = `tmux-256color`（tmux 强制决定，旧引擎继承 SSH 通道环境、常为空/dumb）；
@@ -956,6 +957,10 @@
   `script` 头尾行的过滤、`_session_info` 的 beat `st_mtime` 兜底；**并把 `--no-pty` 参数整体删除**
   （传了会被 argparse 拒绝，不再 no-op）。`fifo` 作为**契约字段**保留（恒 `null`），字段集不变量不变。
   净减：session 域 1935 → 1898 行（−37），制品 427 → 423 KB；行为面唯一变化是"陌生目录不再被特别标注"。
+- **三条测试反馈收口（同日）**：① 文档把遗留目录的两种形态写死（有 `meta` ⇒ `session_dead`；只有
+  `sess.pid`/`in` ⇒ `session_not_found`，已实测）；② `log_recreated` 明确为 **`warnings[]` 文本 +
+  stderr WARN**（不是独立 JSON 字段）；③ reaper 自退/被 `kill` 停掉时顺手删 `reap.sh` 与 `.reaper.pid`
+  （下次 `start` 重写），根目录只留 `.reaper.log` 台账。
 - **`fifo` 字段删除（同日）**：`session start` 不再返回旧引擎遗留的 `fifo`（曾经恒 `null`，只为迁移期
   字段集不变）；契约基线 `tests/contract/session_contract_v2.json` 的 `start_created`/`start_attach`
   两个用例同步去掉该键，`docs/contract.md`/`docs/session.md` 的说明一并删除。迁移期的"字段集一字不变"

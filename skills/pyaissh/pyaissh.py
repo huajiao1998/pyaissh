@@ -5820,6 +5820,7 @@ _SESSION_REAP_SCRIPT_TPL = """\
 #!/bin/bash
 # pyaissh 每主机 reaper（自动生成，勿手改；生成方：pyaissh session start）
 # 用法：reap.sh --once（扫一遍就退）｜reap.sh --loop（常驻，每 @@INTERVAL@@ 秒一遍，无会话目录自退）
+# 自退/被 kill 停止时顺手删掉本脚本与 .reaper.pid（下次 start 会重写）；.reaper.log 台账保留
 ROOT='@@ROOT@@'
 INTERVAL=@@INTERVAL@@
 LOOP=0
@@ -5834,7 +5835,7 @@ while :; do
   reap_once
   n=0
   for d in "$ROOT"/*/; do [ -d "$d" ] && n=$((n+1)); done
-  if [ "$n" -eq 0 ]; then rm -f "$ROOT/.reaper.pid" 2>/dev/null; exit 0; fi
+  if [ "$n" -eq 0 ]; then rm -f "$ROOT/.reaper.pid" "$ROOT/reap.sh" 2>/dev/null; exit 0; fi
   sleep "$INTERVAL"
 done
 """
@@ -5923,7 +5924,7 @@ def _session_reaper_stop_cmd(root):
             "if [ -n \"$P\" ] && kill -0 \"$P\" 2>/dev/null && "
             "ps -o args= -p \"$P\" 2>/dev/null | grep -qF \"$D/reap.sh\"; then "
             "kill \"$P\" 2>/dev/null && echo __PYAISSH_SESS__REAPER=stopped; fi; "
-            "rm -f \"$D/.reaper.pid\" 2>/dev/null; "
+            "rm -f \"$D/.reaper.pid\" \"$D/reap.sh\" 2>/dev/null; "
             "for q in $(ps -eo pid=,args= 2>/dev/null | awk -v pat=\"$D/reap.sh --loop\" "
             "'index($0, pat) {print $1}'); do kill \"$q\" 2>/dev/null; done; "
             "echo __PYAISSH_SESS__DONE=1" % q(root))

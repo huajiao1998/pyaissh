@@ -473,7 +473,8 @@ def suite_unit_regression(s):
     s.check("reaper 脚本：只有提示符空闲（前台是 shell）才收，判不出就不收",
             "pane_current_command" in _rs and "bash|sh|dash|zsh|ksh|-bash" in _rs)
     s.check("reaper 脚本：没有会话目录时下一轮自退并清掉 pid 文件（不留空转常驻）",
-            'if [ "$n" -eq 0 ]; then rm -f "$ROOT/.reaper.pid" 2>/dev/null; exit 0; fi' in _rs,
+            'if [ "$n" -eq 0 ]; then rm -f "$ROOT/.reaper.pid" "$ROOT/reap.sh" 2>/dev/null; '
+            'exit 0; fi' in _rs,
             _rs[-320:])
     s.check("reaper 脚本：不碰陌生目录（没有 tmux 名文件的目录直接跳过）",
             '[ -z "$TN" ]; then continue' in _rs)

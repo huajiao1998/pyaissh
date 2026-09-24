@@ -76,7 +76,7 @@
 | **ENG-09** | `kill` = 先取 pane_pid 的进程树闭包快照 → `kill-session -t '=NAME'` → 对闭包幸存者 TERM→KILL→校验 → `rm -rf 目录`（`--keep-dir` 跳过）；`swept` = 闭包大小，`roots` = 是否有自证根，`verified` = 有根且无幸存；`orphans*` 恒空返回 | 账实合一；闭包快照保留旧引擎"连作业一起清"的语义（S10 的脱离进程是共同盲区） |
 | **ENG-10** | `--no-pty` 参数**已删除**（连同非 PTY 降级路径）：传了会被 argparse 拒绝（rc=2），不静默忽略 | tmux 永远有 PTY（`pty: true`） |
 | **ENG-11** | 依赖预检：`command -v tmux` + `tmux -V` 取版本号；`< 3.0` 报 `tmux_unsupported`；**不自动安装**，错误里给出可执行安装命令（apt/dnf/yum/apk） | 无包管理器/不可变系统装不了 ⇒ UPG-02 |
-| **ENG-12** | `out.log` 被外部删除/清空/轮转 ⇒ offset 读识别"变小/消失"→ 重建基线 + warning `log_recreated`，并不带 `-o` 重 arm 管道 | 会话状态在 tmux、日志在 /tmp，生命周期解耦（S5） |
+| **ENG-12** | `out.log` 被外部删除/清空/轮转 ⇒ offset 读识别"变小/消失"→ 重建基线，并不带 `-o` 重 arm 管道；提示以 **`warnings[]` 里的一条文本 + stderr `[WARN]`** 交付（文本含 `log_recreated` 字样，**不是独立 JSON 字段**） | 会话状态在 tmux、日志在 /tmp，生命周期解耦（S5） |
 
 ---
 
@@ -88,7 +88,7 @@
 | **REAP-02** | **惰性扫**：任何会话子命令入口先给**本次目标会话**续期，**再**扫其它会话；回收判据 = `beat` 过期 > TTL **且** `#{pane_current_command}` 属 shell（空闲）；**判不出 ⇒ 视为忙，不回收** |
 | **REAP-03** | **每主机一个 reaper**（替代 N 个每会话看门狗）：`<root>/reap.sh --once` 做一次清扫；`<root>/.reaper.pid` 记账；由会话命令按需拉起（幂等：pid 文件存在且进程活着就不重复拉）→ `setsid nohup bash reap.sh --loop </dev/null >/dev/null 2>&1 &`，`--loop` = 每 300s 一次，**无会话目录时自退**；回收动作：`kill-session` + `rm -rf 目录`，每次回收往 `<root>/.reaper.log` 追加一行（超 64KB 先截断） |
 | **REAP-04** | 语义变化写进文档：从"服务器端准点回收"变为"**惰性扫 + 每 5 分钟 reaper**"；`--ttl 0` 关闭；`list` 的 `ttl_seconds`/`idle_seconds`/`expires_in_seconds` **字段与口径不变** |
-| **REAP-05** | 目录内容变化：**删除** `in`(FIFO)/`watch.sh`/`watch.pid`/`wd.fifo`/`wd.log`/`sess.pid`/`bash.pid`/`err.log`；**保留** `out.log`/`meta`/`beat`/`last.token`；**新增** `<dir>/tmux`（内容 = tmux 会话名，给 reaper 与人类 attach 用） |
+| **REAP-05** | 目录内容变化（另：会话全清后 `reap.sh`/`.reaper.pid` 会被删掉，根目录只剩 `.reaper.log` 台账）：**删除** `in`(FIFO)/`watch.sh`/`watch.pid`/`wd.fifo`/`wd.log`/`sess.pid`/`bash.pid`/`err.log`；**保留** `out.log`/`meta`/`beat`/`last.token`；**新增** `<dir>/tmux`（内容 = tmux 会话名，给 reaper 与人类 attach 用） |
 | **REAP-06** | reaper 判闲判据与惰性扫一致（`#{pane_current_command}` 属 shell 才算空闲；判不出 ⇒ 不回收） |
 
 ---
@@ -121,7 +121,7 @@
 | ERR-02 | `tmux_unsupported` | `tmux -V` 解析出的版本 `< 3.0`（依赖 `window-size manual` 与 `#{pane_pipe}`，实测仅 3.5a） | false |
 | ERR-03 | `tmux_failed` | server/socket 起不来（`TMUX_TMPDIR` 不可写、`new-session` 非零退出） | true |
 | ERR-04 | `pipe_dead`（**warning，非 error**） | `pipe-pane` 无法 arm / 重 arm 后 `out.log` 仍不增长（`ready=false` + warning） | — |
-| ERR-05 | `log_recreated`（warning，非 error） | `out.log` 被删/变小 → offset 重建 + 重 arm | — |
+| ERR-05 | `log_recreated`（**warnings 文本，非 JSON 字段、非 error**） | `out.log` 被删/变小 → offset 重建 + 重 arm | — |
 | ERR-06 | 既有类型全部保留（见 INV-03） | — | — |
 
 ---
@@ -130,7 +130,7 @@
 
 | ID | 判据 |
 |---|---|
-| **UPG-01** | **不识别** tmux 迁移之前遗留的会话目录：没有 `tmux` 名文件的目录一律当陌生目录——`read/run` 按 `meta` 在不在分别报 `session_dead`/`session_not_found`，`kill --all` 只处理有 `tmux`/`meta` 的目录，reaper 直接跳过；遗留目录由人自行 `rm -rf` |
+| **UPG-01** | **不识别** tmux 迁移之前遗留的会话目录：没有 `tmux` 名文件的目录一律当陌生目录——`read/run` 按**有没有 `meta`** 分别报：有 `meta` ⇒ `session_dead`；只有 `sess.pid`/`in` ⇒ `session_not_found`（实测两种形态，见 §8 V6），`kill --all` 只处理有 `tmux`/`meta` 的目录，reaper 直接跳过；遗留目录由人自行 `rm -rf` |
 | **UPG-02** | 无 tmux 的环境（air-gapped / 不可变系统 / 无包管理器）→ session 模式不可用并给出可执行提示；`exec` / `exec --detach` **不受影响**（长任务仍有出路） |
 | **UPG-03** | 旧引擎代码**删除**（不留 `PYAISSH_SESSION_ENGINE` 开关、不双引擎） |
 

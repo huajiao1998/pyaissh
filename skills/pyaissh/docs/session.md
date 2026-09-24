@@ -112,7 +112,9 @@ pyaissh session kill  h --name work                       # 收尾（tmux 会话
 | `tmux` | 该会话的 tmux 会话名（reaper 与人类 attach 用） | 0600 |
 
 根目录另有 `reap.sh`（reaper 脚本，0700）、`.reaper.pid`（pid + 间隔指纹）、`.reaper.log`
-（回收日志，超 64KB 只留尾 200 行）。**旧引擎的 `in`(FIFO)/`sess.pid`/`bash.pid`/`watch.*`/`wd.*`/
+（回收台账，超 64KB 只留尾 200 行）。**会话全清后根目录只剩 `.reaper.log`**：`reap.sh` 与
+`.reaper.pid` 会在 reaper 自退或被 `kill` 停掉时删掉（下次 `start` 会重写），台账留着是为回答
+"我的会话什么时候被谁收了"。**旧引擎的 `in`(FIFO)/`sess.pid`/`bash.pid`/`watch.*`/`wd.*`/
 `err.log` 都不再产生**——如果看到它们，说明这个目录是 tmux 迁移之前起的；pyaissh 不识别这种目录
 （当陌生目录处理），自行 `rm -rf` 即可。
 
@@ -145,7 +147,8 @@ tmux -L pyaissh attach -t "=$(cat /tmp/pyaissh-sessions/work/tmux)"  # 看直播
 5. **输出镜像是"字节流"，但管道会静默死于文件被删**：`pipe-pane` 的 `cat` 若还在往**已 unlink 的
    inode** 写，新输出就丢了（`#{pane_pipe}` 仍是 1，看不出来）。所以 `read`/`run` 前会查
    `#{pane_pipe}` 与 `out.log` 是否存在：管道死了**带 `-o`** 重 arm（已有管道时是 no-op）；
-   文件被外部删了则**不带 `-o`** 重 arm（让 `cat >>` 重建文件）并给 `log_recreated` 提示。
+   文件被外部删了则**不带 `-o`** 重 arm（让 `cat >>` 重建文件），并在 `warnings[]` 里给一条提示
+（文本含 `log_recreated`，同时打一条 stderr `[WARN]`）——**它不是一个独立的 JSON 字段**。
 6. **`ctrl-c` 靠 tty 行规程，不靠自己发信号**：`send-keys C-c` 由 pane 的行规程把 SIGINT 送到
    **前台进程组**——这正是终端里 Ctrl-C 的语义（`pane_current_command` 从 `sleep` 回到 `bash`）。
    `--force` 用内核给出的前台组 `ps -o tpgid= -p <pane_pid>` + `kill -KILL -- -PGID`：只杀那个作业、
