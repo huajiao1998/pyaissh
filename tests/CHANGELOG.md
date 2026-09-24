@@ -297,3 +297,26 @@
 - 该变量的定位是"极慢链路单次大读 >30s"的逃生阀，**语义不变**（仍是"多久无成功往返判死"），
   默认仍 30 秒；优先级：显式 open_sftp(io_timeout) > 环境变量 > 默认
 - B1 的主修法仍是轮询记账（touch），不是绕过/调大——这条只是给极慢链路留的多余退路
+
+## [2026-09-24] v2.3.0 补五：会话残留治理（kill 加固 / 无根不误报 / 会话年龄）
+
+### 新增用例
+- unit_regression +5（92 PASS）：kill 命令结构（根候选含 `sess.pid`/`bash.pid`/会话 shell 的父进程）、
+  根自证闸门（`case "$A" in *"$D"*)`，防 pid 回收误杀）、`ROOTS`/`HAD` 标记回传、
+  awk 根用循环变量 `$r`（不再写死 `$P`）、24h 常驻提醒常量
+- live_session 36 → 43（**43 PASS / 0 FAIL**）：
+  ① `list` 给出 `started_at`/`age_seconds`（看得出会挂了多久）；
+  ② `kill` 报 `roots>=1` + `verified=true`（有自证的根、无幸存者）；
+  ③ **孤儿兜底**：先 `kill -9` 掉 starter（script/bash -i 被 reparent 到 1 号进程）→ `session kill`
+     仍 `swept>=2`、`remaining=0`、`verified=true`，且事后 `ps -eo pid,args | grep pyaissh-sessions` 为 0；
+  ④ **无根不误报**：两个根都杀掉 + 删掉 `sess.pid`/`bash.pid` → 回 `roots:0` + `verified:false`
+     + warning（"未获确认"），不再宣称已清理；
+  ⑤ **闲置 35s 后会话仍可用**（常驻不自退、无 idle 超时）
+### 说明
+- 这套用例回答的是用户提问："session 能退出干净吗？用了不管它会自己退出吗？"——实测结论：
+  **不会自退**（`setsid+nohup` 常驻；代码里无任何 TTL/idle 回收），本地侧永远干净（每次调用都是短命客户端）
+- 离线验证（不占真机时间，可复用）：新 kill 命令 `bash -n` 语法；awk 闭包在**合成进程表**上的三态
+  （正常 root=100→{100,200,300}；孤儿 root=200→{200,300}；陈旧 pid→空集不误杀）；两根交集去重后
+  SWEPT 计数正确；自证闸门 reject/pass
+- 夹具坑记录：`kill -9` starter 后要 `sleep 0.5` 再查 `kill -0 bash.pid`，否则可能读到"还在"的假象；
+  无根场景必须**先杀进程再删 pid 文件**，顺序反了会退化成"孤儿兜底"分支（用例就测不到无根路径）
