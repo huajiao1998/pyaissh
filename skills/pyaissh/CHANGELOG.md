@@ -578,3 +578,44 @@
   即**旧内容仍比基线瘦**，新内容按"第二工作模式"完整保留。
 - **教训（写进取舍线）**：正文可以砍"为什么/历史/实测过程"，**不能砍"默认行为、字段名、错误名、可选写法"**——
   这些是 AI 做决策和写重试逻辑的输入，删掉后它只能去猜或白跑一次。
+
+### 加固：会话残留治理（v2.3.0，R1）
+
+- **起因（用户提问）**："session 能退出干净吗？AI 用了不管它，会自己退出吗？" —— 结论：
+  **不会自退，用完必须 `kill`**。会话是 `setsid nohup` 起的远端常驻进程（"SSH 断开照跑"正是设计目的），
+  代码里**没有任何 idle 超时/TTL/自动回收**（`SESSION_WAIT_MAX` 等只是客户端等待上限）；
+  本地侧则永远干净——每次 `pyaissh …` 都是短命客户端，不会阻塞继续用 `exec`。
+  结束只有三条路：`session kill`（默认连目录删）/ 会话里的 shell 自己 `exit`（进程没了但
+  `/tmp` 目录与 `out.log` 仍在）/ 远端重启。
+- **读码发现两个真问题**：
+  1. **`kill` 会无声误报"清干净"**：清理集合原先是"从 `sess.pid` 的 starter 做进程树闭包"。
+     starter 若被 OOM/外力杀掉，`script` 与 `bash -i` 会被 reparent 到 1 号进程 ⇒ 闭包为空 ⇒
+     返回 `swept=0, remaining=0, cleaned=true`，**而会话仍在跑**。
+  2. **文案过时**：`kill --help`、docstring、warning 仍写"按 **sid** 全量清理"——实现早在 B 系列
+     修复时就改成进程树闭包（代码注释自己写着"为什么不用 sid：script 的子 shell 自己 setsid"）。
+- **改法**：
+  - 根候选扩为三个：`sess.pid`(starter) / `bash.pid`(会话 shell) / 会话 shell 的父进程(`script`)，
+    闭包取并集去重（starter 已死的场景由 `script` 兜底——它的 argv 里带 out.log 路径，
+    闭包覆盖 script + bash -i + 正在跑的命令）。
+  - 每个根必须**自证**：`ps -o args=` 里含本会话目录，不自证就不作为根 ⇒ **堵住 pid 回收误杀
+    无关进程树**（旧实现同样有这隐患，只是没触发过）。
+  - 三个根都不可用时（`ROOTS=0`）**不猜也不杀**：回 `roots: 0` + `verified: false` + warning
+    （附 `ps -eo pid,ppid,tty,args | grep -E 'script -qfc|pyaissh-sessions'` 自查命令），
+    不再宣称清理完成；结果新增 `remaining_total`/`verified_total` 汇总。
+  - `session list` 增加 `started_at`/`age_seconds`（meta 第三个字段本来就写了启动时间，此前被忽略），
+    并对"挂了超过 24 小时仍活着"的会话给一条提醒（`out.log` 只增不减，别白占远端磁盘）。
+  - 修掉 3 处"按 sid"死文案（CLI `--help` + 子命令 description、`cmd_session_kill` docstring、warning）。
+- **文档**：SKILL.md 会话段加"**用完必须 `kill`**"一条；`docs/session.md` 新增
+  「会话会残留吗？（生命周期与清理）」——3 进程 + 目录清单、结束的三条路、`verified` 语义、
+  `kill --all`/`--keep-dir`、以及"本地侧为何永远干净"。
+- **验证（离线四项，已过）**：① 新 kill 命令 `bash -n` 语法；② awk 闭包在合成进程表上的行为
+  （正常会话 root=100→{100,200,300}、**孤儿场景** root=200→{200,300}、陈旧 pid→空集不误杀）；
+  ③ 两根交集去重后 SWEPT 计数正确；④ 自证闸门（argv 不带会话目录 → reject）。
+  `--unit` +5（kill 命令结构/自证闸门/ROOTS-HAD 回传/awk 用循环变量/24h 常量），
+  `live_session` +8 项（孤儿兜底、无根不误报、闲置不自退、list 年龄字段、kill roots+verified）。
+- **真机验证（测试机 A，`--session` 套件）**：**43 PASS / 0 FAIL**，新增 8 项全绿——
+  `list` 的 `started_at`/`age_seconds` 正常；`kill` 报 `roots>=1` + `verified=true` 且事后
+  `pgrep -x script` 为 0；**孤儿场景**（`kill -9` 掉 starter 后 script/bash -i 被 reparent）
+  仍 `swept>=2`、`remaining=0`、`verified=true`、无残留进程；**无根场景**（两个根都杀 + 删 pid 文件）
+  回 `roots:0` + `verified:false` + warning（未获确认）而不再谎报；**闲置 35 秒**后会话仍能跑命令
+  （不自退、无 idle 超时）。

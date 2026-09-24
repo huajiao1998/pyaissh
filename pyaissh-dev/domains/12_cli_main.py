@@ -487,13 +487,20 @@ def build_parser():
   pyaissh session run   h --name work --cmd 'make -j8' --wait-rc 5      # 状态还在（cwd 仍是 /opt/app）
   pyaissh session ctrl-c h --name work                   # 中断正在跑的 make（会话不死）
   pyaissh session keys  h --name work --data 'y\\n'       # 应答程序提示（y/n、密码等）
-  pyaissh session kill  h --name work                    # 结束会话（按 sid 全量清理）
+  pyaissh session kill  h --name work                    # 结束会话（进程树全清 + 删目录）
+  pyaissh session kill  h --all                          # 清掉该主机上全部会话（含忘了关的）
 
 与 exec / exec --detach 的分工:
   exec              一次一条、无状态（cd/export 不跨调用）、stdout/stderr 分离、零残留
   exec --detach     一条长命令丢后台，启动后不能改，错了只能 --kill 重启（可中断但无状态）
   session           多步·需状态·可能要中断·要应答提示：逐条喂 + 状态保留 + ctrl-c + keys
                     （run = send + 等结果，一步一次调用；send/read 分离时用于增量读）
+
+会话的生命周期（重要）:
+  会话是 setsid+nohup 起的**远端常驻进程，不会自己退出**（SSH 断开也照跑）——
+  用完必须 session kill（默认连目录一起删，--keep-dir 保留日志）；
+  会话里 exit 掉、或进程被 OOM/外力杀掉时，进程会消失但 /tmp 下的目录与日志仍在。
+  list 会给你 age_seconds/log_bytes，挂了超过 24 小时的会额外提示。
 
 载荷字段: stdout（合并流，已清洗 CR/ANSI/哨兵行）/ next_offset / status(done|running)
           / exit_code / token / session / pid / pty
@@ -588,8 +595,9 @@ def build_parser():
     ssl.set_defaults(func=cmd_session_list)
 
     ssz = ss.add_parser("kill", help="结束会话（按 sid 全量清理，默认连目录一起删）",
-                        description="TERM → 校验 → KILL 残留；只杀 leader 进程组会留 job 孤儿，"
-                                    "所以按 sid 全量枚举")
+                        description="以自证的会话进程（sess.pid / bash.pid / script）为根算进程树闭包，"
+                                    "TERM → 校验 → KILL 残留：只杀 leader 进程组会留 job 孤儿，"
+                                    "只按 sess.pid 会在 starter 已被 OOM/外力杀掉时漏掉 reparent 的孤儿")
     add_conn(ssz)
     ssz.add_argument("--name", help="会话名")
     ssz.add_argument("--all", action="store_true", help="结束该主机全部会话")

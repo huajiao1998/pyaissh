@@ -335,6 +335,20 @@ def suite_unit_regression(s):
     s.check("--data 转义：\\n/\\r/\\t/\\xNN/\\\\ 与原文",
             un("y\\n") == "y\n" and un("a\\tb") == "a\tb" and un("\\x03") == "\x03"
             and un("\\\\") == "\\" and un("plain") == "plain", repr((un("y\\n"), un("\\x03"))))
+    # kill 命令（R1 加固）：两个根 + 根自证闸门 + ROOTS/HAD 回传
+    _kc = m._session_kill_cmd(m._session_files("/tmp/pyaissh-sessions", "demo"))
+    s.check("kill 命令：根候选含 sess.pid / bash.pid / 会话 shell 的父进程",
+            "sess.pid" in _kc and "bash.pid" in _kc and 'ps -o ppid= -p "$B"' in _kc,
+            _kc[:160])
+    s.check("kill 命令：根自证闸门（argv 必须含本会话目录，防 pid 回收误杀）",
+            'case "$A" in *"$D"*)' in _kc and 'D=' in _kc, _kc[:160])
+    s.check("kill 命令：回传 ROOTS/HAD 供上层判 verified/是否告警",
+            "__PYAISSH_SESS__ROOTS=$ROOTS" in _kc and "__PYAISSH_SESS__HAD=$HAD" in _kc,
+            _kc[:160])
+    s.check("kill 命令：awk 根按循环变量（不再写死 $P）",
+            'awk -v root="$r"' in _kc and 'awk -v root="$P"' not in _kc, _kc[:160])
+    s.check("list 会话年龄常量（24h 提醒）", m._SESSION_STALE_HINT == 86400,
+            repr(m._SESSION_STALE_HINT))
     # 哨兵包裹（真 bug 的护栏：哨兵必须与命令同一行被解析，否则被 read 吃掉）
     pl = m._session_payload_text("read -p 'x' V; echo $V", "abcd1234")
     s.check("命令与哨兵同一行（{ ...; }; echo 哨兵）",
@@ -1266,6 +1280,11 @@ def suite_live_session(s):
             for x in (jl or {}).get("sessions", [])]
     s.check("list 含本会话且 running/pty", bool(jl) and any(
         r[0] == name and r[1] == "running" and r[2] for r in rows), repr(rows))
+    _aged = [x for x in (jl or {}).get("sessions", []) if x.get("session") == name]
+    s.check("list 给出 started_at/age_seconds（看得出会挂了多久）",
+            bool(_aged) and isinstance(_aged[0].get("started_at"), int)
+            and isinstance(_aged[0].get("age_seconds"), int)
+            and 0 <= _aged[0]["age_seconds"] < 3600, repr(_aged[:1])[:200])
 
     # kill：进程树闭包（不只是删目录）
     _live_run(["session", "send", tgt, "--name", name, "--cmd", "sleep 200 &"], timeout=60)
@@ -1277,12 +1296,65 @@ def suite_live_session(s):
     s.check("kill 后无残留、目录已清",
             bool(jz) and jz.get("remaining_total") == 0 and row.get("cleaned") is True,
             repr(jz)[:180])
+    s.check("kill 报了自证的根（roots>=1）且 verified=true",
+            bool(jz) and (row.get("roots") or 0) >= 1 and row.get("verified") is True,
+            repr(row)[:200])
     rc, js, _ = _live_run(["exec", tgt, "--cmd", "pgrep -x script | wc -l"], timeout=60)
     s.check("远端无 script 残留（会话进程真被杀）",
             bool(js) and (js.get("stdout") or "").strip() == "0", repr(js.get("stdout")))
     rc, jsl, _ = _live_run(["session", "list", tgt], timeout=60)
     s.check("kill 后该会话不在 list", bool(jsl) and not any(
         x.get("session") == name for x in (jsl.get("sessions") or [])), repr(jsl)[:140])
+
+    # ---- 残留护栏（v2.3.0 加固 R1：会话是 setsid+nohup 的常驻进程，不会自己退出）----
+    # ① starter 被外力杀掉（模拟 OOM）：script/bash -i 会被 reparent →
+    #    kill 必须靠 bash.pid / script 兜底清干净（旧版只按 sess.pid 做闭包 ⇒ 空集 ⇒ 误报清干净）
+    _orph = name + "or"
+    _live_run(["session", "start", tgt, "--name", _orph], timeout=90)
+    _live_run(["session", "run", tgt, "--name", _orph, "--cmd", "sleep 300 &",
+               "--wait-rc", "3"], timeout=60)
+    rc, _jo, _ = _live_run(["exec", tgt, "--cmd",
+                            "kill -9 $(cat /tmp/pyaissh-sessions/%s/sess.pid); sleep 0.5; "
+                            "kill -0 $(cat /tmp/pyaissh-sessions/%s/bash.pid) 2>/dev/null "
+                            "&& echo ORPHAN_ALIVE" % (_orph, _orph)], timeout=60)
+    s.check("孤儿场景就绪（starter 已死、script/bash -i 仍在）",
+            bool(_jo) and "ORPHAN_ALIVE" in (_jo.get("stdout") or ""), repr(_jo)[:160])
+    rc, _jok, _ = _live_run(["session", "kill", tgt, "--name", _orph], timeout=120)
+    _rowk = ((_jok or {}).get("sessions") or [{}])[0]
+    s.check("R1 孤儿兜底：starter 已死也能清干净（swept>=2、remaining=0、verified）",
+            bool(_jok) and (_rowk.get("swept") or 0) >= 2 and _jok.get("remaining_total") == 0
+            and _rowk.get("verified") is True, repr(_rowk)[:200])
+    rc, _jr1, _ = _live_run(["exec", tgt, "--cmd",
+                             "ps -eo pid,args | grep -c '[p]yaissh-sessions/%s'" % _orph],
+                            timeout=60)
+    s.check("R1 孤儿场景后无残留进程", bool(_jr1) and (_jr1.get("stdout") or "").strip() == "0",
+            repr(_jr1.get("stdout")))
+
+    # ② 两个根都不可用（进程被杀 + pid 文件删掉）→ 不许无声宣称"清干净"，
+    #    必须 roots=0 + verified=false + warning（附 ps 自查）
+    _ghost = name + "gh"
+    _live_run(["session", "start", tgt, "--name", _ghost], timeout=90)
+    _live_run(["exec", tgt, "--cmd",
+               "kill -9 $(cat /tmp/pyaissh-sessions/{g}/sess.pid) "
+               "$(cat /tmp/pyaissh-sessions/{g}/bash.pid) 2>/dev/null; sleep 0.5; "
+               "rm -f /tmp/pyaissh-sessions/{g}/sess.pid /tmp/pyaissh-sessions/{g}/bash.pid".format(g=_ghost)],
+              timeout=60)
+    rc, _jg, _ = _live_run(["session", "kill", tgt, "--name", _ghost], timeout=120)
+    _rowg = ((_jg or {}).get("sessions") or [{}])[0]
+    s.check("R1 无根时不误报：roots=0 + verified=false + warning(未获确认)",
+            bool(_jg) and _rowg.get("roots") == 0 and _rowg.get("verified") is False
+            and any("未获确认" in w for w in (_jg.get("warnings") or [])), repr(_jg)[:240])
+
+    # ③ 会话不自退：放着不动 35s（超过看门狗窗口）后仍能跑命令
+    _idle = name + "id"
+    _live_run(["session", "start", tgt, "--name", _idle], timeout=90)
+    time.sleep(35)
+    rc, _ji, _ = _live_run(["session", "run", tgt, "--name", _idle, "--cmd", "echo IDLE_OK",
+                            "--wait-rc", "10"], timeout=60)
+    s.check("闲置 35s 后会话仍可用（常驻不自退、无 idle 超时）",
+            bool(_ji) and _ji.get("exit_code") == 0 and "IDLE_OK" in (_ji.get("stdout") or ""),
+            repr(_ji)[:160])
+    _live_run(["session", "kill", tgt, "--name", _idle], timeout=60)
 
     # ---- 真机复现的 5 个 bug 的回归护栏（v2.3.0；外部评审报的，逐个先复现再修）----
     # B3：read --lines N 曾被完全忽略（20000 行日志 --lines 5 回传上万行）

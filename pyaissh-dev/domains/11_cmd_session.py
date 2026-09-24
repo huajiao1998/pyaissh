@@ -11,7 +11,8 @@
 - util-linux `script` 给出真 PTY：`test -t 0` 为真、`tty` = /dev/pts/N，可应答 `read -p` 提示
 - PTY 下 bash 有 job control → **每条命令独立进程组** → `kill -INT -- -<pgid>` 即 Ctrl-C 语义
 - 往 FIFO 写 0x03 想靠 pty 行规程转 SIGINT **实测无效** ⇒ 本实现只用进程组信号
-- 只杀会话 leader 的进程组会留下 job 自己的进程组（实测踩过孤儿）⇒ kill 按 sid 全量枚举
+- 只杀会话 leader 的进程组会留下 job 自己的进程组（实测踩过孤儿）
+  ⇒ kill 按**进程树闭包**清（不是按 sid：见 `_session_kill_cmd` docstring）
 """
 
 _SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")  # 防路径穿越
@@ -19,6 +20,9 @@ _SESSION_RC_RE = re.compile(re.escape(SESSION_RC_PREFIX) + r"([0-9a-f]{4,16})__(
 # 远端标记统一 `__PYAISSH_SESS__KEY=VALUE`（v2.3：早期写成 `__KEY__VALUE__KEY2__VALUE2`，
 # 贪婪匹配会把 PID 吃成 "63864__PTY__1"——实测踩到）
 _SESSION_MARK_RE = re.compile(r"__PYAISSH_SESS__([A-Z_]+)=(\S*)")
+
+# list 里对"挂了超过这个时长还活着"的会话给一条提醒（用久了忘 kill 的护栏）
+_SESSION_STALE_HINT = 86400
 
 
 def _session_files(root, name):
@@ -189,25 +193,49 @@ def _session_ctrl_c_cmd(f, sig, escalate=True):
 
 
 def _session_kill_cmd(f, keep_dir=False):
-    """结束会话：一次性算出「starter 进程树闭包」→ TERM → 对幸存者 KILL → 校验。
+    """结束会话：以**自证的会话进程**为根算进程树闭包 → TERM → 对幸存者 KILL → 校验。
 
     为什么不用 sid：实测 `script` 的子 shell 自己 setsid 成**新会话**，starter 的 sid
     与 pty 会话无关（早期版本按 sid 清理 ⇒ 会话其实没死、留下 sleep 孤儿）。
     为什么先算集合：父进程被杀后子进程会被 reparent，事后再按树算会漏。
+
+    v2.3.0 加固（R1：不再无声误报"清干净"）：
+    - 根候选三个：`sess.pid`(starter) / `bash.pid`(会话 shell) / 会话 shell 的父进程(`script`)。
+      为什么加后两个：starter 若被 OOM/外力杀掉，`script` 与 `bash -i` 会被 reparent 到 1 号进程，
+      只按 sess.pid 算闭包得空集 ⇒ 旧版会报 swept=0/remaining=0/cleaned=true 而会话仍在跑；
+      此时从 `script`（argv 里带 out.log 路径）做根，闭包仍覆盖 script + bash -i + 正在跑的命令。
+    - 根必须**自证**：`ps -o args=` 里含本会话目录（bash -i 自己的 argv 没路径，故看它父进程）。
+      这同时堵住 pid 回收误杀——陈旧 pid 被无关进程复用时，argv 不含本会话目录 → 不作为根。
+    - `ROOTS=0`（三个候选都不可用/都不自证）时**不猜不杀**，输出 ROOTS=0 让上层把
+      `verified` 置 false 并给 warning（附自查命令），而不是宣称已清理。
+    - `HAD=1`（目录还在）：上层据此区分"会话本来就没起过"（不必告警）与"可能有孤儿"（告警）。
     """
     q = _sh_quote
     rm = "" if keep_dir else "rm -rf %s" % q(f["dir"])
-    return ("P=$(cat %s 2>/dev/null); SWEPT=0; LEFT=0; "
-            "if [ -n \"$P\" ]; then "
-            "T=$(ps -eo pid=,ppid= | %s); SWEPT=$(echo $T | wc -w | tr -d ' '); "
+    return ("D=%s; HAD=0; [ -d \"$D\" ] && HAD=1; "
+            "P=$(cat %s 2>/dev/null); B=$(cat %s 2>/dev/null); "
+            "T=\"\"; SEEN=\"\"; ROOTS=0; SWEPT=0; LEFT=0; SNAP=$(ps -eo pid=,ppid=); "
+            "for r in \"$P\" \"$B\" \"$(ps -o ppid= -p \"$B\" 2>/dev/null | tr -d ' ')\"; do "
+            "[ -n \"$r\" ] || continue; [ \"$r\" = 1 ] && continue; "
+            "case \" $SEEN \" in *\" $r \"*) continue ;; esac; "
+            "kill -0 \"$r\" 2>/dev/null || continue; "
+            "A=$(ps -o args= -p \"$r\" 2>/dev/null); "
+            "case \"$A\" in *\"$D\"*) ;; *) continue ;; esac; "
+            "SEEN=\"$SEEN $r\"; ROOTS=$((ROOTS+1)); T=\"$T $(echo \"$SNAP\" | %s)\"; "
+            "done; "
+            "T=$(echo $T | tr ' ' '\\n' | sort -u -n | tr '\\n' ' '); "
+            "SWEPT=$(echo $T | wc -w | tr -d ' '); "
+            "if [ -n \"$T\" ]; then "
             "kill -TERM $T 2>/dev/null; sleep 0.6; "
             "K=\"\"; for p in $T; do kill -0 \"$p\" 2>/dev/null && K=\"$K $p\"; done; "
             "if [ -n \"$K\" ]; then kill -KILL $K 2>/dev/null; sleep 0.4; fi; "
             "for p in $T; do kill -0 \"$p\" 2>/dev/null && LEFT=$((LEFT+1)); done; "
             "fi; "
             "echo \"__PYAISSH_SESS__SWEPT=$SWEPT\"; echo \"__PYAISSH_SESS__LEFT=$LEFT\"; "
+            "echo \"__PYAISSH_SESS__ROOTS=$ROOTS\"; echo \"__PYAISSH_SESS__HAD=$HAD\"; "
             "rm -f %s %s; %s; echo __PYAISSH_SESS__CLEANED=1"
-            % (q(f["pid"]), _SESSION_TREE_AWK % "$P", q(f["pid"]), q(f["bash"]), rm))
+            % (q(f["dir"]), q(f["pid"]), q(f["bash"]), _SESSION_TREE_AWK % "$r",
+               q(f["pid"]), q(f["bash"]), rm))
 
 
 def _session_clean_text(s, strip_ansi=True):
@@ -994,7 +1022,7 @@ def cmd_session_list(args):
                 if not _SESSION_NAME_RE.match(name):
                     continue
                 f = _session_files(root, name)
-                pid, pty, cols = None, None, None
+                pid, pty, cols, started = None, None, None, None
                 try:
                     with sftp.open(f["pid"], "r") as fh:
                         t = fh.read().decode("utf-8", "replace").strip()
@@ -1007,6 +1035,9 @@ def cmd_session_list(args):
                     if parts:
                         pty = parts[0] == "1"
                         cols = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+                        # meta 第三个字段是 start 时写的 epoch 秒——用来算"这会话挂了多久"
+                        # （AI 用完忘了 kill 的会话，此前在 list 里看不出年龄）
+                        started = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
                 except Exception:
                     pass
                 log_bytes, mtime = None, None
@@ -1016,6 +1047,8 @@ def cmd_session_list(args):
                 except Exception:
                     pass
                 sessions.append({"session": name, "pid": pid, "pty": pty, "cols": cols,
+                                 "started_at": started,
+                                 "age_seconds": (int(time.time()) - started) if started else None,
                                  "log": f["log"], "log_bytes": log_bytes,
                                  "mtime": mtime, "dir": f["dir"]})
                 if isinstance(pid, int):
@@ -1031,6 +1064,15 @@ def cmd_session_list(args):
             if sessions:
                 result["next_action"] = ("读某个会话：session read --name <name>；"
                                          "结束它：session kill --name <name>")
+                stale = [s for s in sessions
+                         if s.get("alive") and (s.get("age_seconds") or 0) >= _SESSION_STALE_HINT]
+                if stale:
+                    # "用了忘了关"的护栏：会话不自退、out.log 只增不减，挂久了白占远端资源
+                    result["warnings"].append(
+                        "会话 %s 已常驻超过 %d 小时（会话不会自己退出；out.log 只增不减）——"
+                        "不再需要时请 session kill"
+                        % (",".join("%s(%.1fh)" % (s["session"], s["age_seconds"] / 3600.0)
+                                    for s in stale), _SESSION_STALE_HINT // 3600))
             else:
                 result["next_action"] = "还没有会话：session start <target> [--name main]"
         finally:
@@ -1054,7 +1096,7 @@ def cmd_session_list(args):
 
 
 def cmd_session_kill(args):
-    """结束会话：按 sid 全量清理（TERM→校验→KILL），默认连目录一起删。"""
+    """结束会话：按进程树闭包（sess.pid + bash.pid + script，各自证）TERM→校验→KILL，默认连目录一起删。"""
     start = time.time()
     root = getattr(args, "session_dir", None) or DEFAULT_SESSION_DIR
     if not args.all and not args.name:
@@ -1096,21 +1138,38 @@ def cmd_session_kill(args):
             marks = dict(_SESSION_MARK_RE.findall(out))
             left = int(marks.get("LEFT") or 0)
             swept = int(marks.get("SWEPT") or 0)
+            roots = int(marks.get("ROOTS") or 0)
+            had_dir = marks.get("HAD") == "1"
             killed += 1
-            results.append({"session": name, "swept": swept, "remaining": left,
-                            "dir": f["dir"],
-                            "cleaned": (marks.get("CLEANED") == "1") and not args.keep_dir})
+            entry = {"session": name, "swept": swept, "remaining": left, "roots": roots,
+                     "dir": f["dir"],
+                     "cleaned": (marks.get("CLEANED") == "1") and not args.keep_dir,
+                     # verified=真的确认过"会话进程已不在"：找到过自证的根、且没有幸存者。
+                     # swept=0 不再等于"清干净"（旧版会因此误报，见 _session_kill_cmd docstring）
+                     "verified": bool(roots) and left == 0}
+            if not roots and had_dir:
+                entry["note"] = ("没找到可自证的会话进程（sess.pid/bash.pid 缺失或进程已消失）："
+                                 "可能有 reparent 后的孤儿，请自查 "
+                                 "ps -eo pid,ppid,tty,args | grep -E 'script -qfc|pyaissh-sessions'")
+            results.append(entry)
             if rc != 0 and not marks:
                 results[-1]["note"] = (kerr or out or "")[-200:]
         result = {"ok": True, "action": "session", "version": VERSION,
                   "sessions": results, "count": len(results),
                   "remaining_total": sum(r["remaining"] for r in results),
+                  "verified_total": sum(1 for r in results if r.get("verified")),
                   "host": conn["host"], "user": conn["user"], "port": conn["port"],
                   "warnings": [], "duration_ms": int((time.time() - start) * 1000)}
         if result["remaining_total"]:
             result["warnings"].append(
-                "仍有 %d 个进程属于被结束会话的 sid（可能正在退出或有 SIGKILL 也杀不掉的状态）"
+                "仍有 %d 个进程属于被结束会话的进程树（可能正在退出或有 SIGKILL 也杀不掉的状态）"
                 % result["remaining_total"])
+        unverified = [r["session"] for r in results if r.get("note") and not r.get("verified")]
+        if unverified:
+            result["warnings"].append(
+                "会话 %s 的清理**未获确认**（没找到活着的会话进程，可能仍有孤儿）："
+                "按 note 里的 ps 自查，必要时手工 kill 或 pyaissh session kill --all"
+                % ",".join(unverified))
         result["next_action"] = ("会话已清理。重开：session start <target> --name <name>"
                                  if names else "没有需要清理的会话")
         _emit_result(args, result, header="[SESSION KILL] %d 个会话" % len(results))

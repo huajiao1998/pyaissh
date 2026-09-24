@@ -96,3 +96,50 @@ pyaissh session kill  h --name work                       # 收尾（进程树�
 - **安全**：会话目录 0700、`in`/`out.log`/`meta`/`sess.pid`/`bash.pid`/`last.token` 均 0600；
   会话里敲过的命令**会留在远端 `out.log`**（含凭据的命令请用完 `session kill`）。
 - **状态在远端**：SSH 断开、本地关机都不影响会话；但**远端重启**会丢（和 `--detach` 作业一样）。
+
+## 会话会残留吗？（生命周期与清理，v2.3.0 加固）
+
+**结论：会话不会自己退出，用完必须 `session kill`。** 它是 `setsid nohup` 起的远端常驻进程——
+"SSH 断开照跑"正是它的设计目的，因此**没有任何 idle 超时 / TTL / 自动回收**。
+
+一个 PTY 会话在远端占 **3 个进程** + 一个目录：
+
+| 进程 | 作用 | pid 记在 |
+|---|---|---|
+| `bash -c "exec 9<>FIFO; script …"` | starter（会话组长） | `sess.pid` |
+| `script -qfc '…' out.log` | PTY 包装 | — |
+| `bash -i` | 交互 shell（`cd`/`export` 状态在它里面） | `bash.pid` |
+
+目录 `/tmp/pyaissh-sessions/<name>/`（0700）：`in`(FIFO)、`out.log`、`err.log`、`sess.pid`、
+`bash.pid`、`meta`、`last.token`。非 PTY 降级模式是 2 个进程。
+`out.log` **只追加、没有轮转**——长期挂着的会话会一直占 `/tmp` 磁盘。
+
+结束会话只有三条路：
+
+1. **`session kill`**（或 `session kill --all` 清该主机全部）：按进程树闭包 TERM → 校验 → KILL，
+   默认**连目录一起删**（要留日志看现场用 `--keep-dir`）。结果里 `swept`=扫到的进程数、
+   `remaining`=幸存者、`verified`=是否确认"会话进程已不在"、`cleaned`=目录是否已删。
+2. **会话里的 shell 自己退出**（`exit` / `Ctrl-D`，或命令把 shell 弄崩）：进程消失，
+   但 **`/tmp` 下的目录与日志仍在**——下次 `session kill --name` 会把目录收掉，否则要等机器重启。
+3. **远端重启**：进程与 `/tmp` 一起清掉。
+
+**`kill` 不会误报"清干净"**（v2.3.0 加固）：清理前先看三个候选根（`sess.pid` / `bash.pid` /
+会话 shell 的父进程 `script`），每个根都要**自证**（`ps -o args=` 里含本会话目录，防止陈旧 pid
+被无关进程复用时误杀）。为什么需要 `bash.pid`/`script` 兜底：starter 若被 OOM 或外力杀掉，
+`script` 与 `bash -i` 会被 reparent 到 1 号进程，只按 `sess.pid` 算闭包会得空集。
+三个根都不可用时，pyaissh **不猜也不杀**：返回 `roots: 0`、`verified: false` + 一条 warning
+（附 `ps -eo pid,ppid,tty,args | grep -E 'script -qfc|pyaissh-sessions'` 自查命令），
+而不是宣称已清理。看到 `verified: false` 就按 note 手工确认一次。
+
+**怎么发现"忘了关"的会话**：`session list` 给出 `age_seconds`/`started_at`/`log_bytes`；
+挂了超过 24 小时的会话会额外给一条 warning（提示不再需要时 kill）。
+
+```bash
+python3 pyaissh.py session list root@1.2.3.4                     # 看有几个、挂了多久、多大
+python3 pyaissh.py session kill root@1.2.3.4 --name work         # 结束（进程树 + 目录）
+python3 pyaissh.py session kill root@1.2.3.4 --name work --keep-dir   # 只杀进程、留日志
+python3 pyaissh.py session kill root@1.2.3.4 --all               # 一次清掉该主机全部会话
+```
+
+**本地侧永远是干净的**：每次 `pyaissh …` 都是短命客户端，不会因为远端有会话而占本地资源，
+也不会阻塞你继续用 `exec`——残留只在远端（几个进程 + `/tmp` 文件）。

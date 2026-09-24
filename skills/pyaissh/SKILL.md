@@ -104,12 +104,13 @@ python3 pyaissh.py session run   h --name work --cmd 'cd /opt/app && make -j8'  
 python3 pyaissh.py session ctrl-c h --name work                  # 中断执行中的命令（会话不死，状态保留；SIGINT→TERM，`--force`=SIGKILL）
 python3 pyaissh.py session keys  h --name work --data 'y\n'      # 应答交互提示（y/n、密码…；支持 \n \r \t \xNN）
 python3 pyaissh.py session read  h --name work --offset 0        # 增量读（send/--no-wait 之后）
-python3 pyaissh.py session kill  h --name work                   # 收尾（进程树全清 + 删目录）
+python3 pyaissh.py session kill  h --name work                   # 收尾（必做：会话不会自退；进程树全清 + 删目录）
 ```
 
 - **每条命令独立退出码**；**`cd`/`export`/函数跨命令保留**——**打错了就把那条命令改对再发一遍**（同一条重试）：像人打错文件名那样，报错 → 改对 → 重发 → 成功，上下文与上次完全一致
 - `run --wait-rc` 超时回 `status:"running"`（带 `token`，可 `read --wait-rc` 续等或 `ctrl-c` 中断）；`read` 载荷字段 `stdout`（合并流，已清洗 CR/ANSI/哨兵行）、`status`(`done`|`running`)、`exit_code`、`next_offset`
 - 子命令 `start/run/send/read/ctrl-c/keys/list/kill`；真 PTY 需 util-linux `script`（缺则自动降级为非 PTY）。**实现细节、实测坑与边界 → `docs/session.md`**
+- **用完必须 `kill`**：会话是 `setsid+nohup` 的**远端常驻进程，不会自己退出**（SSH 断开照跑）；`kill` 默认连目录一起删（`--keep-dir` 留日志看现场），`--all` 清该主机全部会话；`list` 给 `age_seconds`/`log_bytes`，挂超 24h 会提醒。清理是**进程树闭包 + `verified` 字段**（不会无声误报"清干净"）
 
 ### ls — 列远程目录
 ```bash
