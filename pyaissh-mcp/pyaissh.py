@@ -6258,9 +6258,7 @@ def cmd_session_start(args):
                                                  else None})
                 result = {
                     "ok": True, "action": "session", "version": VERSION, "session": name,
-                    # fifo 是**契约字段**（v2.3 起基线里就有）：tmux 引擎没有 FIFO，恒返回 None，
-            # 只为字段集不变、AI 侧解析不踩空
-            "attached": True, "dir": f["dir"], "fifo": None, "log": f["log"],
+                    "attached": True, "dir": f["dir"], "log": f["log"],
                     "pid": int(ex_pid) if str(ex_pid).isdigit() else ex_pid,
                     "ready": True, "ttl_seconds": extra.get("ttl_seconds"),
                     "age_seconds": extra.get("age_seconds"),
@@ -6310,7 +6308,7 @@ def cmd_session_start(args):
         result = {
             "ok": True, "action": "session", "version": VERSION, "session": name,
             "attached": False,
-            "dir": f["dir"], "fifo": None, "log": f["log"],   # 契约字段，恒 None
+            "dir": f["dir"], "log": f["log"],
             "pid": int(pid) if str(pid).isdigit() else pid,
             "pty": True, "cols": args.cols, "ready": ready, "ready_wait_ms": int(wait_s * 1000),
             "ttl_seconds": ttl if ttl and ttl > 0 else None,

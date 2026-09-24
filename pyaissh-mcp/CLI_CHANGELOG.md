@@ -956,3 +956,7 @@
   `script` 头尾行的过滤、`_session_info` 的 beat `st_mtime` 兜底；**并把 `--no-pty` 参数整体删除**
   （传了会被 argparse 拒绝，不再 no-op）。`fifo` 作为**契约字段**保留（恒 `null`），字段集不变量不变。
   净减：session 域 1935 → 1898 行（−37），制品 427 → 423 KB；行为面唯一变化是"陌生目录不再被特别标注"。
+- **`fifo` 字段删除（同日）**：`session start` 不再返回旧引擎遗留的 `fifo`（曾经恒 `null`，只为迁移期
+  字段集不变）；契约基线 `tests/contract/session_contract_v2.json` 的 `start_created`/`start_attach`
+  两个用例同步去掉该键，`docs/contract.md`/`docs/session.md` 的说明一并删除。迁移期的"字段集一字不变"
+  已由 SPEC V1 的 21/21 证据完成使命，不再保留恒空字段。

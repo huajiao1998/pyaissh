@@ -65,7 +65,7 @@ pyaissh session kill  h --name work                       # 收尾（tmux 会话
 
 | 子命令 | 作用 | 关键字段/参数 |
 |---|---|---|
-| `start <target> [--name main]` | 起会话（远端 tmux，专用 socket `pyaissh`）| 返回 `pid`/`pty`（恒 `true`）/`ready`/`log`（`fifo` 字段保留但恒为 `null`）/[`permissions`](contract.md)；`--cols`（默认 200，防折行）、`--ttl`、`--attach`、`--wait-ready`；**`--no-pty` 已废弃**（no-op + warning，tmux 永远提供 PTY） |
+| `start <target> [--name main]` | 起会话（远端 tmux，专用 socket `pyaissh`）| 返回 `pid`/`pty`（恒 `true`）/`ready`/`log`/[`permissions`](contract.md)；`--cols`（默认 200，防折行）、`--ttl`、`--attach`、`--wait-ready`；**`--no-pty` 已废弃**（no-op + warning，tmux 永远提供 PTY） |
 | **`run <target> --name S --cmd '…'`** | **跑一条并等它结束（推荐；=`send`+等待合成一次调用）** | 返回与 `read` 同构：`stdout`/`exit_code`/`status`(`done`\|`running`)/`token`/`next_offset`；`--wait-rc N`（默认 60，上限 600）超时回 `running`，`--no-wait` 只发送 |
 | `send <target> --name S (--cmd '…' \| --cmd-file -)` | 只喂命令不等（需要边跑边增量读时用）| 返回 `token`/`offset`/`next_offset`；命令文本 CRLF 默认归一（`--keep-crlf` 保留）|
 | `read <target> --name S [--offset N] [--lines N] [--wait-rc SECS] [--token T]` | 读输出：尾部 / 增量 / 等某条命令结束 | 载荷字段 `stdout`（合并流，已清洗 CR/ANSI/哨兵行）、`next_offset`、`status`(`done`\|`running`)、`exit_code`、`token`；`--keep-ansi` 保留颜色码 |

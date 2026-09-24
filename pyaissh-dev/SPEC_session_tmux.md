@@ -44,7 +44,7 @@
 
 | ID | 判据 | 验证方法 | 证据 |
 |---|---|---|---|
-| **INV-01a** | 每个子命令/错误路径的返回**键集必须包含基线全部键**（同输入同键集） | `python pyaissh-dev/contract_baseline.py --check tests/contract/session_contract_v2.json` | V1 ✅ |
+| **INV-01a** | 每个子命令/错误路径的返回**键集必须包含基线全部键**（同输入同键集） |（**2026-09-24 收口**：基线 fixture 已同步删除旧引擎遗留的 `fifo` 字段——`session start` 不再返回该键；迁移期的"字段集一字不变"已由 V1 的 21/21 证据完成使命） | `python pyaissh-dev/contract_baseline.py --check tests/contract/session_contract_v2.json` | V1 ✅ |
 | **INV-01b** | 允许**新增**的键仅限白名单：`orphans` / `orphans_total` / `orphan_remaining_total`（恒空返回，AI 侧零感知）；白名单外新增即 FAIL | 同上（工具加 `--allow` 白名单） | V1 ✅ |
 | **INV-02** | 八个子命令与参数面：`start`(含 `--attach`/`--ttl`/`--cols`)/`run`(`--cmd`/`--cmd-file`/`--wait-rc`/`--no-wait`)/`send`(`--keep-crlf`)/`read`(`--offset`/`--lines`/`--wait-rc`/`--token`/`--keep-ansi`)/`ctrl-c`(`--force`)/`keys`(`--data`/`--raw`/`--cmd-file`)/`list`/`kill`(`--name`/`--all`/`--keep-dir`)。\*`--no-pty` 保留为 **no-op + warning**（deprecated） | `pyaissh session --help` + `--suite live_session` | V3 ✅ |
 | **INV-03** | 错误类型不变：`session_not_found` / `session_exists` / `session_dead` / `bad_args` / `send_failed` / `keys_failed` / `session_failed` / `session_list_failed` / `session_read_failed` / `session_kill_failed`；新增仅限 ERR 表 | 基线 fixture 的错误用例 + `--suite live_session` | V1+V3 ✅ |
