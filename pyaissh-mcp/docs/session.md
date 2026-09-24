@@ -102,14 +102,14 @@ pyaissh session kill  h --name work                       # 收尾（进程树�
 **结论：会话是远端常驻进程（`setsid nohup`，"SSH 断开照跑"正是它的设计目的），默认带 10 分钟空闲回收兜底，
 用完也可以随时 `session kill` 立刻结束。**
 
-一个 PTY 会话在远端占 **3 个进程**（+ 空闲回收开启时 1 个看门狗进程）+ 一个目录：
+一个 PTY 会话在远端占 **3 个进程**（+ 空闲回收开启时 1 个看门狗 bash，它每轮还有一个 `sleep` 子进程）+ 一个目录：
 
 | 进程 | 作用 | pid 记在 |
 |---|---|---|
 | `bash -c "exec 9<>FIFO; script …"` | starter（会话组长） | `sess.pid` |
 | `script -qfc '…' out.log` | PTY 包装 | — |
 | `bash -i` | 交互 shell（`cd`/`export` 状态在它里面） | `bash.pid` |
-| `bash watch.sh` | **空闲回收看门狗**（`--ttl 0` 时没有） | `watch.pid` |
+| `bash watch.sh` | **空闲回收看门狗**（`--ttl 0` 时没有；每轮 `sleep 15` 唤醒，RSS ≈ 3 MB） | `watch.pid` |
 
 目录 `/tmp/pyaissh-sessions/<name>/`（0700）：`in`(FIFO)、`out.log`、`err.log`、`sess.pid`、
 `bash.pid`、`watch.pid`、`watch.sh`、`beat`（最后交互时间）、`meta`、`last.token`。非 PTY 降级模式是 2 个进程。

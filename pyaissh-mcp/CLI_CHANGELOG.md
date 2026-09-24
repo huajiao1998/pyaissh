@@ -736,3 +736,24 @@
     `verified`、O1c 事后无 `script` 包装与 starter、**O1d 诱饵旁观进程仍活着**（不被误杀）。
 - **顺带修的自身失误**：加函数时误删了 `_session_clean_text()` 的 `def` 行（函数体被并进上一个函数，
   语法合法、运行必炸）——被"重建 + 立即调用一次"的检查抓到，已修复并复验。
+
+### 修正：看门狗只占 1 个进程（启动方式）+ 测试 runner 崩溃不再静默中断（v2.3.0）
+
+- **看门狗启动方式（实测发现问题）**：上一版为了修"启动组挂住 SSH 通道导致 `session start`
+  20 秒超时"，把整组后台任务写成 `{ printf …; chmod …; setsid …; } >/dev/null 2>&1 </dev/null &`。
+  超时是修好了，但 `&&`/`;` 链被 `&` **整体后台化**会多留一个 **wrapper 进程**：它的 argv 继承 start
+  命令原文、以 init 为父、还要等看门狗退出才结束；`watch.pid` 记的也是这个 wrapper 而不是看门狗
+  —— 是 `ps --ppid` 才看见真正的看门狗（实测 `watch.pid` 的 argv 是整条 start 命令）。
+  改：**前台写好脚本（管道 stderr 丢 /dev/null）→ 用 `;` 分隔 → `&` 只作用于 `setsid nohup bash watch.sh`
+  那一条**（三个流都重定向）。两段之间写 `&&` 会退回"wrapper + 挂住通道"（这个坑也踩了一次）。
+  实测结果：`start` 2.4s 返回；`watch.pid` 的真身就是 `bash …/watch.sh`（ppid=1）；
+  `kill` 后 `swept=5`（starter/script/bash -i/看门狗/sleep）、`remaining=0`、`verified=true`、零残留。
+  每个会话因此只多 **1 个** 进程（看门狗 bash，另有一个 `sleep 15` 子进程，RSS ≈ 3 MB）。
+- **测试 runner 崩溃处理**：套件中途抛异常（本次就发生过一次：新断言引用了还没赋值的 `_sc6`）会让
+  整个 runner 带 traceback 退出 ⇒ **后面的套件根本没跑**，而 PowerShell 管道里"最后一个命令成功"
+  又让外层看起来是 exit 0——我因此先把一次失败误读成"unit 通过"。
+  改：`_run_suite()` 接住异常 → 打印 traceback、**记 FAIL、继续跑其余套件**、整体退出码非 0。
+  验证：把 unit 第一个套件替换成"必崩 + 后面套件打标记"，`rc=1` 且 `calls=['boom','after']`（后面的
+  确实跑了）；正常路径 `--unit` 109 PASS 不变。
+- **测试**：`--unit` 108 → **109 PASS**（新增"看门狗启动：前台写脚本 + 单条后台启动"断言）；
+  真机 `--session` **56 PASS / 0 FAIL** 在最终启动方式下复跑通过。

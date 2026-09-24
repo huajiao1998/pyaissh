@@ -5445,20 +5445,26 @@ def _session_watchdog_launch_cmd(f, ttl):
 
     TTL<=0 时返回空串（不装看门狗）。脚本落在会话目录内，随目录一起被清掉。
 
-    **整组后台任务必须自己重定向三个流**（实测教训：只给 `setsid` 那条加 `>/dev/null`、
-    却让同组的 `printf | base64 -d > watch.sh` / `chmod` 继承 SSH 通道的 stderr ⇒
-    通道永不 EOF ⇒ paramiko 的 `recv_exit_status()` 一直等，`session start` 20 秒超时
-    报 `session_failed`（消息为空），而会话其实已经起好了）。所以用 `{ ...; } >/dev/null
-    2>&1 </dev/null &` 把整组包住。
+    **两段式**（实测教训，两版都踩过）：
+      - 早先写成"整组后台任务"`{ printf ...; chmod ...; setsid ...; } &`：组里的 `printf | base64`
+        /`chmod` 继承了 SSH 通道的 stderr ⇒ 通道永不 EOF ⇒ paramiko 的 `recv_exit_status()` 一直等，
+        `session start` 20 秒超时误报 `session_failed`（会话其实起好了）。
+      - 改用 `{ ...; } >/dev/null 2>&1 </dev/null &` 修好了超时，但 `&&` 链整体被 `&` 后台化会多留一个
+        **wrapper 进程**（argv 继承 start 命令原文、以 init 为父、还要等看门狗退出才结束），
+        `watch.pid` 记的也是这个 wrapper 而不是看门狗本身 —— 实测 `ps --ppid` 才看见真正的看门狗。
+      ⇒ 现在：**先在前台把脚本写好**（管道 stderr 直接丢 /dev/null，写完全部进程即退出，不占通道），
+        再用**一条**自带三个重定向的后台命令启动看门狗。两段之间必须用 `;` 而不是 `&&` ——
+        写成 `printf … && chmod … && setsid … &` 时 `&` 会把整条 `&&` 链一起后台化，
+        又会变回"多一个 wrapper + 挂住通道"（实测踩过）。这样每个会话只多 **1 个**进程，
+        `watch.pid` 就是看门狗本人。
     """
     if not ttl or ttl <= 0:
         return ""
     q = _sh_quote
     b64 = base64.b64encode(_session_watchdog_script(f, ttl).encode("utf-8")).decode("ascii")
     w = f["dir"] + "/watch.sh"
-    return ("{ printf %%s '%s' | base64 -d > %s && chmod 700 %s && "
-            "setsid nohup bash %s >/dev/null 2>&1 </dev/null & echo $! > %s; } "
-            ">/dev/null 2>&1 </dev/null & "
+    return ("printf %%s '%s' | base64 -d > %s 2>/dev/null; chmod 700 %s; "
+            "setsid nohup bash %s >/dev/null 2>&1 </dev/null & echo $! > %s; "
             % (b64, q(w), q(w), q(w), q(f["watch"])))
 
 

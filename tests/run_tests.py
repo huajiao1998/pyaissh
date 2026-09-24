@@ -42,6 +42,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 
 sys.stdout.reconfigure(encoding="utf-8")
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 仓库根
@@ -374,6 +375,10 @@ def suite_unit_regression(s):
             and "watch.sh" not in m._session_start_cmd(_f, 200, False, 0)
             and "watch.sh" in m._session_start_cmd(_f, 200, False, 600), _ws[:80])
     _sc6 = m._session_start_cmd(_f, 200, False, 600)
+    s.check("看门狗启动：前台写脚本 + 单条后台启动（`;` 分隔，`&` 只作用于 setsid 那条）",
+            "2>/dev/null; chmod 700" in _sc6 and "; setsid nohup bash" in _sc6
+            and "& echo $!" in _sc6 and "} >/dev/null 2>&1 </dev/null &" not in _sc6,
+            _sc6[-360:])
     s.check("start 命令：meta 写 4 字段（pty/cols/起始秒/TTL）",
             "printf '%s %s %s %s\\n' \"$PTY\" 200 \"$(date +%s)\" 600" in _sc6, _sc6[-420:-260])
     s.check("start 命令：初始化 beat（否则首次判闲会把新会话当陈旧）",
@@ -1628,10 +1633,20 @@ SUITES = [
 
 
 def _run_suite(idx):
+    """跑一个套件。**崩了也记 FAIL 并继续跑后面的套件**。
+
+    为什么要接住异常（2026-09-24 教训）：套件中途抛异常（例如新加的断言引用了还没赋值的变量）
+    会让整个 runner 带 traceback 退出——后面的套件根本没跑，而 PowerShell 管道里"最后一个命令
+    成功"还会让外层看起来是 exit 0。那次我先把它误读成"单位集通过"。现在崩溃=FAIL 且不中断。
+    """
     name, desc, fn = SUITES[idx]
     print("\n>>> %s（%s）" % (name, desc))
     s = _Suite(name)
-    fn(s)
+    try:
+        fn(s)
+    except Exception:
+        print("SUITE CRASH（记 FAIL，继续跑其余套件）:\n%s" % traceback.format_exc())
+        return False
     if s.pass_n == 0 and s.fail_n == 0:
         return None  # SKIP（live 缺凭据返回 None 已 print）
     n, f = s.result()
