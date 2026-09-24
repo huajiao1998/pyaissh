@@ -44,9 +44,9 @@ pyaissh 是基于 paramiko 的命令行 SSH 工具，专为非交互的 AI/脚�
 ## 输出约定（核心，完整版见 docs/contract.md）
 
 - **stdout 才是可解析结果**（进度日志全在 stderr）；**默认即 JSON**，直接 `json.loads`；`--text` 仅供人类速览（AI 一律用默认 JSON）
-- **`--field` 消费端免样板**（v1.5.16）：**标准示例 `--field stdout,-stderr`**——stdout/stderr 各走对应通道（**stderr 报错不被吞**：只读 stdout 曾丢过认证失败的真实原因）；`-` 前缀=打 stderr，多字段逗号分隔每行一个；与 `--text` 互斥；错误路径仍输出完整 JSON；该模式 stderr 无进度日志（仅 WARN/提示）——**不要 `2>/dev/null`**
+- **`--field` 消费端免样板**（v1.5.16）：**标准示例 `--field stdout,-stderr`**——**要某字段的裸值时用它代替手写 `json.loads`**；stdout/stderr 各走对应通道（**stderr 报错不被吞**：只读 stdout 曾丢过认证失败的真实原因）；`-` 前缀=打 stderr，多字段逗号分隔每行一个；与 `--text` 互斥；错误路径仍输出完整 JSON；该模式 stderr 无进度日志（仅 WARN/提示）——**不要 `2>/dev/null`**
 - **`ok` 与 `exit_success` 区分**：`ok=true` 只表示工具操作成功（连接+执行完成）；**远程命令成败看 `exit_success`**（例：`exit 3` → `ok=true, exit_code=3, exit_success=false`）
-- 错误 JSON：`ok:false` + `error` + `message` + **`retryable`**（true=重试可能成功且安全，false=改输入或放弃；超时类 true 只表示值得一试，**先看 `remote_may_be_running`**——超时类恒有，true=进程可能仍在跑，副作用命令先 pgrep 再重试；见 **docs/errors.md**）；参数写错 `bad_args`（退出码 2）；`--help` 纯文本，`--version` 一行 JSON
+- 错误 JSON：`ok:false` + `error` + `message` + **`retryable`**（bool：true=重试可能成功且安全，false=改输入或放弃；超时类 true 只表示值得一试，**先看 `remote_may_be_running`**——超时类恒有，true=进程可能仍在跑，副作用命令先 pgrep 再重试；见 **docs/errors.md**）；参数写错 `bad_args`（退出码 2）；`--help` 纯文本，`--version` 一行 JSON
 - **`warnings` 恒为参考信息，不代表操作失败**（疑似凭据等安全类提示不阻断执行，命令照常运行；需要行动的如 `.part` 残留会附清理命令）
 
 ## 退出码粗筛（完整见 docs/errors.md）
