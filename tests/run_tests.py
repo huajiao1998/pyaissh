@@ -679,6 +679,114 @@ def suite_unit_artifacts(s):
                    if not os.path.exists(os.path.join(os.path.dirname(mf), "domains", n))]
         s.check("域文件齐全（MANIFEST 列出的 13 个都在）", not missing, "缺: %s" % missing)
 
+    # ---- 编码不变量（2026-09-24 定：所有脚本一律 UTF-8 + 显式声明 I/O 编码）----
+    # 为什么上闸：本机代码页是 GBK/936，而工具/脚本产出 UTF-8。历史上踩过两类事：
+    #   ① 源码被 GBK 存过 → 中文注释/字符串直接乱码；
+    #   ② 本地文本 open() 没写 encoding= → Windows 上按 cp936 读写，写出非 UTF-8 字节；
+    #   ③ 入口脚本没把 stdout 设 UTF-8 → 管道/重定向下打印中文乱码，遇到 GBK 编不出的
+    #      字符（⬜ 等）直接 UnicodeEncodeError 崩溃。
+    import ast as _ast
+    _enc_bad, _open_bad = [], []
+    _txt_n = 0
+    _SKIP_DIRS = {".git", "node_modules", "__pycache__", "dist", "build", ".venv",
+                  "tavern-ops"}      # tavern-ops 是别的会话的工作目录，不归本测试管
+    _TEXT_EXT = (".py", ".sh", ".ps1", ".json", ".md", ".yml", ".yaml", ".cmd")
+    for _dp, _dns, _fns in os.walk(_REPO):
+        _dns[:] = [d for d in _dns if d not in _SKIP_DIRS]
+        for _fn in _fns:
+            _ext = os.path.splitext(_fn)[1].lower()
+            if _ext not in _TEXT_EXT:
+                continue
+            _p = os.path.join(_dp, _fn)
+            _rel = os.path.relpath(_p, _REPO)
+            _txt_n += 1
+            _raw = open(_p, "rb").read()
+            try:
+                _txt = _raw.decode("utf-8")
+            except UnicodeDecodeError as _e:
+                _enc_bad.append("%s（%s）" % (_rel, str(_e)[:60]))
+                continue
+            if _raw.startswith(b"\xef\xbb\xbf"):
+                _enc_bad.append("%s（带 BOM：统一不要 BOM）" % _rel)
+            if _ext != ".py":
+                continue
+            try:
+                _tree = _ast.parse(_txt)
+            except SyntaxError as _e:
+                _open_bad.append("%s（语法错误，无法静态检查: %s）" % (_rel, _e))
+                continue
+            for _node in _ast.walk(_tree):
+                if not isinstance(_node, _ast.Call):
+                    continue
+                _f = _node.func
+                _is_open = ((isinstance(_f, _ast.Name) and _f.id in ("open", "io.open"))
+                            or (isinstance(_f, _ast.Attribute) and _f.attr == "open"
+                                and isinstance(_f.value, _ast.Name) and _f.value.id == "io"))
+                if not _is_open:
+                    continue
+                if any(_k.arg == "encoding" for _k in _node.keywords):
+                    continue
+                _mode = None
+                _mode_expr = _node.args[1] if len(_node.args) >= 2 else None
+                for _k in _node.keywords:
+                    if _k.arg == "mode":
+                        _mode_expr = _k.value
+                if isinstance(_mode_expr, _ast.Constant) and isinstance(_mode_expr.value, str):
+                    _mode = _mode_expr.value
+                if isinstance(_mode, str) and "b" in _mode:
+                    continue      # 二进制模式不需要 encoding
+                if _mode is None and _mode_expr is not None:
+                    # 模式不是字面量（如 `"r+b" if existing else "wb"`）：看源码段里的
+                    # 字符串字面量是否**都**含 b —— 都是二进制就放过，判不出来才报
+                    _seg = _ast.get_source_segment(_txt, _mode_expr) or ""
+                    _lits = re.findall(r"['\"]([^'\"]*)['\"]", _seg)
+                    if _lits and all("b" in _x for _x in _lits):
+                        continue
+                _open_bad.append("%s:%d" % (_rel, _node.lineno))
+    s.check("编码：仓库文本文件全部是 UTF-8 且无 BOM（%d 个文件）" % _txt_n,
+            not _enc_bad, repr(_enc_bad[:6]))
+    s.check("编码：本地文本 open() 一律显式写 encoding=（含生成物 pyaissh.py）",
+            not _open_bad, repr(_open_bad[:8]))
+    _art = open(os.path.join(_REPO, "pyaissh.py"), "rb").read().decode("utf-8")
+    s.check("编码：制品把 stdout/stderr/stdin 重配为 UTF-8（errors=replace，永不因编码崩）",
+            'reconfigure(encoding="utf-8", errors="replace")' in _art, "")
+    s.check("编码：制品在 Windows 控制台切成 UTF-8（65001）并在退出时还原",
+            "SetConsoleOutputCP(65001)" in _art and "SetConsoleOutputCP(old_cp)" in _art, "")
+    s.check("编码：制品启动时**调用** _setup_console_utf8（不只是定义）",
+            _art.count("_setup_console_utf8()") >= 2, "调用次数=%d" % _art.count("_setup_console_utf8()"))
+    _entries = ["pyaissh-dev/contract_baseline.py", "pyaissh-mcp/sync_check.py",
+                "pyaissh-mcp/pyaissh_mcp.py", "tests/run_tests.py"]
+    _tdir = os.path.join(_REPO, "pyaissh-mcp", "test")
+    if os.path.isdir(_tdir):
+        _entries += [os.path.join("pyaissh-mcp", "test", f)
+                     for f in sorted(os.listdir(_tdir)) if f.endswith(".py")]
+    _no_guard = []
+    for _r in _entries:
+        _p = os.path.join(_REPO, _r)
+        if not os.path.exists(_p):
+            continue
+        _t = open(_p, "rb").read().decode("utf-8")
+        if 'reconfigure(encoding="utf-8"' not in _t:
+            _no_guard.append(_r)
+    s.check("编码：会被直接运行的入口脚本都显式设 stdout/stderr=UTF-8（%d 个）" % len(_entries),
+            not _no_guard, repr(_no_guard))
+    # 远端兜底：通道里没有 LANG/LC_ALL 时要给 pane 补 C.UTF-8（否则远端可能落到 POSIX，
+    # 打印中文乱码或直接编码报错）
+    _saved_lang = (os.environ.pop("LANG", None), os.environ.pop("LC_ALL", None))
+    try:
+        _items = dict(m._session_env_items())
+        os.environ["LANG"] = "zh_CN.UTF-8"
+        _items2 = dict(m._session_env_items())
+    finally:
+        os.environ.pop("LANG", None)
+        if _saved_lang[0] is not None:
+            os.environ["LANG"] = _saved_lang[0]
+        if _saved_lang[1] is not None:
+            os.environ["LC_ALL"] = _saved_lang[1]
+    s.check("编码：通道无 LANG/LC_ALL 时兜底注入 %s；有则原样透传" % m.SESSION_DEFAULT_LANG,
+            _items.get("LANG") == m.SESSION_DEFAULT_LANG and _items2.get("LANG") == "zh_CN.UTF-8",
+            "无=%r 有=%r" % (_items.get("LANG"), _items2.get("LANG")))
+
 
 # ============================================================
 # 测试集 4：unit host add/remove/list 闭环（v2.1.4 自动化）

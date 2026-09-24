@@ -170,6 +170,7 @@ SESSION_TMUX_MIN_MAJOR = 3             # 主版本下限（依赖 window-size ma
 SESSION_TMUX_BUFFER = "pyaissh-buf"    # load-buffer/paste-buffer 的缓冲名
 SESSION_TMUX_LOOP_INTERVAL = 300       # reaper --loop 的检查间隔（秒）
 SESSION_TMUX_REAP_LOG_MAX = 65536      # .reaper.log 超过此大小就截断（只留尾 200 行）
+SESSION_DEFAULT_LANG = "C.UTF-8"       # 通道里没有 LANG/LC_ALL 时给 pane 兜底的 UTF-8 locale
 _SESSION_TMUX = "tmux -L %s -f /dev/null" % SESSION_TMUX_SOCKET
 
 
@@ -905,12 +906,22 @@ def _session_info(client, f, sftp=None, tmux_info=None):
 
 
 def _session_env_items():
-    """当前 SSH 通道环境里值得注入 tmux 全局环境的变量（tmux server 环境在启动时冻结）。"""
+    """当前 SSH 通道环境里值得注入 tmux 全局环境的变量（tmux server 环境在启动时冻结）。
+
+    **中文/编码兜底**：本机（Windows）环境通常没有 `LANG`/`LC_ALL`，而 tmux server 的环境
+    又冻结在它启动那一刻——如果那一刻也没有 locale，远端的 pane 会落到 `POSIX`/`C`，
+    里面打印中文要么乱码要么直接报编码错（Python `UnicodeEncodeError`、`ls` 把非 ASCII
+    文件名显示成 `?`）。所以两者都缺时**补一个 `C.UTF-8`**（glibc ≥ 2.35 起内置；
+    老系统上没有这个 locale 时等价于原来的 C，不会更糟）。用户自己的 `LANG`/`LC_ALL`
+    若存在则原样透传，不覆盖。
+    """
     out = []
     for k in ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TZ", "TERM"):
         v = os.environ.get(k)
         if v:
             out.append((k, v))
+    if not os.environ.get("LANG") and not os.environ.get("LC_ALL"):
+        out.append(("LANG", SESSION_DEFAULT_LANG))
     return out
 
 

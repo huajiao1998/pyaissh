@@ -305,7 +305,7 @@ def _atomic_auto_add_policy():
                 if os.name == "posix":
                     try:
                         import fcntl
-                        lock_fd = open(fn + ".lock", "a+")
+                        lock_fd = open(fn + ".lock", "a+", encoding="utf-8")
                         fcntl.flock(lock_fd, fcntl.LOCK_EX)
                     except Exception:
                         lock_fd = None
@@ -321,7 +321,9 @@ def _atomic_auto_add_policy():
                     fd, tmp = tempfile.mkstemp(
                         dir=os.path.dirname(fn) or ".", prefix=".known_hosts.", suffix=".tmp")
                     try:
-                        with os.fdopen(fd, "w") as f:
+                        # encoding 显式给 UTF-8：known_hosts 内容是 ASCII，但**绝不依赖平台默认**
+                        # （Windows 默认 cp936，一旦将来写入非 ASCII 就会变 GBK 字节）
+                        with os.fdopen(fd, "w", encoding="utf-8") as f:
                             for hostname, keys in merged.items():
                                 for keytype, key in keys.items():
                                     f.write("%s %s %s\n" % (hostname, keytype, key.get_base64()))

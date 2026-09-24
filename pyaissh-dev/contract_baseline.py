@@ -14,6 +14,17 @@
     python pyaissh-dev/contract_baseline.py --check tests/contract/session_contract_v2.json \
         --allow orphans,orphans_total,orphan_remaining_total
 """
+
+
+# --- 中文输出保护（2026-09-24 统一规则）---
+# Windows 默认按本地代码页（cp936/GBK）编码 stdout，打印中文会乱码、遇到 GBK 编不出的
+# 字符（如 ⬜）直接 UnicodeEncodeError 崩溃；管道/重定向下同样如此。显式设 UTF-8 一劳永逸。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+# --- 中文输出保护结束 ---
 import argparse
 import json
 import os
