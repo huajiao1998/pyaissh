@@ -363,13 +363,37 @@ def suite_unit_regression(s):
     _f = m._session_files("/tmp/pyaissh-sessions", "demo")
     s.check("会话路径表含 beat（活动时间戳）", _f["beat"].endswith("/beat"), _f["beat"])
     _ws = m._session_watchdog_script(_f, 600)
-    s.check("看门狗：目录消失即退（不留常驻循环）", '[ -d "$D" ] || exit 0' in _ws, _ws[:120])
+    s.check("看门狗：目录消失时先临终清理再退出（不留常驻循环）",
+            'if [ ! -d "$D" ]; then cleanup_tree; exit 0; fi' in _ws, _ws[:160])
     s.check("看门狗：有前台命令就续期 + beat 判闲",
             'pgrep -P "$B"' in _ws and 'LAST=$(<"$BEAT")' in _ws
             and 'printf \'%s\\n\' "$NOW" > "$BEAT"' in _ws, _ws[:200])
     s.check("看门狗：自证闭包（argv 含会话目录）+ 先删目录再杀",
-            'case "$A" in *"$D"*)' in _ws and _ws.index('rm -rf "$D"') < _ws.index("kill -TERM $T"),
-            _ws[-260:])
+            'case "$A" in *"$D"*)' in _ws and 'case " $SEEN "' in _ws
+            and _ws.index('[ "$1" = rm ] && rm -rf "$D"') < _ws.index("kill -TERM $T"),
+            _ws[-400:])
+    # 临终带走（用户提的补充）：有人 rm -rf 会话目录时，看门狗最后收一次自己的进程树再自退
+    s.check("看门狗：共用一套清理实现（cleanup_tree 函数 + 两处调用）",
+            "cleanup_tree() {" in _ws and "cleanup_tree rm" in _ws
+            and "cleanup_tree; exit 0" in _ws, _ws[:400])
+    s.check("看门狗：每轮开头就记 pid/meta（内建读、空读不覆盖旧值）",
+            'if [ -r "$SPID" ]; then _pv=$(<"$SPID"); [ -n "$_pv" ] && P=$_pv; fi' in _ws
+            and '[ -n "$_pv" ] && B=$_pv' in _ws and '[ -z "$M0" ] && M0=$_pv' in _ws,
+            _ws[:600])
+    s.check("看门狗：判闲前重读 shell pid，且**pid 未知一律视为忙**（实测踩过的误回收）",
+            'if [ -r "$BPID" ]; then _pv=$(<"$BPID"); [ -n "$_pv" ] && B=$_pv; fi' in _ws
+            and 'if [ -z "$B" ]; then printf \'%s\\n\' "$NOW" > "$BEAT"; continue; fi' in _ws,
+            _ws[-700:])
+    s.check("看门狗：归属自检两道（watch.pid≠自己 / meta 变了 ⇒ 退出，防同名新会话被误杀）",
+            'W=""; [ -r "$WPID" ] && W=$(<"$WPID")' in _ws
+            and '[ "$W" != "$$" ] && exit 0' in _ws
+            and '[ "$M" != "$M0" ] && exit 0' in _ws, _ws[:700])
+    s.check("看门狗：临终路径不自证根时不乱杀，且不写 wd.log（用户要求不留审计痕）",
+            _ws.split('if [ ! -d "$D" ]')[1].split("fi")[0].count("wd.log") == 0
+            and "|| return 1" in _ws, _ws[:200])
+    s.check("看门狗：读文件前用内建 [ -r ] 保护（缺失文件不往 stderr 报错）",
+            '[ -r "$SPID" ]' in _ws and '[ -r "$BPID" ]' in _ws
+            and '[ -r "$BEAT" ]' in _ws and '[ -r "$META" ]' in _ws, _ws[:400])
     # 设计 C（v2.3.0）：单进程看门狗 = read -t + 自持 FIFO fd（省掉 sleep 的 1.9 MB/1 进程）
     #   + 防 spin 护栏（内建 $SECONDS 计时，连续 3 次立刻返回就退回外部 sleep）
     #   + 内建读（$(<) 不 fork cat/stat）+ $EPOCHSECONDS（bash≥5 不 fork date）
@@ -380,7 +404,7 @@ def suite_unit_regression(s):
             "$((SECONDS - T0)) -lt 1" in _ws and '"$FAST" -ge 3' in _ws
             and 'sleep "$TICK"' in _ws and 'wd.log' in _ws, _ws[:400])
     s.check("看门狗 C：内建读 + EPOCHSECONDS（不 fork cat/stat/date）",
-            'B=$(<"$BPID")' in _ws and 'P=$(<"$SPID")' in _ws
+            '$(<"$SPID")' in _ws and '$(<"$BPID")' in _ws and '$(<"$META")' in _ws
             and "NOW=${EPOCHSECONDS:-$(date +%s)}" in _ws
             and "cat " not in _ws and "stat -c" not in _ws, _ws[:300])
     s.check("看门狗 C：beat 非法/缺失只续期不回收",
@@ -1526,6 +1550,13 @@ def suite_live_session(s):
     _live_run(["session", "kill", tgt, "--name", _at], timeout=60)
 
     # ---- W：单进程看门狗（设计 C）的实机开销 + 防 spin 护栏 ----
+
+    def _field(txt, key):
+        for _ln in (txt or "").splitlines():
+            if _ln.startswith(key + "="):
+                return _ln.split("=", 1)[1].strip()
+        return ""
+
     _wdc = name + "wd"
     rc, _jw, _ = _live_run(["session", "start", tgt, "--name", _wdc, "--ttl", "300"], timeout=90)
     _wp = (_jw or {}).get("pid")
@@ -1547,11 +1578,6 @@ def suite_live_session(s):
                                  "echo \"now=$(date +%%s)\"" % (_wdc, _wdc)], timeout=60)
         _w1 = (_jc1 or {}).get("stdout") or ""
 
-        def _field(txt, key):
-            for _ln in txt.splitlines():
-                if _ln.startswith(key + "="):
-                    return _ln.split("=", 1)[1].strip()
-            return ""
         _rss = _field(_w0, "rss")
         try:
             _dcpu = int(_field(_w1, "cpu") or 0) - int(_field(_w0, "cpu") or 0)
@@ -1599,9 +1625,87 @@ def suite_live_session(s):
             _field(_g2, "cpu").isdigit() and int(_field(_g2, "cpu")) <= 3,
             "cpu=%s jiffy" % _field(_g2, "cpu"))
 
+    # ---- L：看门狗"临终带走"（v2.3.0 用户提案）：有人 rm -rf 会话目录时，看门狗最后收一次再自退 ----
+    import base64 as _b64b
+    # L1 主用例：start(ttl>0) → 等 >15s（看门狗已记下 pid）→ rm -rf 目录 → 等 ≤20s
+    #    → starter/script/bash -i 与看门狗全消失，且随后 kill --all 没有孤儿可扫（证明是看门狗干的）
+    _lz = name + "lz"
+    rc, _jl, _ = _live_run(["session", "start", tgt, "--name", _lz, "--ttl", "300"], timeout=90)
+    time.sleep(20)
+    rc, _jpre, _ = _live_run(["exec", tgt, "--cmd",
+                              "rm -rf /tmp/pyaissh-sessions/%s; sleep 0.5; "
+                              "echo -n 'before='; pgrep -fc '[p]yaissh-sessions/%s' || true"
+                              % (_lz, _lz)], timeout=60)
+    _before = _field(((_jpre or {}).get("stdout") or ""), "before")
+    time.sleep(20)
+    # 路径用变量拼（cmdline 里不出现完整路径）⇒ pgrep -f 不会匹配到执行本命令的 shell 自己
+    _l1cmd = ("R=$(printf '/tmp/pyaissh-%s' sessions); D=\"$R/" + _lz + "\"; "
+              "echo -n 'after='; pgrep -fc \"$D\" || true; "
+              "echo -n 'dir='; [ -d \"$D\" ] && echo 1 || echo 0; "
+              "echo -n 'script='; pgrep -xc script || true")
+    rc, _jz, _ = _live_run(["exec", tgt, "--cmd", _l1cmd], timeout=60)
+    _lzs = (_jz or {}).get("stdout") or ""
+    s.check("L1 孤儿确实存在过（rm -rf 目录后还有 >=3 个进程）",
+            _before.isdigit() and int(_before) >= 3, "before=%s" % _before)
+    s.check("L1 看门狗临终带走：rm -rf 目录后该会话的进程全消失、看门狗自退",
+            _field(_lzs, "after") == "0" and _field(_lzs, "dir") == "0"
+            and _field(_lzs, "script") == "0", repr(_lzs)[:200])
+    rc, _jall2, _ = _live_run(["session", "kill", tgt, "--all"], timeout=120)
+    s.check("L1 随后 kill --all 已无可扫孤儿（说明是看门狗清的，不是兜底扫描）",
+            bool(_jall2) and not (_jall2.get("orphans_total") or 0), repr(_jall2)[:200])
+
+    # L2 自证反向：记住的 pid 被内核复用成"无关进程"时**不得误杀**
+    #    做法：伪造 sess.pid/bash.pid 指向一个 argv 不含会话路径的 sleep，再 rm -rf 目录等一个 tick
+    _lz2 = name + "lz2"
+    _D2 = "/tmp/pyaissh-sessions/" + _lz2
+    _wsrc2 = _module()._session_watchdog_script(
+        _module()._session_files("/tmp/pyaissh-sessions", _lz2), 300)
+    _l2cmd = ("rm -rf {D}; mkdir -m 700 -p {D}; "
+              "setsid nohup sleep 120 >/dev/null 2>&1 </dev/null & DP=$!; "
+              "echo $DP > {D}/sess.pid; echo $DP > {D}/bash.pid; "
+              "date +%s > {D}/beat; echo \"1 200 $(date +%s) 300\" > {D}/meta; "
+              "printf %s '{B64}' | base64 -d > {D}/watch.sh; chmod 700 {D}/watch.sh; "
+              "setsid nohup bash {D}/watch.sh >/dev/null 2>&1 </dev/null & echo \"decoy=$DP\""
+              ).format(D=_D2, B64=_b64b.b64encode(_wsrc2.encode()).decode())
+    rc, _jdec2, _ = _live_run(["exec", tgt, "--cmd", _l2cmd], timeout=60)
+    _decoy2 = _field(((_jdec2 or {}).get("stdout") or ""), "decoy")
+    time.sleep(3)
+    _live_run(["exec", tgt, "--cmd", "rm -rf " + _D2], timeout=60)
+    time.sleep(20)
+    rc, _jl2b, _ = _live_run(["exec", tgt, "--cmd",
+                              "echo -n 'decoy='; kill -0 %s 2>/dev/null && echo alive || echo gone; "
+                              "echo -n 'wd='; pgrep -fc '%s/[w]atch[.]sh' || true; "
+                              "kill -9 %s 2>/dev/null; rm -rf %s; echo cleaned"
+                              % (_decoy2, _D2, _decoy2, _D2)], timeout=60)
+    _l2s = (_jl2b or {}).get("stdout") or ""
+    s.check("L2 自证闸门：记住的 pid 已属无关进程（argv 不含会话路径）⇒ 不误杀、看门狗自退",
+            _decoy2.isdigit() and _field(_l2s, "decoy") == "alive" and _field(_l2s, "wd") == "0",
+            repr(_l2s)[:200])
+
+    # L3 名字被接管：rm -rf 目录后立刻同名重建 → 老看门狗必须退出、新会话必须活着
+    _lz3 = name + "lz3"
+    _live_run(["session", "start", tgt, "--name", _lz3, "--ttl", "300"], timeout=90)
+    time.sleep(20)
+    _live_run(["exec", tgt, "--cmd", "rm -rf /tmp/pyaissh-sessions/%s" % _lz3], timeout=60)
+    rc, _jnew, _ = _live_run(["session", "start", tgt, "--name", _lz3, "--ttl", "300"], timeout=90)
+    time.sleep(25)      # 给老看门狗足够时间 tick（它会看到 watch.pid/meta 变了，应自行退出）
+    rc, _jl3, _ = _live_run(["session", "run", tgt, "--name", _lz3, "--cmd", "echo NEWALIVE",
+                             "--wait-rc", "10"], timeout=60)
+    rc, _jc3, _ = _live_run(["exec", tgt, "--cmd",
+                             "echo -n 'watchprocs='; pgrep -fc '/tmp/pyaissh-sessions/%s/[w]atch[.]sh' || true"
+                             % _lz3], timeout=60)
+    s.check("L3 同名重建不被老看门狗误杀：新会话仍可执行命令",
+            bool(_jl3) and _jl3.get("exit_code") == 0 and "NEWALIVE" in (_jl3.get("stdout") or ""),
+            repr(_jl3)[:160])
+    s.check("L3 老看门狗已自退（只剩新会话的那 1 个看门狗进程）",
+            _field(((_jc3 or {}).get("stdout") or ""), "watchprocs") == "1",
+            repr((_jc3 or {}).get("stdout"))[:160])
+    _live_run(["session", "kill", tgt, "--name", _lz3], timeout=60)
+
     # ---- O：按 argv 扫孤儿（v2.3.0）：目录被手工删掉、只剩进程的会话，`kill --all` 也要收掉 ----
     _orph2 = name + "o2"
-    _live_run(["session", "start", tgt, "--name", _orph2], timeout=90)
+    # 用 --ttl 0：新语义下"目录被删"的孤儿会由看门狗临终带走，argv 扫描只能在**没有看门狗**时被验证
+    _live_run(["session", "start", tgt, "--name", _orph2, "--ttl", "0"], timeout=90)
     # 旁观者诱饵：argv 里"提到"会话路径，但不是会话进程（不该被杀）
     rc, _jdec, _ = _live_run(["exec", tgt, "--cmd",
                               "setsid nohup bash -c 'sleep 120; :' "
@@ -1615,19 +1719,21 @@ def suite_live_session(s):
                                      % (_orph2, _orph2)], timeout=60)
     rc, _jall, _ = _live_run(["session", "kill", tgt, "--all"], timeout=120)
     _orph_rows = [o for o in (_jall or {}).get("orphans", []) if o.get("session") == _orph2]
-    s.check("O1a kill --all 按 argv 扫到孤儿（目录已不在的 starter/pty 包装）",
-            bool(_orph_rows) and (_jall or {}).get("orphans_total", 0) >= 1, repr(_jall)[:260])
+    s.check("O1a kill --all 按 argv 扫到孤儿（无看门狗会话：目录已删只剩进程）",
+            bool(_orph_rows), repr((_jall or {}).get("orphans"))[:220])
     s.check("O1b 孤儿清理无残留（orphan_remaining_total=0 且 verified）",
             bool(_jall) and (_jall.get("orphan_remaining_total") or 0) == 0
             and all(o.get("verified") for o in _orph_rows), repr(_orph_rows)[:220])
-    rc, _jo2, _ = _live_run(["exec", tgt, "--cmd",
-                             "echo -n 'script='; ps -eo args | grep -c '[s]cript -qfc' || true; "
-                             "echo -n 'starter='; ps -eo args | grep -c \"[e]xec 9<>'/tmp/pyaissh-sessions/%s/in'\" || true; "
-                             "echo -n 'decoy='; kill -0 %s 2>/dev/null && echo alive || echo gone"
-                             % (_orph2, _decoy)], timeout=60)
+    # 注意：这条命令里既做 pgrep 又看同一个路径 ⇒ 路径用变量拼，避免 pgrep -f 的自匹配假阳性
+    _o1cmd = ("R=$(printf '/tmp/pyaissh-%s' sessions); D=\"$R/" + _orph2 + "\"; "
+              "echo -n 'script='; ps -eo args | grep -c '[s]cript -qfc' || true; "
+              "echo -n 'starter='; ps -eo args | grep -c \"[e]xec 9<>'$D/in'\" || true; "
+              "echo -n 'dir='; [ -d \"$D\" ] && echo 1 || echo 0; "
+              "echo -n 'decoy='; kill -0 " + str(_decoy) + " 2>/dev/null && echo alive || echo gone")
+    rc, _jo2, _ = _live_run(["exec", tgt, "--cmd", _o1cmd], timeout=60)
     _o2s = (_jo2 or {}).get("stdout") or ""
-    s.check("O1c 孤儿进程真被杀掉（无 script 包装、无 starter）",
-            "script=0" in _o2s and "starter=0" in _o2s, repr(_o2s))
+    s.check("O1c 孤儿进程真被杀掉（无 script 包装、无 starter、目录已删）",
+            "script=0" in _o2s and "starter=0" in _o2s and "dir=0" in _o2s, repr(_o2s))
     s.check("O1d 旁观者（argv 提到路径但不是会话进程）**没被误杀**",
             "decoy=alive" in _o2s, repr(_o2s))
     if _decoy.isdigit():

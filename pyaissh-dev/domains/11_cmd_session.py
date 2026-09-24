@@ -144,36 +144,30 @@ def _session_watchdog_script(f, ttl):
     **防 spin 护栏**：`read -t` 若因 fd 异常而**立刻返回**，循环会变成忙循环（实测无护栏时
     5 秒烧掉 ≈6 秒 CPU = 跑满一个核）。所以每轮用内建 `$SECONDS` 量耗时，连续 3 次"立刻返回"
     就写一行 `wd.log` 并**退回外部 `sleep`**（此后再出问题也只是回到"2 个进程"的老形态，不会烧 CPU）。
+
+    **判闲的两个前提（都是实测踩出来的）**：
+      - shell pid 要在**判闲前重新读**一次：第一轮 tick 在 `read` 之前（约 0.4 s）`bash.pid` 还没写出来，
+        用空值会判成"没有命令在跑"——实测把正在 `sleep 40` 的会话误回收了（`--ttl 5`）。
+      - **pid 未知一律视为忙**（不回收）：没有 shell pid 就无法证明空闲，宁可多留也不误杀；
+        这种降级会话（init payload 没写成功）不会被空闲回收，`list` 会提示 shell pid 缺失。
     """
     q = _sh_quote
     return (
         "#!/bin/bash\n"
         "# pyaissh 空闲回收看门狗（自动生成；TTL=%d 秒，每 %d 秒检查一次；单进程实现）\n"
-        "D=%s; BEAT=%s; BPID=%s; SPID=%s; TTL=%d; TICK=%d; WDFIFO=%s\n"
+        "D=%s; BEAT=%s; BPID=%s; SPID=%s; WPID=%s; META=%s; TTL=%d; TICK=%d; WDFIFO=%s\n"
         "mkfifo -m 600 \"$WDFIFO\" 2>/dev/null || true\n"
         "exec 9<>\"$WDFIFO\"          # 自持读写端：read -t 才有阻塞语义（写端在自己手里，不会 EOF）\n"
-        "FAST=0\n"
-        "while :; do\n"
-        "  [ -d \"$D\" ] || exit 0     # 目录消失就退出；**不能继续循环**（探针踩过：条件反了就永不退出）\n"
-        "  T0=$SECONDS\n"
-        "  read -t \"$TICK\" -r -u 9 _x        # 无子进程的睡眠（bash 内建）\n"
-        "  if [ $((SECONDS - T0)) -lt 1 ]; then   # 立刻返回 ⇒ fd 异常，护栏\n"
-        "    FAST=$((FAST+1))\n"
-        "    if [ \"$FAST\" -ge 3 ]; then\n"
-        "      echo \"guard: read -t 立刻返回，本会话退回 sleep\" >> \"$D/wd.log\" 2>/dev/null\n"
-        "      sleep \"$TICK\"; FAST=0\n"
-        "    fi\n"
-        "    continue\n"
-        "  fi\n"
-        "  NOW=${EPOCHSECONDS:-$(date +%%s)}\n"
-        "  B=$(<\"$BPID\")\n"
-        "  if [ -n \"$B\" ] && [ -n \"$(pgrep -P \"$B\" 2>/dev/null)\" ]; then printf '%%s\\n' \"$NOW\" > \"$BEAT\"; continue; fi\n"
-        "  LAST=$(<\"$BEAT\")\n"
-        "  case \"$LAST\" in ''|*[!0-9]*) printf '%%s\\n' \"$NOW\" > \"$BEAT\"; continue ;; esac\n"
-        "  [ $((NOW - LAST)) -gt \"$TTL\" ] || continue\n"
-        "  P=$(<\"$SPID\"); T=\"\"; SEEN=\"\"; ROOTS=0; SNAP=$(ps -eo pid=,ppid=)\n"
+        "FAST=0; P=\"\"; B=\"\"; M0=\"\"\n"
+        "\n"
+        "# 共用清理（TTL 到期与\"临终带走\"都走这里，只有一套实现）：\n"
+        "#   自证闭包（argv 必须仍含本会话目录 ⇒ 防 pid 被内核复用后误杀无关进程）→ 可选删目录 → TERM→KILL\n"
+        "#   参数 rm ⇒ 连目录一起删（TTL 到期路径）；不带参数 ⇒ 目录已不在，只收进程（临终路径）\n"
+        "cleanup_tree() {\n"
+        "  T=\"\"; SEEN=\"\"; ROOTS=0; SNAP=$(ps -eo pid=,ppid=)\n"
         "  for r in \"$P\" \"$B\" \"$(ps -o ppid= -p \"$B\" 2>/dev/null | tr -d ' ')\"; do\n"
         "    [ -n \"$r\" ] || continue\n"
+        "    [ \"$r\" = \"$$\" ] && continue\n"
         "    [ \"$r\" = 1 ] && continue\n"
         "    case \" $SEEN \" in *\" $r \"*) continue ;; esac\n"
         "    kill -0 \"$r\" 2>/dev/null || continue\n"
@@ -182,16 +176,57 @@ def _session_watchdog_script(f, ttl):
         "    SEEN=\"$SEEN $r\"; ROOTS=$((ROOTS+1))\n"
         "    T=\"$T $(echo \"$SNAP\" | %s)\"\n"
         "  done\n"
-        "  [ \"$ROOTS\" -gt 0 ] || exit 0\n"
+        "  [ \"$ROOTS\" -gt 0 ] || return 1\n"
         "  T=$(echo $T | tr ' ' '\\n' | sort -u -n | tr '\\n' ' ')\n"
-        "  rm -rf \"$D\"\n"
+        "  [ \"$1\" = rm ] && rm -rf \"$D\"\n"
         "  kill -TERM $T 2>/dev/null; sleep 0.5\n"
         "  K=\"\"; for p in $T; do kill -0 \"$p\" 2>/dev/null && K=\"$K $p\"; done\n"
         "  [ -n \"$K\" ] && kill -KILL $K 2>/dev/null\n"
+        "  return 0\n"
+        "}\n"
+        "\n"
+        "while :; do\n"
+        "  # ① 记 pid/meta（含第一轮，所以\"启动后 ~0 秒\"就记住了；$(<) 内建不 fork；\n"
+        "  #    空读不覆盖旧值——一次抖动不能丢掉临终带走的能力）\n"
+        "  if [ -r \"$SPID\" ]; then _pv=$(<\"$SPID\"); [ -n \"$_pv\" ] && P=$_pv; fi\n"
+        "  if [ -r \"$BPID\" ]; then _pv=$(<\"$BPID\"); [ -n \"$_pv\" ] && B=$_pv; fi\n"
+        "  if [ -r \"$META\" ]; then _pv=$(<\"$META\"); [ -n \"$_pv\" ] && [ -z \"$M0\" ] && M0=$_pv; fi\n"
+        "  # ② 归属自检（两道）：名字被新会话接管（watch.pid 在但不是自己）/ 会话被重建（meta 变了）\n"
+        "  #    ⇒ 立刻退出，绝不碰别人的会话（否则同名重建的老看门狗会把新会话收回）\n"
+        "  W=\"\"; [ -r \"$WPID\" ] && W=$(<\"$WPID\")\n"
+        "  [ -n \"$W\" ] && [ \"$W\" != \"$$\" ] && exit 0\n"
+        "  M=\"\"; [ -r \"$META\" ] && M=$(<\"$META\")\n"
+        "  [ -n \"$M0\" ] && [ -n \"$M\" ] && [ \"$M\" != \"$M0\" ] && exit 0\n"
+        "  # ③ 目录消失（且没被上述自检判定为\"别人的会话\"）⇒ 临终带走：\n"
+        "  #    有人 rm -rf 了会话目录时，把 starter/script/bash -i 一起收掉再自退，不留孤儿\n"
+        "  if [ ! -d \"$D\" ]; then cleanup_tree; exit 0; fi\n"
+        "  # ④ 正常一轮：内建睡眠（read -t + 自持 fd）+ 防 spin 护栏\n"
+        "  T0=$SECONDS\n"
+        "  read -t \"$TICK\" -r -u 9 _x\n"
+        "  if [ $((SECONDS - T0)) -lt 1 ]; then\n"
+        "    FAST=$((FAST+1))\n"
+        "    if [ \"$FAST\" -ge 3 ]; then\n"
+        "      echo \"guard: read -t 立刻返回，本会话退回 sleep\" >> \"$D/wd.log\" 2>/dev/null\n"
+        "      sleep \"$TICK\"; FAST=0\n"
+        "    fi\n"
+        "    continue\n"
+        "  fi\n"
+        "  NOW=${EPOCHSECONDS:-$(date +%%s)}\n"
+        "  # 判闲前**重新读一次** shell pid：第一轮在 read 之前（约 0.4s）bash.pid 还没被 init\n"
+        "  # payload 写出来，用那时的空值会判成\"没有命令在跑\"——实测把正在 sleep 40 的会话误回收了。\n"
+        "  # 另外：**pid 未知时一律视为忙**（没有 shell pid 就无法证明空闲，宁可多留也不误杀）\n"
+        "  if [ -r \"$BPID\" ]; then _pv=$(<\"$BPID\"); [ -n \"$_pv\" ] && B=$_pv; fi\n"
+        "  if [ -z \"$B\" ]; then printf '%%s\\n' \"$NOW\" > \"$BEAT\"; continue; fi\n"
+        "  if [ -n \"$(pgrep -P \"$B\" 2>/dev/null)\" ]; then printf '%%s\\n' \"$NOW\" > \"$BEAT\"; continue; fi\n"
+        "  LAST=\"\"; [ -r \"$BEAT\" ] && LAST=$(<\"$BEAT\")\n"
+        "  case \"$LAST\" in ''|*[!0-9]*) printf '%%s\\n' \"$NOW\" > \"$BEAT\"; continue ;; esac\n"
+        "  [ $((NOW - LAST)) -gt \"$TTL\" ] || continue\n"
+        "  cleanup_tree rm\n"
         "  exit 0\n"
         "done\n"
         % (int(ttl), _SESSION_TTL_TICK, q(f["dir"]), q(f["beat"]), q(f["bash"]), q(f["pid"]),
-           int(ttl), _SESSION_TTL_TICK, q(f["wdfifo"]), _SESSION_TREE_AWK % "$r"))
+           q(f["watch"]), q(f["meta"]), int(ttl), _SESSION_TTL_TICK, q(f["wdfifo"]),
+           _SESSION_TREE_AWK % "$r"))
 
 
 def _session_watchdog_launch_cmd(f, ttl):
@@ -658,6 +693,11 @@ def _session_info(client, f, sftp=None):
             info["idle_seconds"] = max(0, int(time.time()) - int(st.st_mtime or 0))
         except Exception:
             pass
+        try:
+            with sftp.open(f["bash"], "r") as fh:
+                info["shell_pid"] = fh.read().decode("utf-8", "replace").strip() or None
+        except Exception:
+            info["shell_pid"] = None      # 降级会话：看门狗判不了闲（它把"pid 未知"视为忙）
         try:
             st = sftp.stat(f["log"])
             info["log_bytes"] = st.st_size
@@ -1398,6 +1438,13 @@ def cmd_session_list(args):
                         "会话 %s 即将因空闲被回收（剩余 %s；想留住就发一条命令或 --ttl 0 重开）"
                         % (",".join("%s(%s)" % (s["session"], _fmt_age(s["expires_in_seconds"]))
                                     for s in near), _fmt_age(near[0]["expires_in_seconds"])))
+                degraded = [s for s in sessions if s.get("status") == "running"
+                            and not s.get("shell_pid")]
+                if degraded:
+                    result["warnings"].append(
+                        "会话 %s 缺 shell pid（bash.pid）——看门狗无法判断\"命令是否在跑\"，"
+                        "因此**空闲回收对它不生效**（宁可不收也不误杀）：用完请 session kill"
+                        % ",".join(s["session"] for s in degraded))
             else:
                 result["next_action"] = "还没有会话：session start <target> [--name main]"
         finally:
