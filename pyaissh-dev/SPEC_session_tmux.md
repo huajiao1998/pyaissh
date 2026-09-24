@@ -44,19 +44,19 @@
 
 | ID | 判据 | 验证方法 | 证据 |
 |---|---|---|---|
-| **INV-01a** | 每个子命令/错误路径的返回**键集必须包含基线全部键**（同输入同键集） | `python pyaissh-dev/contract_baseline.py --check tests/contract/session_contract_v2.json` | ⬜ |
-| **INV-01b** | 允许**新增**的键仅限白名单：`orphans` / `orphans_total` / `orphan_remaining_total`（恒空返回，AI 侧零感知）；白名单外新增即 FAIL | 同上（工具加 `--allow` 白名单） | ⬜ |
-| **INV-02** | 八个子命令与参数面不变：`start`(含 `--attach`/`--ttl`/`--cols`/`--no-pty`*)/`run`(`--cmd`/`--cmd-file`/`--wait-rc`/`--no-wait`)/`send`(`--keep-crlf`)/`read`(`--offset`/`--lines`/`--wait-rc`/`--token`/`--keep-ansi`)/`ctrl-c`(`--force`)/`keys`(`--data`/`--raw`/`--cmd-file`)/`list`/`kill`(`--name`/`--all`/`--keep-dir`)。\*`--no-pty` 保留为 **no-op + warning**（deprecated） | `pyaissh session --help` + `--suite live_session` | ⬜ |
-| **INV-03** | 错误类型不变：`session_not_found` / `session_exists` / `session_dead` / `bad_args` / `send_failed` / `keys_failed` / `session_failed` / `session_list_failed` / `session_read_failed` / `session_kill_failed`；新增仅限 ERR 表 | 基线 fixture 的错误用例 + `--suite live_session` | ⬜ |
-| **INV-04** | **字节级增量契约**：`--offset`/`next_offset` 指向磁盘上的**追加文件** `out.log`（SFTP 读），非 `capture-pane`；连续读不重不漏；输出 >1MB 仍能看到哨兵（尾窗逻辑保留）；文件被删/缩小时重建基线并给 warning | `--suite live_session_ttl,live_session_bugs`（B3/B4） | ⬜ |
-| **INV-05** | 哨兵协议不变：`{ ...; }; echo "__PYAISSH_RC__<token>__$?"`，**哨兵与命令同一行被解析**（防 `read -p` 吃哨兵）；`last.token` 落盘 + 写失败重试 | `--unit`（`_session_payload_text`）+ `--suite live_session`（keys/交互提示） | ⬜ |
-| **INV-06** | **每条命令独立退出码**：0 / 非 0（如 127）/ 管道取末命令状态；`status: done|running` | `--suite live_session`（错误命令 127、run 退出码） | ⬜ |
-| **INV-07** | CRLF 归一：命令文本 CRLF/CR → LF 并回传 `crlf_normalized`；`--keep-crlf` 保留；`upload`/`download` 不改字节 | 基线 fixture（`send`/`run`）+ `--suite live_session_bugs`（B5） | ⬜ |
-| **INV-08** | ANSI 清洗：默认剥离、`--keep-ansi` 保留 | `--suite live_session`（ANSI 用例） | ⬜ |
-| **INV-09** | `--max-output`（**客户端**读取截断，非服务端）→ `output_truncated` + `omitted_bytes` | `--suite live_session` | ⬜ |
-| **INV-10** | 权限：会话目录 `0700`，`out.log`/`meta`/`beat`/`last.token` 均 `0600` | `--suite live_session`（start 权限断言 + ls） | ⬜ |
-| **INV-11** | 人类可现场排障：`tmux -L pyaissh attach -t '=<py-…>'` 可看直播（命令在 `list`/`start` 的 warning/`next_action` 里给出换算提示；名字映射见 ENG-01b）；attach 不破坏契约（`window-size manual`，输出历史不参与 offset）；`TERM` 为 tmux 选定的 `tmux-256color`（与旧引擎不同，属既知变化） | 手工 + `--suite live_session_watchdog` | ⬜ |
-| **INV-12** | `list` 语义不变：`idle_seconds` 由 **beat** 算（非 tmux activity）、`age_seconds` 由 `session_created`/`meta`、`expires_in_seconds`、`status: running|dead|unknown`、`shell_pid`（来自 `#{pane_pid}`）、`log_bytes` | `--suite live_session_ttl`（list/年龄/剩余） | ⬜ |
+| **INV-01a** | 每个子命令/错误路径的返回**键集必须包含基线全部键**（同输入同键集） | `python pyaissh-dev/contract_baseline.py --check tests/contract/session_contract_v2.json` | V1 ✅ |
+| **INV-01b** | 允许**新增**的键仅限白名单：`orphans` / `orphans_total` / `orphan_remaining_total`（恒空返回，AI 侧零感知）；白名单外新增即 FAIL | 同上（工具加 `--allow` 白名单） | V1 ✅ |
+| **INV-02** | 八个子命令与参数面不变：`start`(含 `--attach`/`--ttl`/`--cols`/`--no-pty`*)/`run`(`--cmd`/`--cmd-file`/`--wait-rc`/`--no-wait`)/`send`(`--keep-crlf`)/`read`(`--offset`/`--lines`/`--wait-rc`/`--token`/`--keep-ansi`)/`ctrl-c`(`--force`)/`keys`(`--data`/`--raw`/`--cmd-file`)/`list`/`kill`(`--name`/`--all`/`--keep-dir`)。\*`--no-pty` 保留为 **no-op + warning**（deprecated） | `pyaissh session --help` + `--suite live_session` | V3 ✅ |
+| **INV-03** | 错误类型不变：`session_not_found` / `session_exists` / `session_dead` / `bad_args` / `send_failed` / `keys_failed` / `session_failed` / `session_list_failed` / `session_read_failed` / `session_kill_failed`；新增仅限 ERR 表 | 基线 fixture 的错误用例 + `--suite live_session` | V1+V3 ✅ |
+| **INV-04** | **字节级增量契约**：`--offset`/`next_offset` 指向磁盘上的**追加文件** `out.log`（SFTP 读），非 `capture-pane`；连续读不重不漏；输出 >1MB 仍能看到哨兵（尾窗逻辑保留）；文件被删/缩小时重建基线并给 warning | `--suite live_session_ttl,live_session_bugs`（B3/B4） | V8 ✅ |
+| **INV-05** | 哨兵协议不变：`{ ...; }; echo "__PYAISSH_RC__<token>__$?"`，**哨兵与命令同一行被解析**（防 `read -p` 吃哨兵）；`last.token` 落盘 + 写失败重试 | `--unit`（`_session_payload_text`）+ `--suite live_session`（keys/交互提示） | V2+V3 ✅ |
+| **INV-06** | **每条命令独立退出码**：0 / 非 0（如 127）/ 管道取末命令状态；`status: done|running` | `--suite live_session`（错误命令 127、run 退出码） | V3 ✅ |
+| **INV-07** | CRLF 归一：命令文本 CRLF/CR → LF 并回传 `crlf_normalized`；`--keep-crlf` 保留；`upload`/`download` 不改字节 | 基线 fixture（`send`/`run`）+ `--suite live_session_bugs`（B5） | V8 ✅ |
+| **INV-08** | ANSI 清洗：默认剥离、`--keep-ansi` 保留 | `--suite live_session`（ANSI 用例） | V3 ✅ |
+| **INV-09** | `--max-output`（**客户端**读取截断，非服务端）→ `output_truncated` + `omitted_bytes` | `--suite live_session` | V3 ✅ |
+| **INV-10** | 权限：会话目录 `0700`，`out.log`/`meta`/`beat`/`last.token` 均 `0600` | `--suite live_session`（start 权限断言 + ls） | V3 ✅ |
+| **INV-11** | 人类可现场排障：`tmux -L pyaissh attach -t '=<py-…>'` 可看直播（命令在 `list`/`start` 的 warning/`next_action` 里给出换算提示；名字映射见 ENG-01b）；attach 不破坏契约（`window-size manual`，输出历史不参与 offset）；`TERM` 为 tmux 选定的 `tmux-256color`（与旧引擎不同，属既知变化） | 手工 + `--suite live_session_watchdog` | V5 ✅（socket 隔离/attach 实测） |
+| **INV-12** | `list` 语义不变：`idle_seconds` 由 **beat** 算（非 tmux activity）、`age_seconds` 由 `session_created`/`meta`、`expires_in_seconds`、`status: running|dead|unknown`、`shell_pid`（来自 `#{pane_pid}`）、`log_bytes` | `--suite live_session_ttl`（list/年龄/剩余） | V4 ✅ |
 
 ---
 
