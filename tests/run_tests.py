@@ -365,11 +365,27 @@ def suite_unit_regression(s):
     _ws = m._session_watchdog_script(_f, 600)
     s.check("看门狗：目录消失即退（不留常驻循环）", '[ -d "$D" ] || exit 0' in _ws, _ws[:120])
     s.check("看门狗：有前台命令就续期 + beat 判闲",
-            'pgrep -P "$B"' in _ws and 'stat -c %Y "$BEAT"' in _ws and 'touch "$BEAT"' in _ws,
-            _ws[:200])
+            'pgrep -P "$B"' in _ws and 'LAST=$(<"$BEAT")' in _ws
+            and 'printf \'%s\\n\' "$NOW" > "$BEAT"' in _ws, _ws[:200])
     s.check("看门狗：自证闭包（argv 含会话目录）+ 先删目录再杀",
             'case "$A" in *"$D"*)' in _ws and _ws.index('rm -rf "$D"') < _ws.index("kill -TERM $T"),
             _ws[-260:])
+    # 设计 C（v2.3.0）：单进程看门狗 = read -t + 自持 FIFO fd（省掉 sleep 的 1.9 MB/1 进程）
+    #   + 防 spin 护栏（内建 $SECONDS 计时，连续 3 次立刻返回就退回外部 sleep）
+    #   + 内建读（$(<) 不 fork cat/stat）+ $EPOCHSECONDS（bash≥5 不 fork date）
+    s.check("看门狗 C：read -t + 自持 FIFO fd（单进程睡眠，无 sleep 子进程）",
+            'read -t "$TICK" -r -u 9 _x' in _ws and 'exec 9<>"$WDFIFO"' in _ws
+            and 'mkfifo -m 600 "$WDFIFO"' in _ws, _ws[:260])
+    s.check("看门狗 C：防 spin 护栏（连续 3 次立刻返回 ⇒ 退回 sleep + 记 wd.log）",
+            "$((SECONDS - T0)) -lt 1" in _ws and '"$FAST" -ge 3' in _ws
+            and 'sleep "$TICK"' in _ws and 'wd.log' in _ws, _ws[:400])
+    s.check("看门狗 C：内建读 + EPOCHSECONDS（不 fork cat/stat/date）",
+            'B=$(<"$BPID")' in _ws and 'P=$(<"$SPID")' in _ws
+            and "NOW=${EPOCHSECONDS:-$(date +%s)}" in _ws
+            and "cat " not in _ws and "stat -c" not in _ws, _ws[:300])
+    s.check("看门狗 C：beat 非法/缺失只续期不回收",
+            "case \"$LAST\" in ''|*[!0-9]*)" in _ws, _ws[:300])
+    s.check("看门狗 C：无 %% 转义残留（生成脚本里不该出现双百分号）", "%%" not in _ws, _ws[:160])
     s.check("看门狗：TTL/周期写进脚本且可关闭",
             "TTL=600" in _ws and "TICK=%d" % m._SESSION_TTL_TICK in _ws
             and "watch.sh" not in m._session_start_cmd(_f, 200, False, 0)
@@ -379,10 +395,23 @@ def suite_unit_regression(s):
             "2>/dev/null; chmod 700" in _sc6 and "; setsid nohup bash" in _sc6
             and "& echo $!" in _sc6 and "} >/dev/null 2>&1 </dev/null &" not in _sc6,
             _sc6[-360:])
+    s.check("start 命令：beat 初始化写 epoch（看门狗靠内容判闲，不能是空文件）",
+            "printf '%s\\n' \"$(date +%s)\" > '/tmp/pyaissh-sessions/demo/beat'" in _sc6,
+            _sc6[:400])
+    _cap = {}
+    _orig_run = m._session_run
+    m._session_run = lambda client, cmd, stdin_data=None, timeout=30: (
+        _cap.setdefault("cmd", cmd), (0, "", ""))[1]
+    try:
+        m._session_touch(None, _f)
+    finally:
+        m._session_run = _orig_run
+    s.check("交互续期：_session_touch 写的是 epoch 秒（不再只 touch mtime）",
+            _cap.get("cmd") == ("printf '%s\\n' \"$(date +%s)\" > "
+                                "'/tmp/pyaissh-sessions/demo/beat' 2>/dev/null || true"),
+            repr(_cap.get("cmd")))
     s.check("start 命令：meta 写 4 字段（pty/cols/起始秒/TTL）",
             "printf '%s %s %s %s\\n' \"$PTY\" 200 \"$(date +%s)\" 600" in _sc6, _sc6[-420:-260])
-    s.check("start 命令：初始化 beat（否则首次判闲会把新会话当陈旧）",
-            "touch '/tmp/pyaissh-sessions/demo/beat'" in _sc6, _sc6[:200])
     # 孤儿扫描（kill --all 的 argv 自证）：只认"以会话身份出现"的进程，不误杀"提到路径"的进程
     _ps = "\n".join([
         "  101 root  bash -c umask 077; exec 9<>'/tmp/pyaissh-sessions/gone1/in'; sleep 9",
@@ -1495,6 +1524,80 @@ def suite_live_session(s):
             bool(_ja3) and _ja3.get("ok") is True and _ja3.get("attached") is False
             and isinstance(_ja3.get("pid"), int), repr(_ja3)[:200])
     _live_run(["session", "kill", tgt, "--name", _at], timeout=60)
+
+    # ---- W：单进程看门狗（设计 C）的实机开销 + 防 spin 护栏 ----
+    _wdc = name + "wd"
+    rc, _jw, _ = _live_run(["session", "start", tgt, "--name", _wdc, "--ttl", "300"], timeout=90)
+    _wp = (_jw or {}).get("pid")
+    _cpu0 = None
+    if _wp:
+        rc, _jc0, _ = _live_run(["exec", tgt, "--cmd",
+                                 "W=$(cat /tmp/pyaissh-sessions/%s/watch.pid); "
+                                 "echo \"procs=$(pgrep -fc '/tmp/pyaissh-sessions/%s/[w]atch[.]sh')\"; "
+                                 "echo \"kids=$(pgrep -P $W | wc -l)\"; "
+                                 "echo \"rss=$(awk '/VmRSS/{print $2}' /proc/$W/status)\"; "
+                                 "echo \"cpu=$(awk '{print $14+$15}' /proc/$W/stat)\"" % (_wdc, _wdc)],
+                                timeout=60)
+        _w0 = (_jc0 or {}).get("stdout") or ""
+        time.sleep(32)      # 2 个检查点
+        rc, _jc1, _ = _live_run(["exec", tgt, "--cmd",
+                                 "W=$(cat /tmp/pyaissh-sessions/%s/watch.pid); "
+                                 "echo \"cpu=$(awk '{print $14+$15}' /proc/$W/stat)\"; "
+                                 "echo \"beat=$(<//tmp/pyaissh-sessions/%s/beat)\"; "
+                                 "echo \"now=$(date +%%s)\"" % (_wdc, _wdc)], timeout=60)
+        _w1 = (_jc1 or {}).get("stdout") or ""
+
+        def _field(txt, key):
+            for _ln in txt.splitlines():
+                if _ln.startswith(key + "="):
+                    return _ln.split("=", 1)[1].strip()
+            return ""
+        _rss = _field(_w0, "rss")
+        try:
+            _dcpu = int(_field(_w1, "cpu") or 0) - int(_field(_w0, "cpu") or 0)
+        except ValueError:
+            _dcpu = -1
+        s.check("W1 单进程看门狗：只有 1 个 watch 进程、没有 sleep 子进程",
+                _field(_w0, "procs") == "1" and _field(_w0, "kids") == "0", repr(_w0)[:160])
+        s.check("W1 RSS < 4 MB（比 sleep 版省 ~1.9 MB）",
+                _rss.isdigit() and int(_rss) < 4000, "rss=%s KB" % _rss)
+        s.check("W1 32 秒（2 个检查点）CPU ≤ 2 jiffy（内建睡眠不烧 CPU）",
+                0 <= _dcpu <= 2, "cpu_delta=%s jiffy" % _dcpu)
+        s.check("W1 beat 里是 epoch 秒，且与远端 now 相差 < TTL（判闲靠内容）",
+                _field(_w1, "beat").isdigit() and _field(_w1, "now").isdigit()
+                and 0 <= int(_field(_w1, "now")) - int(_field(_w1, "beat")) < 300,
+                repr(_w1)[:160])
+        _live_run(["session", "kill", tgt, "--name", _wdc], timeout=60)
+
+    # W2 防 spin 护栏：把真实生成的看门狗脚本的 fd 改成 /dev/null（read 立刻返回）后跑 35 秒，
+    #    必须看到 wd.log 里出现护栏记录，且进程 CPU 仍然≈0（没有忙循环）。
+    import base64 as _b64
+    _wsrc = _module()._session_watchdog_script(
+        _module()._session_files("/tmp/pyaissh-sessions", "guard1"), 60)
+    _bad = _wsrc.replace('mkfifo -m 600 "$WDFIFO" 2>/dev/null || true', ":") \
+                .replace('exec 9<>"$WDFIFO"', "exec 9</dev/null")
+    assert "exec 9</dev/null" in _bad and "mkfifo" not in _bad, _bad[:200]
+    _live_run(["exec", tgt, "--cmd",
+               "rm -rf /tmp/pyaissh-sessions/guard1; mkdir -m 700 -p /tmp/pyaissh-sessions/guard1; "
+               "printf '%s' \"$(date +%s)\" > /tmp/pyaissh-sessions/guard1/beat; "
+               "echo $$ > /tmp/pyaissh-sessions/guard1/bash.pid; echo 1 > /tmp/pyaissh-sessions/guard1/sess.pid; "
+               "printf %s '" + _b64.b64encode(_bad.encode()).decode() + "' | base64 -d > "
+               "/tmp/pyaissh-sessions/guard1/watch.sh; chmod 700 /tmp/pyaissh-sessions/guard1/watch.sh; "
+               "setsid nohup bash /tmp/pyaissh-sessions/guard1/watch.sh >/dev/null 2>&1 </dev/null & "
+               "echo started"], timeout=60)
+    time.sleep(35)
+    rc, _jg2, _ = _live_run(["exec", tgt, "--cmd",
+                             "P=$(pgrep -f '/tmp/pyaissh-sessions/guard1/[w]atch[.]sh' | head -1); "
+                             "echo \"guardlog=$(grep -c 'guard: read -t' /tmp/pyaissh-sessions/guard1/wd.log 2>/dev/null)\"; "
+                             "echo \"cpu=$(awk '{print $14+$15}' /proc/$P/stat 2>/dev/null)\"; "
+                             "echo \"kids=$(pgrep -P $P | wc -l)\" ; kill -9 $P 2>/dev/null; "
+                             "rm -rf /tmp/pyaissh-sessions/guard1; echo cleaned"], timeout=60)
+    _g2 = (_jg2 or {}).get("stdout") or ""
+    s.check("W2 防 spin 护栏生效：read 立刻返回时写 wd.log 并退回 sleep",
+            _field(_g2, "guardlog") not in ("", "0"), repr(_g2)[:200])
+    s.check("W2 护栏兜底期间不烧 CPU（≤3 jiffy / 35 秒）",
+            _field(_g2, "cpu").isdigit() and int(_field(_g2, "cpu")) <= 3,
+            "cpu=%s jiffy" % _field(_g2, "cpu"))
 
     # ---- O：按 argv 扫孤儿（v2.3.0）：目录被手工删掉、只剩进程的会话，`kill --all` 也要收掉 ----
     _orph2 = name + "o2"

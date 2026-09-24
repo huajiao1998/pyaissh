@@ -788,3 +788,33 @@
   - 结论：15 秒一次的开销可忽略；按规模算 50 个闲置会话 ≈250 MB（看门狗部分）+ 每 15 秒 190 ms CPU
     —— 内存吃紧的小机器上**限制项是内存不是 CPU**；不需要回收就 `--ttl 0`（连进程带内存一起没有）。
 - 该结论已写进 `docs/session.md`（「空闲回收」小节末尾的"开销实测"表）。
+
+### 优化：空闲回收看门狗改单进程（设计 C，v2.3.0）
+
+- **用户提问引出的改动**："护栏会不会又多一个进程？能不能放弃旧写法、全部用 bash 内建，这样复杂度不叠加？"
+  结论：护栏**不 fork、不加进程**（只用 bash 内建 `$SECONDS` 做整数比较）；而且可以顺手把外部命令换成
+  内建，于是**只有一套实现**（不是"sleep 版 + read 版"两条路）。
+- **改法（原 `sleep 15` → 单进程）**：
+  - 睡眠：`read -t "$TICK" -r -u 9` 读**自持读写**的 `wd.fifo`（写端握在自己手里 ⇒ 永不 EOF，
+    实测每轮精确 15.00s、rc=142、0 jiffy CPU）——省掉 `sleep` 那 **1.9 MB + 1 个进程**。
+  - 读文件：`B=$(<"$BPID")` / `LAST=$(<"$BEAT")`（bash 内建，不 fork `cat`）；
+    时间：`NOW=${EPOCHSECONDS:-$(date +%s)}`（bash≥5 不 fork `date`，老 bash 自动回落）；
+    于是每检查点的 fork 从 **4 次降到 1 次**（只剩 `pgrep -P`），并去掉 `stat -c` 这处 GNU 依赖。
+  - `beat` 从"空文件 + mtime"改成**内容为 epoch 秒**（客户端 `_session_touch` 与 `start` 都改写；
+    `list` 的 `idle_seconds` 仍按 mtime，两边都成立）。
+  - **防 spin 护栏**：每轮用内建 `$SECONDS` 量耗时，连续 3 次"`read -t` 立刻返回"就写一行
+    `wd.log` 并退回外部 `sleep`。数据支撑：同一故障下**无护栏 5 秒烧掉 613 jiffy ≈ 6.1 秒 CPU
+    （跑满一个核）**；有护栏 3 次内切回、兜底期间 35 秒只涨 ≤3 jiffy。
+  - 循环首行保留 `[ -d "$D" ] || exit 0`：**目录消失必须退出而不是继续循环**——这条是我写探针时
+    踩出来的（把条件写成 `[ ! -f stop ]`，目录删掉后条件恒真 ⇒ 进程永不退出，留了 3 个残渣）。
+- **测试**：`--unit` **ALL PASS**（+7：read -t/自持 fd、护栏三件套、目录消失即退、内建读+EPOCHSECONDS
+  且无 `cat`/`stat -c`、beat 非法只续期、无 `%%` 残留、start 的 beat 初始化写 epoch、`_session_touch`
+  发出的命令就是写 epoch）；真机 `--session` 56 → **62 PASS / 0 FAIL**，新增：
+  - W1：只有 **1 个** watch 进程、**无 sleep 子进程**、RSS < 4 MB、32 秒（2 检查点）CPU ≤2 jiffy、
+    `beat` 是 epoch 秒且与远端 now 相差 < TTL；
+  - W2：把**真实生成的看门狗脚本**的 fd 换成 `/dev/null`（复现"read 立刻返回"）→ `wd.log` 出现护栏
+    记录，兜底期间 CPU ≤3 jiffy（不忙循环）。
+- **文档**：`docs/session.md` 更新进程/文件清单（新增 `wd.fifo`、护栏触发才有的 `wd.log`）、
+  开销实测表（1 进程 3.2 MB、每检查点 1 次 fork、整会话 ≈12 MB）与新旧对比，并补一节
+  **支持的系统**（bash/util-linux/coreutils/procps-ng/awk + 已核实的各发行版 bash 版本；
+  Alpine/BusyBox 与 macOS/BSD 明确不在范围内）。

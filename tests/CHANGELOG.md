@@ -384,3 +384,24 @@
   起因是本次新断言引用了未赋值的局部变量，导致 unit 集带 traceback 中断、后续套件没跑，而
   外层 PowerShell 管道仍显示 exit 0 —— 差点被误读成"unit 通过"。已用"必崩套件 + 后续标记套件"
   验证：rc=1 且后续套件确实执行
+
+## [2026-09-24] v2.3.0 补九：单进程看门狗（设计 C）+ 防 spin 护栏
+
+### 新增/更新用例
+- unit_regression +7（含删掉一条过时断言"start 用 touch 初始化 beat"）：
+  看门狗 C 的 read -t + 自持 `wd.fifo`、护栏（`$SECONDS` 计时 + 连续 3 次退回 sleep + 写 wd.log）、
+  目录消失即退、内建读（`$(<)`，断言脚本里没有 `cat `/`stat -c`）、`$EPOCHSECONDS`、
+  beat 非法只续期、生成脚本无 `%%` 残留、`start` 的 beat 初始化写 epoch、
+  `_session_touch` 实际发出的命令（用桩替换 `_session_run` 抓取命令文本）
+- live_session 56 → 62（**62 PASS / 0 FAIL**）：
+  - W1 单进程开销：1 个 watch 进程 / 0 个 sleep 子进程 / RSS < 4 MB / 32 秒 2 检查点 CPU ≤2 jiffy /
+    beat 内容为 epoch 且与 now 相差 < TTL
+  - W2 护栏：取**真实生成的脚本**，把 `mkfifo` 行与 `exec 9<>` 换成 `exec 9</dev/null`（制造"立刻返回"）
+    → 断言 `wd.log` 有护栏记录、且兜底期间 CPU ≤3 jiffy
+### 说明
+- 本轮的"无护栏对照"实验（在测试机上手跑原型）：同一故障下 `read -t` 立刻返回会让循环跑满一个核
+  （5 秒 613 jiffy）——这就是护栏存在的理由，也是"单进程版安全"的实测依据
+- 夹具/流程教训（复用价值）：探针脚本把循环退出条件写成 `[ ! -f $D/stop ]`，目录被删后条件恒真 ⇒
+  进程永不退出（留下 3 个残渣，其中一个在烧 CPU）。**看门狗必须用 `[ -d "$D" ] || exit 0`**
+- 另一个反复踩的坑：用 PowerShell 内联 `python -c` 写含 `$(( ))`/`$!`/引号的脚本会被 PowerShell 抢先
+  解释 —— 一律写成 .py 文件再跑（本轮又踩了一次，已按此改）

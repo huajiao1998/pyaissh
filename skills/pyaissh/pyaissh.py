@@ -5311,6 +5311,7 @@ def _session_files(root, name):
     return {"dir": d, "fifo": d + "/in", "log": d + "/out.log", "err": d + "/err.log",
             "pid": d + "/sess.pid", "meta": d + "/meta", "bash": d + "/bash.pid",
             "token": d + "/last.token", "beat": d + "/beat", "watch": d + "/watch.pid",
+            "wdlog": d + "/wd.log", "wdfifo": d + "/wd.fifo",
             "name": name, "root": root.rstrip("/")}
 
 
@@ -5394,7 +5395,7 @@ def _session_watchdog_script(f, ttl):
     """空闲回收看门狗脚本（v2.3.0 空闲 TTL）：以独立 setsid 进程跑，两个条件同时成立才回收。
 
       ① 提示符空闲：`pgrep -P <会话 shell>` 为空（没有前台命令在跑）——构建/安装不会被误杀；
-      ② 距上次 pyaissh 交互超过 TTL：beat 文件的 mtime 由每次交互刷新（`_session_touch`）。
+      ② 距上次 pyaissh 交互超过 TTL：beat 文件里存的是 **epoch 秒**（每次交互由 `_session_touch` 写入）。
     为什么独立进程而不是会话树内的一员：
       - 会话是 `setsid nohup` 起的，看门狗也必须脱离发起它的那次 SSH 连接（否则 start 一返回
         就随连接收到 SIGHUP 而死）；
@@ -5402,22 +5403,45 @@ def _session_watchdog_script(f, ttl):
     回收动作与 `kill` 同款：**自证**闭包（argv 含本会话目录才认，防 pid 回收误杀）→ 先删目录
     （即使自己被信号打断也不留残留目录）→ TERM → 宽限 → KILL。
     退出条件：会话目录消失（已被 kill/回收）就退，**不留常驻循环**。
-    beat 缺失时只续期不回收（宁可多留也不误杀）。
+    beat 缺失/内容非法时只续期不回收（宁可多留也不误杀）。
+
+    **单进程实现（v2.3.0，设计 C）**：不再用外部 `sleep`，改用 bash 内建的
+    `read -t "$TICK" -u 9`（fd 9 = 自持读写的 `wd.fifo`，写端握在自己手里所以永不 EOF）——
+    每个会话因此只多 **1 个**进程（省掉 `sleep` 那 1.9 MB）。同时尽量用内建少 fork：
+    `B=$(<"$BPID")`（不 fork `cat`）、时间用 `$EPOCHSECONDS`（bash≥5，不 fork `date`；
+    老 bash 自动回落 `date +%s`）。回收路径每轮只剩 1 次 `pgrep`（`ps`/`awk` 只在真正回收时跑）。
+
+    **防 spin 护栏**：`read -t` 若因 fd 异常而**立刻返回**，循环会变成忙循环（实测无护栏时
+    5 秒烧掉 ≈6 秒 CPU = 跑满一个核）。所以每轮用内建 `$SECONDS` 量耗时，连续 3 次"立刻返回"
+    就写一行 `wd.log` 并**退回外部 `sleep`**（此后再出问题也只是回到"2 个进程"的老形态，不会烧 CPU）。
     """
     q = _sh_quote
     return (
         "#!/bin/bash\n"
-        "# pyaissh 空闲回收看门狗（自动生成；TTL=%d 秒，每 %d 秒检查一次）\n"
-        "D=%s; BEAT=%s; BPID=%s; SPID=%s; TTL=%d; TICK=%d\n"
+        "# pyaissh 空闲回收看门狗（自动生成；TTL=%d 秒，每 %d 秒检查一次；单进程实现）\n"
+        "D=%s; BEAT=%s; BPID=%s; SPID=%s; TTL=%d; TICK=%d; WDFIFO=%s\n"
+        "mkfifo -m 600 \"$WDFIFO\" 2>/dev/null || true\n"
+        "exec 9<>\"$WDFIFO\"          # 自持读写端：read -t 才有阻塞语义（写端在自己手里，不会 EOF）\n"
+        "FAST=0\n"
         "while :; do\n"
-        "  sleep \"$TICK\"\n"
-        "  [ -d \"$D\" ] || exit 0\n"
-        "  B=$(cat \"$BPID\" 2>/dev/null)\n"
-        "  if [ -n \"$B\" ] && [ -n \"$(pgrep -P \"$B\" 2>/dev/null)\" ]; then touch \"$BEAT\"; continue; fi\n"
-        "  NOW=$(date +%%s); LAST=$(stat -c %%Y \"$BEAT\" 2>/dev/null)\n"
-        "  [ -n \"$LAST\" ] || { touch \"$BEAT\"; continue; }\n"
+        "  [ -d \"$D\" ] || exit 0     # 目录消失就退出；**不能继续循环**（探针踩过：条件反了就永不退出）\n"
+        "  T0=$SECONDS\n"
+        "  read -t \"$TICK\" -r -u 9 _x        # 无子进程的睡眠（bash 内建）\n"
+        "  if [ $((SECONDS - T0)) -lt 1 ]; then   # 立刻返回 ⇒ fd 异常，护栏\n"
+        "    FAST=$((FAST+1))\n"
+        "    if [ \"$FAST\" -ge 3 ]; then\n"
+        "      echo \"guard: read -t 立刻返回，本会话退回 sleep\" >> \"$D/wd.log\" 2>/dev/null\n"
+        "      sleep \"$TICK\"; FAST=0\n"
+        "    fi\n"
+        "    continue\n"
+        "  fi\n"
+        "  NOW=${EPOCHSECONDS:-$(date +%%s)}\n"
+        "  B=$(<\"$BPID\")\n"
+        "  if [ -n \"$B\" ] && [ -n \"$(pgrep -P \"$B\" 2>/dev/null)\" ]; then printf '%%s\\n' \"$NOW\" > \"$BEAT\"; continue; fi\n"
+        "  LAST=$(<\"$BEAT\")\n"
+        "  case \"$LAST\" in ''|*[!0-9]*) printf '%%s\\n' \"$NOW\" > \"$BEAT\"; continue ;; esac\n"
         "  [ $((NOW - LAST)) -gt \"$TTL\" ] || continue\n"
-        "  P=$(cat \"$SPID\" 2>/dev/null); T=\"\"; SEEN=\"\"; ROOTS=0; SNAP=$(ps -eo pid=,ppid=)\n"
+        "  P=$(<\"$SPID\"); T=\"\"; SEEN=\"\"; ROOTS=0; SNAP=$(ps -eo pid=,ppid=)\n"
         "  for r in \"$P\" \"$B\" \"$(ps -o ppid= -p \"$B\" 2>/dev/null | tr -d ' ')\"; do\n"
         "    [ -n \"$r\" ] || continue\n"
         "    [ \"$r\" = 1 ] && continue\n"
@@ -5437,7 +5461,7 @@ def _session_watchdog_script(f, ttl):
         "  exit 0\n"
         "done\n"
         % (int(ttl), _SESSION_TTL_TICK, q(f["dir"]), q(f["beat"]), q(f["bash"]), q(f["pid"]),
-           int(ttl), _SESSION_TTL_TICK, _SESSION_TREE_AWK % "$r"))
+           int(ttl), _SESSION_TTL_TICK, q(f["wdfifo"]), _SESSION_TREE_AWK % "$r"))
 
 
 def _session_watchdog_launch_cmd(f, ttl):
@@ -5469,13 +5493,19 @@ def _session_watchdog_launch_cmd(f, ttl):
 
 
 def _session_touch(client, f):
-    """刷新会话的"最后交互时间"（beat mtime）——空闲回收据此判断"没人用了"。
+    """刷新会话的"最后交互时间"——把 **epoch 秒写进 beat 文件**（空闲回收据此判断"没人用了"）。
 
-    失败不致命（旧会话没有 beat 文件、或远端 stat/touch 异常）：只记一条 WARN 到 stderr，
+    v2.3.0 起写的是时间戳内容而不是单纯 `touch` mtime：看门狗可以用 bash 内建 `$(<beat)` 读它，
+    省掉每轮一次 `stat`（少一个 fork、也少一处 GNU `stat -c` 依赖）；`list` 仍按 mtime 计算
+    `idle_seconds`（写文件同样会更新 mtime，两边都成立）。
+
+    失败不致命（旧会话没有 beat 文件、或远端写入异常）：只记一条 WARN 到 stderr，
     绝不让它影响正常调用。`list` 不算交互（看一眼不代表在用），故不调用本函数。
     """
-    rc, out, err = _session_run(client, "touch %s 2>/dev/null || true" % _sh_quote(f["beat"]),
-                                timeout=10)
+    rc, out, err = _session_run(
+        client,
+        "printf '%%s\\n' \"$(date +%%s)\" > %s 2>/dev/null || true" % _sh_quote(f["beat"]),
+        timeout=10)
     if rc != 0 and err.strip():
         log("[WARN] 刷新会话活动时间失败（不影响本次调用）：%s" % err.strip()[:160])
     return rc == 0
@@ -5511,7 +5541,9 @@ def _session_start_cmd(f, cols, no_pty=False, ttl=0):
         # read/run 永远 running+空输出——实测 --no-pty 完全不可用）
         "else setsid nohup bash -c '%s' >>%s 2>&1 </dev/null & fi; " % (plain, q(f["log"])) +
         "echo $! > %s; sleep 0.4; " % q(f["pid"]) +
-        "touch %s; chmod 600 %s 2>/dev/null; " % (q(f["beat"]), q(f["beat"])) +
+        # beat 里写 epoch 秒（不是空文件）：看门狗用 $(<beat) 内建读它判闲，省掉每轮 stat
+        "printf '%%s\\n' \"$(date +%%s)\" > %s; chmod 600 %s 2>/dev/null; " % (
+            q(f["beat"]), q(f["beat"])) +
         "printf '%%s %%s %%s %%s\\n' \"$PTY\" %d \"$(date +%%s)\" %d > %s; " % (cols, int(ttl or 0),
                                                                                q(f["meta"])) +
         "chmod 600 %s 2>/dev/null; " % q(f["meta"]) +

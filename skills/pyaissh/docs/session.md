@@ -109,10 +109,11 @@ pyaissh session kill  h --name work                       # 收尾（进程树�
 | `bash -c "exec 9<>FIFO; script …"` | starter（会话组长） | `sess.pid` |
 | `script -qfc '…' out.log` | PTY 包装 | — |
 | `bash -i` | 交互 shell（`cd`/`export` 状态在它里面） | `bash.pid` |
-| `bash watch.sh` | **空闲回收看门狗**（`--ttl 0` 时没有；每轮 `sleep 15` 唤醒，RSS ≈ 3 MB） | `watch.pid` |
+| `bash watch.sh` | **空闲回收看门狗**（`--ttl 0` 时没有；单进程：用 bash 内建 `read -t` 自持 FIFO 睡眠，无 `sleep` 子进程，RSS ≈ 3.2 MB） | `watch.pid` |
 
 目录 `/tmp/pyaissh-sessions/<name>/`（0700）：`in`(FIFO)、`out.log`、`err.log`、`sess.pid`、
-`bash.pid`、`watch.pid`、`watch.sh`、`beat`（最后交互时间）、`meta`、`last.token`。非 PTY 降级模式是 2 个进程。
+`bash.pid`、`watch.pid`、`watch.sh`、`wd.fifo`（看门狗自持的睡眠用 FIFO）、`beat`（最后交互时间，
+内容是 epoch 秒）、`meta`、`last.token`；只在护栏触发时才会多一个 `wd.log`。非 PTY 降级模式是 2 个进程。
 `out.log` **只追加、没有轮转**。
 
 ### 空闲回收（idle TTL，默认 600 秒）
@@ -146,19 +147,36 @@ t4   干完活，最后一条命令       ← 到期 = t4+TTL；之后没有任�
 **超过 TTL 才回来的后果**：会话已被回收 ⇒ `run/send/read` 报 `session_not_found`（提示"可能已被空闲回收"），
 `start --attach` 会当成不存在而**新建**（`attached: false`，cwd/变量丢失）；`--ttl 0` 可彻底关掉回收。
 
-**开销实测**（v2.3.0，2 核 / 0.9 GB 的小机器上量的）：
+**开销实测**（v2.3.0，2 核 / 0.9 GB 的小机器上量的；单进程看门狗 = 设计 C）：
 
 | 项目 | 实测值 |
 |---|---|
-| 看门狗常驻内存 | `bash watch.sh` **3.2 MB**（RSS）+ 它的 `sleep` 子进程 **1.9 MB** ≈ **5 MB/会话** |
-| 每个检查点 CPU | **≈3.75 ms**（120 秒 8 个检查点共 3 个 jiffy = 30 ms）⇒ **≈0.025% 单核**、一天约 21 秒 CPU |
-| 每个检查点动作 | 4 次短命 fork（`cat` / `pgrep -P` / `date` / `stat`）+ 约 8 次上下文切换；**不做全表 `ps` 扫描** |
+| 看门狗常驻内存 | `bash watch.sh` **≈3.2 MB**（RSS 3196→3264 KB）——单进程，**没有** `sleep` 子进程 |
+| 每个检查点 CPU | **≤10 ms**（真机断言：32 秒 2 个检查点累计 ≤2 个 jiffy）；空闲轮实测 62 秒 0 jiffy |
+| 每个检查点动作 | **1 次短命 fork**（`pgrep -P`）；读 pid/beat 用 bash 内建 `$(<)`，时间用 `$EPOCHSECONDS`（bash≥5；老 bash 回落 `date`）；**不做全表 `ps` 扫描** |
 | 回收那一刻（一次性） | `ps -eo pid=,ppid=` 15 ms、带 awk 闭包 22 ms；另有 0.9 s 的 `sleep`（等信号生效，不占 CPU） |
-| 整个空闲会话 | starter 3.3 MB + `script` 2.1 MB + `bash -i` ≈3 MB + 看门狗 5 MB ≈ **13 MB / 会话** |
+| 整个空闲会话 | starter 3.3 MB + `script` 2.1 MB + `bash -i` ≈3 MB + 看门狗 3.2 MB ≈ **12 MB / 会话** |
 
-结论：**15 秒一次的开销可以忽略**（0.025% 单核、5 MB 内存）。要按规模算：50 个闲置会话 ≈
-250 MB（看门狗部分）+ 每 15 秒 190 ms CPU；在内存吃紧的小机器上，**内存是限制项，不是 CPU**。
+对比**旧实现**（外部 `sleep 15`）：常驻内存 5.1 MB（看门狗 3.2 + sleep 1.9）、常驻进程 2 个、
+每检查点 4 次 fork（`cat`/`pgrep`/`date`/`stat`）——单进程版省 **1 个进程 + 1.9 MB**，
+每检查点少 3 次 fork，并去掉 `stat -c` 这一处 GNU 依赖。
+
+**防 spin 护栏（为什么单进程版是安全的）**：`read -t` 若因 fd 异常而立刻返回，循环会变成忙循环
+（实测无护栏时 5 秒烧掉 ≈6 秒 CPU = 跑满一个核）。看门狗每轮用 bash 内建 `$SECONDS` 量耗时，
+连续 3 次"立刻返回"就写一行 `wd.log` 并**退回外部 `sleep`**（真机用例 W2：人为把 fd 换成
+`/dev/null` 复现该故障 → 护栏按预期触发，兜底期间 35 秒只涨 ≤3 个 jiffy）。护栏本身不 fork、
+不加进程（正常路径仍是 1 个进程）。
+
+结论：**15 秒一次的开销可以忽略**（≤0.025% 单核、3.2 MB 内存）。按规模算：50 个闲置会话 ≈
+160 MB（看门狗部分）+ 每 15 秒约 50 次 fork；在内存吃紧的小机器上，**内存是限制项，不是 CPU**。
 不需要回收就 `--ttl 0`，看门狗连进程带内存一起没有（会话回落到 ~8 MB）。
+
+**支持的系统**：看门狗脚本是 `#!/bin/bash`，依赖 bash ≥4.4（`read -t`／`-u fd` 早在 bash 2.04 就有；
+`$EPOCHSECONDS` 需要 bash≥5，缺了自动回落 `date +%s`）、util-linux 的 `script -qfc`、GNU coreutils
+（`mkfifo`/`stat -c`/`setsid`/`nohup`/`timeout`）、procps-ng（`pgrep -P`/`ps -eo`）与任一 POSIX `awk`。
+已核实版本：Ubuntu 20.04/22.04/24.04 = bash 5.0/5.1/5.2，Debian 13 = 5.2.37（真机实测），
+Linux Mint 22.3 = 5.2.21，Fedora 43/44 = 5.3/5.3.9，Arch = 5.3.20，openSUSE Tumbleweed = 5.3.15、
+Leap 15.6 = 4.4。**Alpine/BusyBox 与 macOS/BSD 不在支持范围**（没有 GNU `stat -c`，`script`/`pgrep` 语义不同）。
 
 - 取值：`--ttl 600`（默认）／`--ttl 30s`／`--ttl 10m`／`--ttl 2h`／`--ttl 0`（关闭回收）；
   环境变量 `PYAISSH_SESSION_TTL` 改默认值。检查周期 15 秒 ⇒ 实际回收落在 `TTL ~ TTL+15s`。
