@@ -5881,11 +5881,16 @@ def _session_reaper_ensure_cmd(root, script_b64, interval):
             "kill \"$q\" 2>/dev/null && KILLED=$((KILLED+1)); done; "
             "if [ \"$ALIVE\" = 1 ] && [ \"$OLD\" = \"%d\" ]; then echo __PYAISSH_SESS__REAPER=alive; "
             "else [ -n \"$P\" ] && kill \"$P\" 2>/dev/null; "
-            "setsid nohup bash \"$D/reap.sh\" --loop </dev/null >/dev/null 2>&1 & "
+            "setsid nohup bash \"$D/reap.sh\" --loop </dev/null >/dev/null 2>&1 & NP=$!; "
+            # 立刻把"新代的 pid + 间隔"写进指纹文件：不依赖子进程自己写，
+            # 否则紧接着读它的人（测试/下一次 ensure）可能读到上一代的间隔。
+            # 注意：bash printf 的格式串要写成 `%%s %%d`（本段用 % 格式化，未转义会被当占位符），
+            # 间隔值用本层的 `%d` 占位符传入（不能用 `+` 拼接——Python 里 `%` 优先级高于 `+`）
+            "printf '%%s %%d\\n' \"$NP\" %d > \"$D/.reaper.pid\" 2>/dev/null; "
             "echo __PYAISSH_SESS__REAPER=started; fi; "
             "echo \"__PYAISSH_SESS__REAPER_KILLED=$KILLED\"; "
             "echo __PYAISSH_SESS__DONE=1"
-            % (q(root), script_b64, int(interval)))
+            % (q(root), script_b64, int(interval), int(interval)))
     return _SESSION_TMUX_PROLOGUE + body
 
 

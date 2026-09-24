@@ -2031,11 +2031,12 @@ def suite_live_session_lifecycle(s):
             and "legacy_engine" not in _row5
             and any("tmux 会话已不存在" in w for w in (_jl5.get("warnings") or [])),
             repr(_jl5)[:260])
-    rc, _jex5, _ = _live_run(["exec", tgt, "--cmd",
-                              "[ -d /tmp/pyaissh-sessions/%s ] && echo still || echo gone" % _lg],
-                             timeout=60)
+    _l5c_cmd = ("[ -d /tmp/pyaissh-sessions/%s ] && echo still || echo gone" % _lg)
+    rc, _jex5, _ = _live_run(["exec", tgt, "--cmd", _l5c_cmd], timeout=60)
+    if (_jex5 or {}).get("stdout") is None:      # 单次 exec 失败（SSH 抖动）→ 重试一次，别把 flake 当断言失败
+        rc, _jex5, _ = _live_run(["exec", tgt, "--cmd", _l5c_cmd], timeout=60)
     s.check("L5c 过期也不被惰性扫/reaper 误删（没有 tmux 名文件 ⇒ 不碰）",
-            "still" in ((_jex5 or {}).get("stdout") or ""), repr((_jex5 or {}).get("stdout")))
+            "still" in ((_jex5 or {}).get("stdout") or ""), repr(_jex5)[:200])
     rc, _jk5, _ = _live_run(["session", "kill", tgt, "--name", _lg], timeout=120)
     _krow5 = ((_jk5 or {}).get("sessions") or [{}])[0]
     s.check("L5d kill 能清掉它（cleaned=true，且不再标 legacy_engine）",
@@ -2064,7 +2065,16 @@ def suite_live_session_orphan(s):
     _o2 = name + "o2"
     _live_run(["session", "start", tgt, "--name", _o2, "--ttl", "300"], timeout=90)
     _live_run(["session", "send", tgt, "--name", _o2, "--cmd", "sleep 200 &"], timeout=60)
-    time.sleep(0.8)
+    # 等后台作业真的进进程树（忙机器上 fork 可能晚于固定 sleep）：最多轮询 ~4s
+    for _try in range(8):
+        _rc, d, _se = _live_run(["exec", tgt, "--cmd",
+                                 "P=$(cat /tmp/pyaissh-sessions/%s/meta >/dev/null 2>&1; "
+                                 "tmux -L pyaissh display-message -p -t \"=$(cat /tmp/pyaissh-sessions/%s/tmux):\" "
+                                 "'#{pane_pid}' 2>/dev/null); "
+                                 "pgrep -P \"$P\" 2>/dev/null | wc -l" % (_o2, _o2)], timeout=60)
+        if ((d or {}).get("stdout") or "").strip() not in ("", "0"):
+            break
+        time.sleep(0.5)
     rc, _j2, _ = _live_run(["session", "kill", tgt, "--name", _o2], timeout=120)
     _r2 = ((_j2 or {}).get("sessions") or [{}])[0]
     s.check("O2a kill 扫到会话进程树（含后台作业，swept>=2）+ 无残留 + verified",
