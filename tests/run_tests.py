@@ -842,6 +842,26 @@ def suite_live_exec_field(s):
     s.check("log --list 可用", bool(jl) and jl.get("ok") is True
             and isinstance(jl.get("jobs"), list) and "job_dir" in jl, repr(jl)[:160])
 
+    # B1（真机复现，v2.3.0 修）：log --wait-rc >30s 曾被 SFTP 看门狗误杀（30s 处断链，
+    # 随后报"读不到日志文件"）——与 session 同病：轮询循环不刷新看门狗活动时间
+    rc, jb1d, _ = _live_run(["exec", tgt, "--detach", "--cmd", "sleep 32; echo JOB32"], timeout=90)
+    if jb1d and jb1d.get("job_id"):
+        _t0 = time.time()
+        rc, jb1, _ = _live_run(["log", tgt, "--job-id", jb1d["job_id"], "--wait-rc", "50"],
+                               timeout=180)
+        _dt = time.time() - _t0
+        s.check("B1 log --wait-rc 50 等满 32s 不被看门狗误杀（finished + exit 0）",
+                bool(jb1) and jb1.get("status") == "finished" and jb1.get("exit_code") == 0,
+                "%.1fs status=%s exit=%s msg=%s" % (_dt, (jb1 or {}).get("status"),
+                                                    (jb1 or {}).get("exit_code"),
+                                                    ((jb1 or {}).get("message") or "")[:40]))
+        s.check("B1 刚结束的作业不误判 dead（rc 落盘宽限）",
+                bool(jb1) and jb1.get("status") != "dead", repr(jb1)[:120])
+        _live_run(["log", tgt, "--job-id", jb1d["job_id"], "--cleanup"], timeout=60)
+    else:
+        s.check("B1 log --wait-rc 50 等满 32s 不被看门狗误杀（finished + exit 0）", False,
+                "detach 未返回 job_id: %r" % (jb1d,))
+
     # v2.2.1 kill：长作业整组停掉 → 状态收敛为 dead（不再永久 running）
     rc, jk, _ = _live_run(["exec", tgt, "--detach", "--cmd", "sleep 120"], timeout=90)
     kjob = (jk or {}).get("job_id")
@@ -1095,24 +1115,31 @@ def suite_live_session(s):
             and j.get("pty") is True and j.get("ready") is True
             and j.get("permissions", {}).get("dir") == "0700", repr(j)[:200])
 
-    _live_run(["session", "send", tgt, "--name", name, "--cmd", "cd /var/log; pwd"], timeout=60)
-    rc, j, _ = _live_run(["session", "read", tgt, "--name", name, "--wait-rc", "20"], timeout=90)
+    rc, _js1, _ = _live_run(["session", "send", tgt, "--name", name, "--cmd",
+                            "cd /var/log; pwd"], timeout=60)
+    rc, j, _ = _live_run(["session", "read", tgt, "--name", name, "--wait-rc", "20",
+                          "--token", (_js1 or {}).get("token")], timeout=90)
     s.check("逐条喂命令：退出码 0 + 输出 /var/log",
             bool(j) and j.get("exit_code") == 0 and "/var/log" in (j.get("stdout") or ""),
             repr(j)[:160])
-    _live_run(["session", "send", tgt, "--name", name, "--cmd", "this_cmd_is_missing"],
-              timeout=60)
-    rc, j, _ = _live_run(["session", "read", tgt, "--name", name, "--wait-rc", "20"], timeout=90)
+    rc, _js2, _ = _live_run(["session", "send", tgt, "--name", name, "--cmd",
+                            "this_cmd_is_missing"], timeout=60)
+    rc, j, _ = _live_run(["session", "read", tgt, "--name", name, "--wait-rc", "20",
+                          "--token", (_js2 or {}).get("token")], timeout=90)
     s.check("错误命令独立退出码 127，会话不死", bool(j) and j.get("exit_code") == 127,
             repr(j.get("exit_code")))
-    _live_run(["session", "send", tgt, "--name", name, "--cmd", "echo PWD=$(pwd)"], timeout=60)
-    rc, j, _ = _live_run(["session", "read", tgt, "--name", name, "--wait-rc", "20"], timeout=90)
+    rc, _js3, _ = _live_run(["session", "send", tgt, "--name", name, "--cmd",
+                            "echo PWD=$(pwd)"], timeout=60)
+    rc, j, _ = _live_run(["session", "read", tgt, "--name", name, "--wait-rc", "20",
+                          "--token", (_js3 or {}).get("token")], timeout=90)
     s.check("状态保留：错误命令后 cwd 仍是 /var/log",
             bool(j) and "PWD=/var/log" in (j.get("stdout") or ""), repr(j.get("stdout"))[:120])
 
     # ctrl-c：中断执行中的命令，会话与状态都保住
-    _live_run(["session", "send", tgt, "--name", name, "--cmd", "sleep 300"], timeout=60)
-    rc, jr, _ = _live_run(["session", "read", tgt, "--name", name, "--wait-rc", "2"], timeout=60)
+    rc, _js4, _ = _live_run(["session", "send", tgt, "--name", name, "--cmd", "sleep 300"],
+                           timeout=60)
+    rc, jr, _ = _live_run(["session", "read", tgt, "--name", name, "--wait-rc", "2",
+                          "--token", (_js4 or {}).get("token")], timeout=60)
     s.check("长命令 status=running", bool(jr) and jr.get("status") == "running",
             repr(jr.get("status")))
     rc, jc, _ = _live_run(["session", "ctrl-c", tgt, "--name", name], timeout=90)
@@ -1185,9 +1212,10 @@ def suite_live_session(s):
             and j4.get("exit_code") == 0, repr(j4.get("stdout"))[:140])
 
     # ANSI/CR 清洗
-    _live_run(["session", "send", tgt, "--name", name, "--cmd",
-               "printf '\\033[31mRED\\033[0m\\n'"], timeout=60)
-    rc, j5, _ = _live_run(["session", "read", tgt, "--name", name, "--wait-rc", "20"], timeout=60)
+    rc, _js5, _ = _live_run(["session", "send", tgt, "--name", name, "--cmd",
+                            "printf '\\033[31mRED\\033[0m\\n'"], timeout=60)
+    rc, j5, _ = _live_run(["session", "read", tgt, "--name", name, "--wait-rc", "20",
+                          "--token", (_js5 or {}).get("token")], timeout=60)
     s.check("默认剥离 ANSI（保留文本）",
             bool(j5) and "RED" in (j5.get("stdout") or "") and "\x1b" not in (j5.get("stdout") or ""),
             repr(j5.get("stdout"))[:100])
@@ -1215,6 +1243,79 @@ def suite_live_session(s):
     rc, jsl, _ = _live_run(["session", "list", tgt], timeout=60)
     s.check("kill 后该会话不在 list", bool(jsl) and not any(
         x.get("session") == name for x in (jsl.get("sessions") or [])), repr(jsl)[:140])
+
+    # ---- 真机复现的 5 个 bug 的回归护栏（v2.3.0；外部评审报的，逐个先复现再修）----
+    # B3：read --lines N 曾被完全忽略（20000 行日志 --lines 5 回传上万行）
+    rc, jb3s, _ = _live_run(["session", "start", tgt, "--name", name + "b3"], timeout=90)
+    _live_run(["session", "run", tgt, "--name", name + "b3", "--cmd", "seq 1 3000",
+               "--wait-rc", "20"], timeout=90)
+    rc, jb3, _ = _live_run(["session", "read", tgt, "--name", name + "b3", "--lines", "5"],
+                           timeout=60)
+    _n3 = len([x for x in ((jb3 or {}).get("stdout") or "").splitlines() if x.strip()])
+    s.check("B3 read --lines 5 真的只回 5 行", bool(jb3) and 0 < _n3 <= 5,
+            "行数=%d lines_returned=%s" % (_n3, (jb3 or {}).get("lines_returned")))
+    _live_run(["session", "kill", tgt, "--name", name + "b3"], timeout=60)
+
+    # B4：命令输出 >1MB 时哨兵在old窗口外 → 曾永远回 running（seq 1 300000 ≈ 2MB）
+    rc, jb4s, _ = _live_run(["session", "start", tgt, "--name", name + "b4"], timeout=90)
+    rc, jb4, _ = _live_run(["session", "run", tgt, "--name", name + "b4", "--cmd",
+                            "seq 1 300000; echo BIG_DONE", "--wait-rc", "30"], timeout=120)
+    s.check("B4 输出 >1MB 也能看到哨兵（status=done + 尾部有 BIG_DONE）",
+            bool(jb4) and jb4.get("status") == "done" and jb4.get("exit_code") == 0
+            and "BIG_DONE" in (jb4.get("stdout") or ""),
+            "status=%s exit=%s 尾=%r" % ((jb4 or {}).get("status"), (jb4 or {}).get("exit_code"),
+                                        ((jb4 or {}).get("stdout") or "")[-30:]))
+    _live_run(["session", "kill", tgt, "--name", name + "b4"], timeout=60)
+
+    # B5：CRLF 命令文本要像 exec 一样回传 crlf_normalized
+    import shutil as _sh2
+    import tempfile as _tf2
+    _cdir2 = _tf2.mkdtemp(prefix="pyaissh_sess_crlf_")
+    try:
+        _f5 = os.path.join(_cdir2, "crlf.sh")
+        io.open(_f5, "w", encoding="utf-8", newline="").write("echo SESS_CRLF_OK\r\n")
+        rc, jb5s, _ = _live_run(["session", "start", tgt, "--name", name + "b5"], timeout=90)
+        rc, jb5, _ = _live_run(["session", "run", tgt, "--name", name + "b5", "--cmd-file", _f5,
+                                "--wait-rc", "15"], timeout=60)
+        s.check("B5 session run 回传 crlf_normalized",
+                bool(jb5) and jb5.get("crlf_normalized") == 1
+                and jb5.get("exit_code") == 0, repr(jb5)[:180])
+        rc, jb5b, _ = _live_run(["session", "send", tgt, "--name", name + "b5",
+                                 "--cmd-file", _f5], timeout=60)
+        s.check("B5 session send 回传 crlf_normalized",
+                bool(jb5b) and jb5b.get("crlf_normalized") == 1, repr(jb5b)[:160])
+        _live_run(["session", "kill", tgt, "--name", name + "b5"], timeout=60)
+    finally:
+        _sh2.rmtree(_cdir2, ignore_errors=True)
+
+    # B1+B2：长等待不被 SFTP 看门狗误杀（>30s）+ --no-pty 降级路径可用
+    rc, jb1s, _ = _live_run(["session", "start", tgt, "--name", name + "b1"], timeout=90)
+    _t1 = time.time()
+    rc, jb1, _ = _live_run(["session", "run", tgt, "--name", name + "b1", "--cmd",
+                            "sleep 32; echo SLEPT32", "--wait-rc", "60"], timeout=180)
+    _dt1 = time.time() - _t1
+    s.check("B1 会话长等待 >30s 不被看门狗误杀（sleep 32 跑完）",
+            bool(jb1) and jb1.get("status") == "done" and jb1.get("exit_code") == 0
+            and "SLEPT32" in (jb1.get("stdout") or ""),
+            "%.1fs status=%s" % (_dt1, (jb1 or {}).get("status")))
+    _live_run(["session", "kill", tgt, "--name", name + "b1"], timeout=60)
+
+    rc, jbnp, _ = _live_run(["session", "start", tgt, "--name", name + "np", "--no-pty"],
+                            timeout=90)
+    s.check("B2 --no-pty 会话就绪（ready=True，pty=False）",
+            bool(jbnp) and jbnp.get("pty") is False and jbnp.get("ready") is True,
+            repr(jbnp)[:160])
+    rc, jbnp2, _ = _live_run(["session", "run", tgt, "--name", name + "np", "--cmd",
+                              "echo NOPTY_OK", "--wait-rc", "15"], timeout=60)
+    s.check("B2 --no-pty 下 run 能拿到输出与退出码（曾静默挂死）",
+            bool(jbnp2) and jbnp2.get("status") == "done" and jbnp2.get("exit_code") == 0
+            and "NOPTY_OK" in (jbnp2.get("stdout") or ""), repr(jbnp2)[:180])
+    rc, jbnp3, _ = _live_run(["session", "run", tgt, "--name", name + "np", "--cmd",
+                              "cd /tmp && pwd", "--wait-rc", "15"], timeout=60)
+    s.check("B2 --no-pty 下多行/复合命令与状态保留正常",
+            bool(jbnp3) and jbnp3.get("exit_code") == 0
+            and (jbnp3.get("stdout") or "").strip() == "/tmp", repr(jbnp3)[:160])
+    _live_run(["session", "kill", tgt, "--name", name + "np"], timeout=60)
 
     # 错误路径
     rc, je, _ = _live_run(["session", "read", tgt, "--name", "nope_xyz"], timeout=60)

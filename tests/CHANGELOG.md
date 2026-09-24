@@ -268,3 +268,21 @@
 - 验证过程中的两次 FAIL 都是**夹具问题**：① 拿 nginx 做样例但目标机没装 nginx（产品行为正确）；
   ② `cat $打错的变量 | wc -c` —— 变量为空导致 `cat` 无参读 stdin 阻塞（人类会按 Ctrl-C），
   且管道 exit_code 取末尾命令（POSIX），故断言应看输出文本而非 exit_code
+
+## [2026-09-24] v2.3.0 补三：外部评审 5 个真机缺陷的回归护栏
+
+### 新增用例（先逐个复现、再修、再回归）
+- live_session 28 → 36：B1 会话长等待 >30s 不被 SFTP 看门狗误杀（sleep 32 跑完）；
+  B2 `--no-pty` 就绪（ready=True/pty=False）+ run 拿到输出与退出码 + 多行复合命令与状态保留；
+  B3 `read --lines 5` 真的只回 ≤5 行（曾回 3000 行）；B4 输出 >1MB 仍能看到哨兵（`seq 1 300000`
+  → done + 尾部 BIG_DONE，曾永远 running）；B5 run/send 回传 `crlf_normalized=1`（真 CRLF 夹具）
+- live_exec_field 62 → 64：B1 `log --wait-rc 50` 等满 32s 不被误杀（finished + exit 0）；
+  刚结束的作业不误判 dead（rc 落盘宽限）
+### 说明
+- 复现脚本发现的两个**夹具/流程坑**：① 我用 LF 文件测 CRLF 归一 ⇒ 字段缺失是正常行为（夹具错）；
+  ② 套件跑的是**根 `pyaissh.py`**，只跑 `join` 不跑 `dist` ⇒ 新修复没进被测二进制（教训：改完 code
+  必须 `dist`）；③ 新块里用了未导入的 tempfile/shutil ⇒ 套件中途 NameError 中断
+- 另修一处**自测发现的竞态**：判 `dead` 前给 job.rc 落盘 0.6s 宽限（`sleep 45` 刚结束那一瞬
+  曾被读成 dead）
+- 首次跑新用例出现一次 `exec --detach` 未返回 job_id（未复现，isolated 3/3 正常），失败详情
+  已改为打印原始 JSON

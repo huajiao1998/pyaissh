@@ -857,9 +857,17 @@ def _sftp_read_rc(sftp, rc_path):
 
 
 def _sftp_read_pid(sftp, pid_path):
-    """读作业进程组 leader pid；缺失/非法 → None。"""
+    """读作业进程组 leader pid；缺失/非法 → None。
+
+    v2.3.0：读前先 `_sftp_touch_activity` —— 作业 `--wait-rc` 轮询会几十秒只有这一处
+    SFTP 操作，不刷新活动时间就会被 SFTP 看门狗（默认 30s）误杀（实测 `--wait-rc 50`
+    在 ~30s 处连接被杀、随后报"读不到日志文件"）。"""
     if not pid_path:
         return None
+    try:
+        _sftp_touch_activity(sftp)
+    except Exception:
+        pass
     try:
         with sftp.open(pid_path, "rb") as f:
             raw = f.read(64)
@@ -951,6 +959,10 @@ def _job_status(sftp, client, files):
 
     "dead" 的存在意义：让 --wait-rc 与消费端轮询**收敛**——否则被 kill 的作业
     永远是 running，AI 只能靠超时放弃（v2.2.1 修复）。
+
+    v2.3.0 加固（真机偶发）：**刚结束的作业不能误判 dead**——`sleep 45` 跑完的那一瞬间，
+    进程已退出但 `run.sh` 还没把 `job.rc` 落盘，实测被读成 dead（exit 不可知）。
+    现在判 dead 前给 rc 一个短暂宽限（`JOB_RC_GRACE` 内重试两次读 rc）。
     """
     files = files or {}
     rc_val = _sftp_read_rc(sftp, files.get("rc"))
@@ -958,6 +970,12 @@ def _job_status(sftp, client, files):
     if rc_val is not None:
         return "finished", rc_val, pid
     if _pid_alive(client, pid) is False:
+        # 进程没了：可能是"刚结束、rc 还在落盘"，也可能是"被 kill/OOM 永不落 rc"
+        for _ in range(2):
+            time.sleep(JOB_RC_GRACE / 2.0)
+            rc_val = _sftp_read_rc(sftp, files.get("rc"))
+            if rc_val is not None:
+                return "finished", rc_val, pid
         return "dead", None, pid
     return "running", None, pid
 
@@ -1312,6 +1330,10 @@ def _log_read(sftp, client, args, job_dir, conn, start):
             if _SIGTERM_RECEIVED:
                 raise KeyboardInterrupt("SIGTERM")
             time.sleep(JOB_POLL_TICK)
+            try:
+                _sftp_touch_activity(sftp)   # 防 SFTP 看门狗误杀长等待（v2.3.0）
+            except Exception:
+                pass
             status, rc_val, pid = _job_status(sftp, client, files)
             if status != "running":
                 break

@@ -97,6 +97,7 @@ DEFAULT_MAX_OUTPUT = 65536   # exec 单流默认最大保留字节（v2.2 由 25
 DEFAULT_JOB_DIR = "/tmp/pyaissh-jobs"  # 远端作业根目录（每作业一个子目录）
 JOB_TAIL_WINDOW = 1048576    # log 取尾部时的最大回看字节窗口（1MB，防大日志全量入内存）
 JOB_WAIT_MAX = 600           # --wait-rc 上限秒数（宿主单次调用上限约 600s）
+JOB_RC_GRACE = 0.6           # 判 dead 前给 job.rc 落盘的宽限（防"刚结束被误判 dead"，v2.3.0）
 BUF_ALIGN_WINDOW = 4096      # 截断行对齐时回退搜索窗口（字节）
 MIN_BUF_FLOOR = 4096         # 内存缓冲下限：max(args.max_output, 4096) 保证小档位也有可用缓冲
 

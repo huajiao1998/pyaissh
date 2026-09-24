@@ -224,6 +224,7 @@ DEFAULT_MAX_OUTPUT = 65536   # exec 单流默认最大保留字节（v2.2 由 25
 DEFAULT_JOB_DIR = "/tmp/pyaissh-jobs"  # 远端作业根目录（每作业一个子目录）
 JOB_TAIL_WINDOW = 1048576    # log 取尾部时的最大回看字节窗口（1MB，防大日志全量入内存）
 JOB_WAIT_MAX = 600           # --wait-rc 上限秒数（宿主单次调用上限约 600s）
+JOB_RC_GRACE = 0.6           # 判 dead 前给 job.rc 落盘的宽限（防"刚结束被误判 dead"，v2.3.0）
 BUF_ALIGN_WINDOW = 4096      # 截断行对齐时回退搜索窗口（字节）
 MIN_BUF_FLOOR = 4096         # 内存缓冲下限：max(args.max_output, 4096) 保证小档位也有可用缓冲
 
@@ -3561,9 +3562,17 @@ def _sftp_read_rc(sftp, rc_path):
 
 
 def _sftp_read_pid(sftp, pid_path):
-    """读作业进程组 leader pid；缺失/非法 → None。"""
+    """读作业进程组 leader pid；缺失/非法 → None。
+
+    v2.3.0：读前先 `_sftp_touch_activity` —— 作业 `--wait-rc` 轮询会几十秒只有这一处
+    SFTP 操作，不刷新活动时间就会被 SFTP 看门狗（默认 30s）误杀（实测 `--wait-rc 50`
+    在 ~30s 处连接被杀、随后报"读不到日志文件"）。"""
     if not pid_path:
         return None
+    try:
+        _sftp_touch_activity(sftp)
+    except Exception:
+        pass
     try:
         with sftp.open(pid_path, "rb") as f:
             raw = f.read(64)
@@ -3655,6 +3664,10 @@ def _job_status(sftp, client, files):
 
     "dead" 的存在意义：让 --wait-rc 与消费端轮询**收敛**——否则被 kill 的作业
     永远是 running，AI 只能靠超时放弃（v2.2.1 修复）。
+
+    v2.3.0 加固（真机偶发）：**刚结束的作业不能误判 dead**——`sleep 45` 跑完的那一瞬间，
+    进程已退出但 `run.sh` 还没把 `job.rc` 落盘，实测被读成 dead（exit 不可知）。
+    现在判 dead 前给 rc 一个短暂宽限（`JOB_RC_GRACE` 内重试两次读 rc）。
     """
     files = files or {}
     rc_val = _sftp_read_rc(sftp, files.get("rc"))
@@ -3662,6 +3675,12 @@ def _job_status(sftp, client, files):
     if rc_val is not None:
         return "finished", rc_val, pid
     if _pid_alive(client, pid) is False:
+        # 进程没了：可能是"刚结束、rc 还在落盘"，也可能是"被 kill/OOM 永不落 rc"
+        for _ in range(2):
+            time.sleep(JOB_RC_GRACE / 2.0)
+            rc_val = _sftp_read_rc(sftp, files.get("rc"))
+            if rc_val is not None:
+                return "finished", rc_val, pid
         return "dead", None, pid
     return "running", None, pid
 
@@ -4016,6 +4035,10 @@ def _log_read(sftp, client, args, job_dir, conn, start):
             if _SIGTERM_RECEIVED:
                 raise KeyboardInterrupt("SIGTERM")
             time.sleep(JOB_POLL_TICK)
+            try:
+                _sftp_touch_activity(sftp)   # 防 SFTP 看门狗误杀长等待（v2.3.0）
+            except Exception:
+                pass
             status, rc_val, pid = _job_status(sftp, client, files)
             if status != "running":
                 break
@@ -5334,7 +5357,9 @@ def _session_start_cmd(f, cols, no_pty=False):
         "if [ %s = 0 ]; then PTY=0; elif command -v script >/dev/null 2>&1; then PTY=1; else PTY=0; fi; " % pty_pref +
         "if [ \"$PTY\" = 1 ]; then setsid nohup bash -c \"%s\" >>%s 2>&1 </dev/null & " % (
             inner, q(f["err"])) +
-        "else setsid nohup bash -c '%s' >>%s 2>&1 </dev/null & fi; " % (plain, q(f["err"])) +
+        # 非 PTY 分支必须把会话输出写进 out.log（早期误写成 err.log ⇒ out.log 永远为空、
+        # read/run 永远 running+空输出——实测 --no-pty 完全不可用）
+        "else setsid nohup bash -c '%s' >>%s 2>&1 </dev/null & fi; " % (plain, q(f["log"])) +
         "echo $! > %s; sleep 0.4; " % q(f["pid"]) +
         "printf '%%s %%s %%s\\n' \"$PTY\" %d \"$(date +%%s)\" > %s; " % (cols, q(f["meta"])) +
         "chmod 600 %s 2>/dev/null; " % q(f["meta"]) +
@@ -5505,7 +5530,15 @@ def _session_remote_exists(sftp, path):
 
 
 def _session_sftp_read(sftp, path, offset=0, limit=None):
-    """从 offset 读日志（limit 为 None 则读到尾）。返回 (bytes, size)。"""
+    """从 offset 读日志（limit 为 None 则读到尾）。返回 (bytes, size)。
+
+    v2.3.0：读前刷新 SFTP 看门狗活动时间——会话轮询可持续几十秒只做这类小读，
+    不刷新就会被看门狗（默认 30s）误杀（实测 `session run sleep 35` 在 30.7s 处被杀、结果丢失）。
+    """
+    try:
+        _sftp_touch_activity(sftp)
+    except Exception:
+        pass
     f = sftp.open(path, "rb")
     try:
         f.seek(offset)
@@ -5520,22 +5553,53 @@ def _session_sftp_read(sftp, path, offset=0, limit=None):
             pass
 
 
-def _session_poll_sentinel(sftp, path, offset, token, timeout, interval=0.25):
-    """轮询日志直到出现目标哨兵或超时。
+def _session_sftp_size(sftp, path):
+    """只取日志大小（stat，便宜）；失败返回 0。读前刷新看门狗活动时间。"""
+    try:
+        _sftp_touch_activity(sftp)
+    except Exception:
+        pass
+    try:
+        return sftp.stat(path).st_size
+    except Exception:
+        return 0
 
-    返回 (text_bytes, size, rc|None, matched_token|None, elapsed)。
-    单次读取上限 SESSION_TAIL_WINDOW（1MB）：`--wait-rc` 期间日志可能很长，
-    只回看尾部窗口即可——哨兵总是出现在尾部。
+
+def _session_poll_sentinel(sftp, path, offset, token, timeout, interval=0.25):
+    """轮询日志直到出现目标哨兵或超时。返回 (data, size, rc|None, token|None, elapsed)。
+
+    v2.3.0 修两个语义问题（B4，真机复现）：
+      ① **回看窗口**：从 `max(offset, size - SESSION_TAIL_WINDOW)` 起读——哨兵总在文件**末尾**；
+         早期实现"从 offset 起读、上限 1MB"，命令输出 >1MB 时哨兵落在窗外 ⇒ 明明跑完了也永远
+         回 running（实测 `seq 1 300000` 卡在 ~1MB 处、只看到 144960 行）。
+      ② **只追增量**：每轮只 `stat`（便宜），文件长长了才读新增那一段、维护末尾 1MB 输出窗口，
+         不再每 0.25s 重下整个 1MB 窗口（窄带宽链路自残）。
+    另：每轮刷新 SFTP 看门狗活动时间（B1：`session run sleep 35` 曾因 30s 无活动被杀）。
     """
     t0 = time.time()
+    tail = b""          # 输出窗口（末尾 ≤1MB，哨兵在其中）
+    scanned = -1        # 已扫描到的文件大小
+    size = 0
     while True:
-        data, size = _session_sftp_read(sftp, path, offset, SESSION_TAIL_WINDOW)
-        text = data.decode("utf-8", "replace")
+        try:
+            _sftp_touch_activity(sftp)
+        except Exception:
+            pass
+        size = _session_sftp_size(sftp, path)
+        if size != scanned:
+            if scanned >= 0 and size > scanned:
+                inc, _ = _session_sftp_read(sftp, path, scanned, None)
+                tail = (tail + inc)[-SESSION_TAIL_WINDOW:]
+            else:
+                start = max(0 if offset is None else offset, size - SESSION_TAIL_WINDOW)
+                tail, _ = _session_sftp_read(sftp, path, start, None)
+            scanned = size
+        text = tail.decode("utf-8", "replace")
         m, tok, rc = _session_find_sentinel(text, token)
         if m is not None:
-            return data, size, rc, tok, time.time() - t0
+            return tail, size, rc, tok, time.time() - t0
         if time.time() - t0 >= timeout:
-            return data, size, None, None, time.time() - t0
+            return tail, size, None, None, time.time() - t0
         time.sleep(interval)
 
 
@@ -5580,7 +5644,7 @@ def cmd_session_start(args):
 
         # 就绪确认：发一条初始化命令并等它的哨兵（同时验证 FIFO 通路、记录会话 shell pid）
         init = "PS1=; PS2=; stty -echo 2>/dev/null || true; echo $$ > %s" % _sh_quote(f["bash"])
-        token = _session_send_payload(client, f, init)
+        token = _session_send_payload(client, f, init, plain=not pty)
         ready, wait_s = False, 0.0
         if token:
             sftp = open_sftp(client)
@@ -5630,25 +5694,62 @@ def cmd_session_start(args):
         close_all(client)
 
 
-def _session_payload_text(cmd, token):
+def _session_payload_text(cmd, token, plain=False):
     """命令 → 写入 FIFO 的载荷文本（纯函数，便于单测）。
 
-    关键（实测教训）：哨兵必须与命令**在同一行被 shell 解析**——用 `{ ...; }; echo 哨兵` 包裹。
-    早期把哨兵单列一行紧跟命令，命令里若有从终端读取的语句（`read -p`、`passwd`），
-    它会**吃掉**那一行当输入（实测：`read` 拿到的值就是哨兵文本，真哨兵永不出现）。
-    用 `{}` 而非 `()`：大括号是**同一个 shell**，cd/export 等状态照常保留。
+    两种形态（v2.3.0 修正）：
+    - **PTY 模式**（默认）：`{ ...; }; echo 哨兵`。要点：哨兵必须与命令**在同一行被 shell 解析**，
+      否则命令里从终端读取的语句（`read -p`）会把紧随其后的哨兵行当输入吃掉（实测踩过）。
+      用 `{}` 而非 `()`：大括号是同一个 shell，cd/export 状态照常保留。
+      多行形态在 PTY 下没问题——但**行的长度必须短**（tty 规范模式单行上限 ~4096B），
+      所以长命令不要拼成一行。
+    - **非 PTY 降级模式**（`plain=True`）：`eval "$(printf %s '<b64>' | base64 -d)"; echo 哨兵`。
+      降级模式的读取循环是**逐行 eval**，多行载荷会被拆成多段（`{` 单独一行直接 syntax error，
+      哨兵永不出现 —— 实测 `--no-pty` 完全不可用）。base64 保证是**一行**，且 eval 在同一 shell
+      里执行 ⇒ 状态保留 + 多行命令 + 长命令都不受限。
     """
     body = cmd.rstrip("\n")
+    if plain:
+        b64 = base64.b64encode(body.encode("utf-8")).decode("ascii")
+        return "eval \"$(printf %%s '%s' | base64 -d)\"; echo \"%s%s__$?\"\n" % (
+            b64, SESSION_RC_PREFIX, token)
     return "{\n%s\n}; echo \"%s%s__$?\"\n" % (body, SESSION_RC_PREFIX, token)
 
 
-def _session_send_payload(client, f, cmd, token=None):
+def _session_pty_mode(sftp, f):
+    """会话是否 PTY 模式（读 start 时写的 meta：`<pty> <cols> <started_at>`）。
+
+    读不到（老会话/异常）时按 PTY 处理（默认路径）。
+    """
+    try:
+        with sftp.open(f["meta"], "r") as fh:
+            parts = fh.read().decode("utf-8", "replace").split()
+        return parts[0] == "1" if parts else True
+    except Exception:
+        return True
+
+
+def _session_send_payload(client, f, cmd, token=None, plain=False):
     """把「命令 + 退出码哨兵」写进会话 FIFO。返回 token（失败返回 None）。"""
     token = token or os.urandom(4).hex()
-    payload = _session_payload_text(cmd, token)
+    payload = _session_payload_text(cmd, token, plain=plain)
     b64 = base64.b64encode(payload.encode("utf-8"))
     rc, _out, _err = _session_run(client, _session_send_cmd(f), stdin_data=b64, timeout=15)
     return token if rc == 0 else None
+
+
+def _session_tail_lines(text, n):
+    """取末尾 n 行（n<=0 或为 None 时原样返回）。
+
+    v2.3.0：`read --lines N` 此前**完全没被消费**（argparse 注册了、互斥校验也有，但读取分支
+    没用它）——20000 行日志 `--lines 5` 会回传上万行，既违约又烧 token（真机复现）。
+    """
+    if not n or n <= 0:
+        return text
+    lines = text.split("\n")
+    if len(lines) <= n:
+        return text
+    return "\n".join(lines[-n:])
 
 
 def _session_load(args, root, name, need_alive=True):
@@ -5698,20 +5799,18 @@ def cmd_session_send(args):
                 log_bytes = _session_sftp_read(sftp, f["log"], 0, 0)[1]
             except Exception:
                 log_bytes = 0
-            token = _session_send_payload(client, f, cmd)
+            token = _session_send_payload(client, f, cmd,
+                                          plain=not _session_pty_mode(sftp, f))
             if token is None:
                 emit_error(args.json, "send_failed",
                            "命令未能写入会话 FIFO（会话可能刚退出或 FIFO 无读者）",
                            extra={"session": args.name, "fifo": f["fifo"]})
                 return 255
             # 记下"最近这条命令"的 token：read --wait-rc 不带 --token 时用它定位，
-            # 否则会拿历史哨兵立刻返回"已完成"（实测踩过）
-            try:
-                with sftp.open(f["token"], "w") as fh:
-                    fh.write(token)
-                _sftp_chmod(sftp, f["token"], 0o600)
-            except Exception:
-                pass
+            # 否则会拿历史哨兵立刻返回"已完成"（实测踩过）；写失败要在结果里留痕——
+            # 否则消费者会拿**上一条**命令的 token 去 read，读到上一条的输出
+            # （A 机实测偶发：ANSI 用例读回了 keys 用例的 `N? GOT:hello_pty`）
+            _tok_ok = _session_write_token(sftp, f, token)
         finally:
             try:
                 sftp.close()
@@ -5728,6 +5827,12 @@ def cmd_session_send(args):
                             % (args.name, log_bytes, token)),
             "duration_ms": int((time.time() - start) * 1000),
         }
+        if getattr(args, "_crlf_normalized", 0):
+            result["crlf_normalized"] = args._crlf_normalized
+        if not _tok_ok:
+            result["warnings"].append(
+                "last.token 写入失败：后续 `read --wait-rc` 不带 --token 可能定位到上一条命令——"
+                "请显式传 --token %s" % token)
         _emit_result(args, result, header="[SESSION %s] sent token=%s offset=%d"
                      % (args.name, token, log_bytes))
         return 0
@@ -5771,13 +5876,20 @@ def _session_resolve_cmd(args):
 
 
 def _session_write_token(sftp, f, token):
-    """记下"最近这条命令"的 token（read/run 不带 --token 时用它定位）。"""
-    try:
-        with sftp.open(f["token"], "w") as fh:
-            fh.write(token)
-        _sftp_chmod(sftp, f["token"], 0o600)
-    except Exception:
-        pass
+    """记下"最近这条命令"的 token（read/run 不带 --token 时用它定位）。
+
+    重试两次并返回是否成功——写失败会让后续 `read --wait-rc`（不带 --token）误用**上一条**命令的
+    token，从而读到上一条的输出（A 机实测偶发：ANSI 用例读回了 keys 用例的 `N? GOT:hello_pty`）。
+    """
+    for _ in range(2):
+        try:
+            with sftp.open(f["token"], "w") as fh:
+                fh.write(token)
+            _sftp_chmod(sftp, f["token"], 0o600)
+            return True
+        except Exception:
+            time.sleep(0.1)
+    return False
 
 
 def cmd_session_run(args):
@@ -5809,7 +5921,8 @@ def cmd_session_run(args):
                 offset = _session_sftp_read(sftp, f["log"], 0, 0)[1]
             except Exception:
                 offset = 0
-            token = _session_send_payload(client, f, cmd)
+            token = _session_send_payload(client, f, cmd,
+                                          plain=not _session_pty_mode(sftp, f))
             if token is None:
                 emit_error(args.json, "send_failed",
                            "命令未能写入会话 FIFO（会话可能刚退出或 FIFO 无读者）",
@@ -5860,6 +5973,8 @@ def cmd_session_run(args):
                                          "--wait-rc 30 --token %s；中断它：session ctrl-c；"
                                          "读增量输出：session read --offset %d"
                                          % (result["waited_ms"], token, size))
+            if getattr(args, "_crlf_normalized", 0):
+                result["crlf_normalized"] = args._crlf_normalized
         finally:
             try:
                 sftp.close()
@@ -5921,14 +6036,23 @@ def cmd_session_read(args):
                 data, _ = _session_sftp_read(sftp, f["log"], size - back, None)
                 raw, next_offset = data, size
             text_all = raw.decode("utf-8", "replace")
+            lines_applied = None
             if args.wait_rc:
                 out_text, exit_code, token = _session_slice_by_sentinel(
                     text_all, args.token or (None if offset is not None
                                              else _session_last_token(sftp, f)))
                 if exit_code is not None:
                     status = "done"
+                if args.lines:      # --wait-rc 时 --lines 同样生效（取该命令输出的末尾 N 行）
+                    out_text = _session_tail_lines(out_text, args.lines)
+                    lines_applied = args.lines
             else:
                 out_text = _session_clean_text(text_all, not args.keep_ansi)
+                if offset is None:
+                    # 尾部读按 --lines 截尾（默认 SESSION_DEFAULT_LINES 行）
+                    # —— B3：此前该参数被完全忽略（20000 行日志 --lines 5 回传上万行）
+                    lines_applied = args.lines or SESSION_DEFAULT_LINES
+                    out_text = _session_tail_lines(out_text, lines_applied)
             truncated, omitted = False, 0
             if len(out_text.encode("utf-8")) > args.max_output:
                 cut, truncated, omitted = _truncate_output(
@@ -5948,6 +6072,9 @@ def cmd_session_read(args):
             if args.wait_rc:
                 result["waited_ms"] = int(waited * 1000)
                 result["wait_rc_secs"] = args.wait_rc
+            if lines_applied:
+                result["lines_returned"] = len(out_text.split("\n")) if out_text else 0
+                result["lines_requested"] = lines_applied
             if truncated:
                 result["output_truncated"] = True
                 result["omitted_bytes"] = omitted

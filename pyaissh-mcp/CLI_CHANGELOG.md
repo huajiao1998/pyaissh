@@ -477,3 +477,35 @@
 - **测试**：`live_session` 19 → 25 例（run 一次调用拿退出码+输出、run 之间状态保留、
   `--wait-rc` 超时回 running 且 token 保留、run 起的命令可 ctrl-c 中断收敛、`--no-wait` 只发送、
   随后 read 取结果）；MCP 真机 21 → 23（`B17a/B17b` 经 MCP 透传 run）
+
+### 修复：外部评审真机复现的 5 个缺陷（v2.3.0 发布前）
+
+- **B1(P0) SFTP 看门狗误杀长等待**：`open_sftp` 的看门狗线程只看 `_pyaissh_last_activity`，
+  而 session/log 的轮询循环从不刷新它——实测 `session run --cmd 'sleep 35'` 在 **30.7s** 处断链
+  （"Server connection dropped"，整条结果丢失）、`read --wait-rc 40` 同理；
+  **`log --wait-rc >30` 同病（v2.2.0 起潜伏**，实测 45s 作业的 `--wait-rc 50` 在 ~30s 被杀、
+  随后报"读不到日志文件"）——这直接把 `--wait-rc` 上限 600 的设计架空了。
+  修：session 的 `_session_sftp_read`/`_session_sftp_size`/轮询循环与 log 的等待循环，
+  每轮操作前调 `_sftp_touch_activity()`；`_sftp_read_pid` 读前也刷新
+- **B2(P0) `--no-pty` 降级路径完全不可用**（静默挂死式坏）：① 载荷 `{ ...; }; echo 哨兵` 是多行，
+  降级模式**逐行 eval** ⇒ `{` 单独一行 syntax error、哨兵永不出现；② 降级分支把会话输出重定向到
+  `err.log`（PTY 分支写 `out.log`）⇒ `out.log` 永远为空、`read`/`run` 永远回 running+空输出。
+  修：降级模式改用**单行 base64 + eval** 载荷（`eval "$(printf %s '<b64>' | base64 -d)"; echo 哨兵`
+  ——一行内解析，状态保留、多行/长命令不受限），并把降级分支输出改回 `out.log`；
+  `_session_pty_mode()` 读 start 时写的 meta 决定用哪种形态
+- **B3(P1) `read --lines N` 从未被消费**：argparse 注册了、互斥校验也有，但三个读取分支都没用它——
+  实测 3000 行日志 `--lines 5` 回传 **3000 行**（既违约又烧 token）。修：尾部读应用
+  `--lines`（默认 100 行），`--wait-rc` 模式同样生效，并回传 `lines_requested`/`lines_returned`
+- **B4(P1) 哨兵轮询窗口语义错**：从 offset 起读、上限 1MB ⇒ 命令输出 >1MB 时哨兵落在窗外，
+  明明跑完了也永远回 running（实测 `seq 1 300000` 卡在 ~1MB、只看到 144960 行）。
+  修：每轮只 `stat`，从 `max(offset, size-1MB)` 读**末尾窗口**并只追**新增段**（顺带消除
+  每 0.25s 重下整个 1MB 窗口的自残）
+- **B5(P2) session run/send 不回传 `crlf_normalized`**：归一执行了但字段缺失、与 exec 契约不一致。
+  修：两者都回传
+- **顺带加固（自测发现）**：判 `dead` 前给 `job.rc` 落盘留 `JOB_RC_GRACE`(0.6s) 宽限——
+  实测 `sleep 45` 作业**刚结束的那一瞬间**会被读成 `dead`（进程已退出、rc 还没落盘）
+- **测试**：`live_session` 28 → 36（B1 长等待/B2 --no-pty 就绪+run+状态/B3 --lines/B4 >1MB 哨兵/
+  B5 crlf_normalized×2），`live_exec_field` 62 → 64（B1 log --wait-rc 50 等满 32s + 结束不误判 dead）；
+  评审指出"`--no-pty` 无用例"的缺口已补
+- 排障记录：首次跑新用例时 `exec --detach` 偶发未返回 job_id（未复现，isolated 3/3 正常）——
+  已把原始 JSON 打进失败详情，便于下次定位
