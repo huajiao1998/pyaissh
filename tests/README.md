@@ -9,9 +9,15 @@
 
 ## 运行
 
+**开发期只跑"必要的最小测试"**（2026-09-24 定，用户三次收紧）：跑之前先问"这是不是验证本次改动的
+必要最小测试"，不是就别跑——能靠静态检查/读代码/一条命令说清的就不跑套件；文档改动不跑测试；
+能只跑一条断言就不跑整块。**全量（`--all` / `--session`）是"发布到 GitHub 前"的工作**
+（工具层已上闸：必须显式带 `--release` 或 `PYAISSH_TEST_RELEASE=1`，否则直接拒绝）。
+
 ```bash
 python tests/run_tests.py                # 交互菜单（数字选 1-6 / 0 全部）
-python tests/run_tests.py --all          # 全量：unit 先、live 后
+python tests/run_tests.py --suite live_session_engine   # 最常用：只跑改动落点所在的那一块
+python tests/run_tests.py --all --release # 全量：**仅发布前**（开发期会被拒绝）
 python tests/run_tests.py --unit         # 仅单元（无网络，任何机器可跑）
 python tests/run_tests.py --artifacts    # 仅制品结构集
 python tests/run_tests.py --sudo         # 仅 sudo 集
@@ -57,11 +63,12 @@ PYAISSH_BIN=<pyaissh.py 路径> python tests/run_tests.py --exec  # live：子�
 
 1. 在 `run_tests.py` 内对应 `suite_xxx()` 函数加 `s.check("名称", 条件)`
 2. 或新加集：写 `suite_xxx(s)` + 在 `SUITES` 注册一行
-3. 跑 `--all` 全绿后提交（连同工具改动）
+3. **先跑改动落点那一块**（`--suite <块名>`）确认为绿；`--all --release` 只在发布到 GitHub 前跑
 4. `tests/CHANGELOG.md` 末尾追加记录
 
 ## 原则
 
+- **最小测试**：断言只留"能抓住这次改动会怎么坏"的那几条；不做无谓的重复覆盖
 - **测真实函数不测复制品**：unit 调被测模块的 `warn_sensitive_cmd`/`parse_target`/`_SENSITIVE_CMD_RE` 等
 - **live 是行为真源**：sudo 门控/组装等端到端由真机断言
 - **凭据零硬编码**：live 只用 `PYAISSH_TEST_*` env
