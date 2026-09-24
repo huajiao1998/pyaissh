@@ -421,7 +421,7 @@ TOOLS = [
     },
     {
         "name": "pyaissh_session",
-        "description": "常驻会话（真 PTY）：多步且带状态的远端操作——逐条喂命令、cd/export 跨命令保留、每条独立退出码、可中断执行中的命令、可应答交互提示。action 取值与用法：start（起会话，返回 pid/pty/ready）→ run（跑一条并等结果，一步一次调用；--wait-rc 超时回 status=running，--no-wait 只发送）→ read（读输出：offset 增量 / wait_rc 等这条结束拿 exit_code；载荷字段 stdout）→ ctrl-c（中断执行中的命令，会话不死；force=true 用 SIGKILL）→ keys（注入按键文本应答提示，data 支持 \\n \\r \\t \\xNN）→ list（列会话：status/age_seconds/log_bytes，挂了超过 24 小时会提醒）→ kill（结束会话，进程树全清+删目录；结果带 swept/remaining/verified，不会无声误报「清干净」）。**会话是 setsid+nohup 起的远端常驻进程、不会自己退出（SSH 断开、本地关机/断网都不影响它和正在跑的命令——连回来 read wait_rc 能续拿 exit_code 与输出，cwd/变量还在）——用完必须 kill**（或 all=true 清该主机全部会话）。**本 MCP 进程正常退出时会自动清掉它自己启动过的会话**（stdio 关闭 / SIGINT / SIGTERM 都会触发；SIGKILL、断电不会，那时用 list 看 age_seconds 再 kill）；别人启动的会话不受影响。典型：start → send 'cd /opt/app' → send 'git pull' → read wait_rc=45 → send 'make -j8' → （错了）ctrl-c → send 'make -j4' → kill。",
+        "description": "常驻会话（真 PTY）：多步且带状态的远端操作——逐条喂命令、cd/export 跨命令保留、每条独立退出码、可中断执行中的命令、可应答交互提示。action 取值与用法：start（起会话，返回 pid/pty/ready）→ run（跑一条并等结果，一步一次调用；--wait-rc 超时回 status=running，--no-wait 只发送）→ read（读输出：offset 增量 / wait_rc 等这条结束拿 exit_code；载荷字段 stdout）→ ctrl-c（中断执行中的命令，会话不死；force=true 用 SIGKILL）→ keys（注入按键文本应答提示，data 支持 \\n \\r \\t \\xNN）→ list（列会话：status/age_seconds/log_bytes，挂了超过 24 小时会提醒）→ kill（结束会话，进程树全清+删目录；结果带 swept/remaining/verified，不会无声误报「清干净」）。**会话是 setsid+nohup 起的远端常驻进程、不会自己退出（SSH 断开、本地关机/断网都不影响它和正在跑的命令——连回来 read wait_rc 能续拿 exit_code 与输出，cwd/变量还在）**：① **空闲回收**——提示符空闲且 ttl（默认 600s）内没有任何交互就自动回收（进程+目录）；send/run/read/ctrl-c/keys 都算交互并续期，有命令在跑时不回收，`ttl=0` 关闭；② 也可以（或提前）用 kill 显式结束（all=true 清该主机全部；结果带 swept/remaining/verified，不会无声误报「清干净」）；③ `start attach=true` 可接上还活着的同名会话（返回 attached=true + age/idle）。**本 MCP 进程正常退出时也会自动清掉它自己启动过的会话**（stdio 关闭 / SIGINT / SIGTERM 都会触发；SIGKILL、断电不会）；别人启动的会话不受影响。典型：start → send 'cd /opt/app' → send 'git pull' → read wait_rc=45 → send 'make -j8' → （错了）ctrl-c → send 'make -j4' → kill。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -445,6 +445,8 @@ TOOLS = [
                 "no_pty": {"type": "boolean", "description": "start：强制非 PTY（无 tty，但状态与退出码照常）"},
                 "keep_ansi": {"type": "boolean", "description": "read：保留 ANSI 颜色码（默认剥离，便于解析）"},
                 "no_wait": {"type": "boolean", "description": "run：只发送不等待（等价 send，之后自己 read）"},
+                "ttl": {"type": "string", "description": "start：空闲回收秒数（默认 600=10 分钟；可写 30s/10m/2h；0 = 关闭）。规则：**提示符空闲（没有命令在跑）**且 TTL 内没有任何 pyaissh 交互（send/run/read/ctrl-c/keys）才回收（进程 + 目录）；list 不算交互"},
+                "attach": {"type": "boolean", "description": "start：同名会话还活着就接上（返回 attached=true + pid/age/idle_seconds，状态全保留），不存在（或被回收）才新建"},
                 "max_output": {"type": "integer", "description": "run/read：单次回传上限字节（默认 64KB）"},
                 "session_dir": {"type": "string", "description": "会话根目录（默认 /tmp/pyaissh-sessions）"},
                 "keep_crlf": {"type": "boolean", "description": "send：保留命令文本 CRLF（默认归一为 LF，与 exec 同规则）"},
@@ -472,6 +474,8 @@ _FLAG_MAP = {
     "cols": "--cols", "no_pty": "--no-pty", "keep_ansi": "--keep-ansi",
     "session_dir": "--session-dir", "keep_crlf": "--keep-crlf", "token": "--token",
     "no_wait": "--no-wait",
+    # v0.3.1 会话空闲回收（ttl）+ 接上旧会话（attach）
+    "ttl": "--ttl", "attach": "--attach",
 }
 _TOOL_SUB = {t["name"]: t["name"][len("pyaissh_"):] for t in TOOLS}
 

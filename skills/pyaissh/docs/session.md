@@ -97,49 +97,89 @@ pyaissh session kill  h --name work                       # 收尾（进程树�
   会话里敲过的命令**会留在远端 `out.log`**（含凭据的命令请用完 `session kill`）。
 - **状态在远端**：SSH 断开、本地关机都不影响会话；但**远端重启**会丢（和 `--detach` 作业一样）。
 
-## 会话会残留吗？（生命周期与清理，v2.3.0 加固）
+## 会话会残留吗？（生命周期与清理，v2.3.0）
 
-**结论：会话不会自己退出，用完必须 `session kill`。** 它是 `setsid nohup` 起的远端常驻进程——
-"SSH 断开照跑"正是它的设计目的，因此**没有任何 idle 超时 / TTL / 自动回收**。
+**结论：会话是远端常驻进程（`setsid nohup`，"SSH 断开照跑"正是它的设计目的），默认带 10 分钟空闲回收兜底，
+用完也可以随时 `session kill` 立刻结束。**
 
-一个 PTY 会话在远端占 **3 个进程** + 一个目录：
+一个 PTY 会话在远端占 **3 个进程**（+ 空闲回收开启时 1 个看门狗进程）+ 一个目录：
 
 | 进程 | 作用 | pid 记在 |
 |---|---|---|
 | `bash -c "exec 9<>FIFO; script …"` | starter（会话组长） | `sess.pid` |
 | `script -qfc '…' out.log` | PTY 包装 | — |
 | `bash -i` | 交互 shell（`cd`/`export` 状态在它里面） | `bash.pid` |
+| `bash watch.sh` | **空闲回收看门狗**（`--ttl 0` 时没有） | `watch.pid` |
 
 目录 `/tmp/pyaissh-sessions/<name>/`（0700）：`in`(FIFO)、`out.log`、`err.log`、`sess.pid`、
-`bash.pid`、`meta`、`last.token`。非 PTY 降级模式是 2 个进程。
-`out.log` **只追加、没有轮转**——长期挂着的会话会一直占 `/tmp` 磁盘。
+`bash.pid`、`watch.pid`、`watch.sh`、`beat`（最后交互时间）、`meta`、`last.token`。非 PTY 降级模式是 2 个进程。
+`out.log` **只追加、没有轮转**。
 
-结束会话只有三条路：
+### 空闲回收（idle TTL，默认 600 秒）
+
+"没人用的会话"不该白占远端资源——`start` 时会在会话目录里放一个**独立的看门狗进程**，
+**两个条件同时成立**才回收：
+
+1. **提示符空闲**：`pgrep -P <会话 shell>` 为空（没有前台命令在跑）⇒ **构建/安装/长任务不会被误杀**；
+2. **距上次交互超过 TTL**：`beat` 文件的 mtime 由每次 pyaissh 交互刷新。
+
+**什么算交互（会续期）**：`start`（含 `--attach`）、`send`、`run`、`read`、`ctrl-c`、`keys`；
+**`list` 不算**（看一眼不代表在用）。有命令在跑时看门狗每轮都续期，命令跑完后再从那一刻起算 TTL。
+
+- 取值：`--ttl 600`（默认）／`--ttl 30s`／`--ttl 10m`／`--ttl 2h`／`--ttl 0`（关闭回收）；
+  环境变量 `PYAISSH_SESSION_TTL` 改默认值。检查周期 15 秒 ⇒ 实际回收落在 `TTL ~ TTL+15s`。
+- 回收动作与 `kill` 同款：**自证进程树闭包**（argv 含本会话目录才认，防 pid 回收误杀）→ 先删目录 → TERM → KILL；
+  看门狗自己随后退出，**不留痕迹**（目录、日志、`out.log` 一起没）。
+- `list` 给出 `ttl_seconds`/`idle_seconds`/`expires_in_seconds`，剩余不足 2 分钟会额外提醒一次。
+- **保活**：`--ttl 0` 关闭回收（那就必须记得 `kill`），或者在 TTL 内发一条无害命令。
+  **代价**：超过 TTL 没交互 = 会话被回收，**cwd/变量一起丢**（下次 `start` 是新会话）。
+
+```bash
+python3 pyaissh.py session start root@1.2.3.4 --name work --ttl 10m   # 10 分钟空闲就自动收
+python3 pyaissh.py session list  root@1.2.3.4                         # 看 idle_seconds / expires_in_seconds
+```
+
+### 接了又断、断了又接：`--attach`
+
+```bash
+python3 pyaissh.py session start root@1.2.3.4 --name work --attach    # 活着→接上；没有/被回收→新建
+```
+
+- 活着时返回 `attached: true` + `pid`/`age_seconds`/`idle_seconds`，**状态（cwd/变量）全保留**；
+- 不存在（包括刚被空闲回收）时正常新建，返回 `attached: false`；
+- **不带 `--attach`** 时同名撞车仍报 `session_exists`（安全考虑：不会静默接上另一个 agent 的同名会话），
+  但提示已改成"**直接继续用它**：`session run/send/read --name X`，要重开先 `kill`"。
+
+### 其它结束方式
 
 1. **`session kill`**（或 `session kill --all` 清该主机全部）：按进程树闭包 TERM → 校验 → KILL，
    默认**连目录一起删**（要留日志看现场用 `--keep-dir`）。结果里 `swept`=扫到的进程数、
-   `remaining`=幸存者、`verified`=是否确认"会话进程已不在"、`cleaned`=目录是否已删。
+   `remaining`=幸存者、`roots`=自证的根数、`verified`=是否确认"会话进程已不在"、`cleaned`=目录是否已删。
 2. **会话里的 shell 自己退出**（`exit` / `Ctrl-D`，或命令把 shell 弄崩）：进程消失，
    但 **`/tmp` 下的目录与日志仍在**——下次 `session kill --name` 会把目录收掉，否则要等机器重启。
 3. **远端重启**：进程与 `/tmp` 一起清掉。
 
-**`kill` 不会误报"清干净"**（v2.3.0 加固）：清理前先看三个候选根（`sess.pid` / `bash.pid` /
+**`kill` 不会误报"清干净"**（v2.3.0 加固）：清理前先看四个候选根（`sess.pid` / `bash.pid` / `watch.pid` /
 会话 shell 的父进程 `script`），每个根都要**自证**（`ps -o args=` 里含本会话目录，防止陈旧 pid
-被无关进程复用时误杀）。为什么需要 `bash.pid`/`script` 兜底：starter 若被 OOM 或外力杀掉，
-`script` 与 `bash -i` 会被 reparent 到 1 号进程，只按 `sess.pid` 算闭包会得空集。
-三个根都不可用时，pyaissh **不猜也不杀**：返回 `roots: 0`、`verified: false` + 一条 warning
-（附 `ps -eo pid,ppid,tty,args | grep -E 'script -qfc|pyaissh-sessions'` 自查命令），
-而不是宣称已清理。看到 `verified: false` 就按 note 手工确认一次。
+被无关进程复用时误杀）。为什么需要这些兜底：starter 若被 OOM 或外力杀掉，`script` 与 `bash -i`
+会被 reparent 到 1 号进程，只按 `sess.pid` 算闭包会得空集。所有根都不可用时，pyaissh **不猜也不杀**：
+返回 `roots: 0`、`verified: false` + 一条 warning（附 `ps -eo pid,ppid,tty,args | grep -E 'script -qfc|pyaissh-sessions'`
+自查命令），而不是宣称已清理。看到 `verified: false` 就按 note 手工确认一次。
 
-**怎么发现"忘了关"的会话**：`session list` 给出 `age_seconds`/`started_at`/`log_bytes`；
-挂了超过 24 小时的会话会额外给一条 warning（提示不再需要时 kill）。
+**怎么发现"忘了关"的会话**：`session list` 给出 `age_seconds`/`started_at`/`log_bytes`/`idle_seconds`；
+挂了超过 24 小时的会话会额外给一条 warning。
 
 ```bash
-python3 pyaissh.py session list root@1.2.3.4                     # 看有几个、挂了多久、多大
-python3 pyaissh.py session kill root@1.2.3.4 --name work         # 结束（进程树 + 目录）
+python3 pyaissh.py session list root@1.2.3.4                     # 看有几个、挂了多久、多大、还剩多久
+python3 pyaissh.py session kill root@1.2.3.4 --name work         # 立刻结束（进程树 + 目录）
 python3 pyaissh.py session kill root@1.2.3.4 --name work --keep-dir   # 只杀进程、留日志
 python3 pyaissh.py session kill root@1.2.3.4 --all               # 一次清掉该主机全部会话
 ```
+
+**已知边角**：如果会话目录被**手工 `rm -rf`** 掉，它的进程就失去了 pid 记录，而 `session kill --all`
+是按目录枚举会话的 ⇒ 那些孤儿它看不见（只能 `ps -eo pid,args | grep pyaissh-sessions` 手工收，
+或用空闲回收看门狗——它见到目录消失就自己退出，不会替你杀孤儿）。正常路径（`kill`、空闲回收、
+shell 自己退出后再 `kill`）都不会走到这个状态。
 
 **本地侧永远是干净的**：每次 `pyaissh …` 都是短命客户端，不会因为远端有会话而占本地资源，
 也不会阻塞你继续用 `exec`——残留只在远端（几个进程 + `/tmp` 文件）。
@@ -150,7 +190,8 @@ python3 pyaissh.py session kill root@1.2.3.4 --all               # 一次清掉�
 `send 'cd /etc; sleep 20; echo AFTER_RECONNECT_OK; pwd'` 之后 **26 秒完全不连服务器**（等价本地关机），
 期间 `list` 仍报 `running`；连回来后 `read --wait-rc` 直接拿到 `status:done`、`exit_code:0`、
 输出里的 `AFTER_RECONNECT_OK` 与 `pwd=/etc`——**命令跑完了、退出码与输出在、`cd` 状态也在**。
-所以"本地关机"不是问题；问题是**会话不会自己收尾**，下次上机记得 `list` 看一眼、`kill`（或 `kill --all`）。
+所以"本地关机"不是问题：任务照跑，回来接着读；**唯一要记得的是它不会自己收尾**（默认 10 分钟空闲回收，
+或 `kill`/`kill --all` 立刻收）。
 
 ### 半截写入：本地在"写命令半途"断线（R2，已加固）
 

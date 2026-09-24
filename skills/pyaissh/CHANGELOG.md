@@ -671,3 +671,42 @@
     显式 `kill` 过的会话退出时不重复清（S1d）；收尾零残留目录、零 `script -qfc` 进程（S4b）。
   - 文档同步：`docs/session.md` 增「MCP 通道的例外」一节；`pyaissh-mcp/README.md` 增
     「会话归属与退出清理」一节。
+
+### 新增：会话空闲回收（idle TTL）+ `start --attach`（v2.3.0）
+
+- **用户设计（照做）**："服务器的进程 10 分钟后如果提示符空闲、没有命令在跑就回收；这 10 分钟内又发起连接
+  就接着用之前的会话；旧会话关了才创建新的。" 除 TTL 数值外全部采纳，10 分钟按用户要求作默认值；
+  另两条安全细节按讨论结论实现：**`start` 撞名仍报 `session_exists`（不静默接上别人的同名会话）**，
+  另给 `--attach` 做显式幂等；**回收不留痕**。
+- **实现（`11_cmd_session.py`）**：
+  - `start` 时在**会话目录里放一个独立看门狗进程**（`watch.sh`，pid 记 `watch.pid`，独立 `setsid` ——
+    不能挂在会话树里，否则 `start` 返回时随连接 SIGHUP 死；独立也让它清理时不会先杀掉自己）。
+  - 回收判据（**两个条件同时成立**）：① `pgrep -P <会话 shell>` 为空（提示符空闲 ⇒ 构建/安装不被误杀）；
+    ② `beat` 文件 mtime（每次 pyaissh 交互刷新）距今超过 TTL。检查周期 15 秒。
+  - `--ttl 600`（默认）／`30s`／`10m`／`2h`／`0`（关闭）；环境变量 `PYAISSH_SESSION_TTL`；
+    `list` 回 `ttl_seconds`/`idle_seconds`/`expires_in_seconds`（剩余 <2 分钟额外提醒）。
+  - 续期 = `start`（含 `--attach`）/`send`/`run`/`read`/`ctrl-c`/`keys` 各刷一次 `beat`；**`list` 不算**。
+  - 回收动作与 `kill` 同款（**自证进程树闭包** + 先删目录再 TERM→KILL），看门狗随后自退；
+    目录消失即退出，**不留常驻循环**。
+  - **`session start --attach`**：活着 → `attached: true` + `pid`/`age_seconds`/`idle_seconds`（状态保留）；
+    不存在/被回收 → 正常新建 `attached: false`。不带 `--attach` 时 `session_exists` 的提示改为
+    "**直接继续用它**（run/send/read），要重开先 kill"。
+  - `session kill` 的根候选加 `watch.pid`（否则 kill 后看门狗要多活一个周期）+ 收尾删 `watch.pid`。
+  - 会话缺失的错误提示改为"从没起过或**已被空闲回收**（默认 600s，`--ttl 0` 可关）→ `start` 重建
+    （要接上活着的旧会话加 `--attach`）"。
+- **踩到并修掉的两个真机 bug（都是新代码引入、真机套件抓到的）**：
+  1. **看门狗启动组继承了 SSH 通道的 stderr** ⇒ 通道永不 EOF ⇒ `recv_exit_status()` 干等到超时，
+     `session start` 20 秒后报 `session_failed`（消息为空）**而会话其实已经起好了**。修：用
+     `{ ...; } >/dev/null 2>&1 </dev/null &` 把整组后台任务包住（只给 `setsid` 那条加重定向不够）。
+  2. **`kill` 之后看门狗要多活一个检查周期（≤15s）** ⇒ "kill 后无残留进程"断言失败。修：`start` 记录
+     `watch.pid`，`kill` 把它作为第三个自证根一起扫。
+- **测试**：`--unit` 102 PASS（+10：TTL 解析 5 例、看门狗脚本关键片段、TTL=0 不装看门狗、meta 4 字段、
+  beat 初始化、路径表含 beat/watch、kill 根候选含 watch.pid）；真机 `--session` **52 PASS / 0 FAIL**
+  （+8：T1a~c 空闲 32s 自动回收且目录进程都没了、T2a~b 命令在跑跨过看门狗检查仍 running + 长命令跑完
+  拿到输出、T3a~c --attach 接上/提示/新建）；MCP 离线 49 PASS、MCP 真机会话 12 PASS 不受影响。
+- **离线校验（可复用）**：TTL 解析表、看门狗脚本 `bash -n`、关键片段断言、TTL=0 无看门狗、
+  判据三态（刚交互不回收 / 命令在跑续期 / beat 陈旧回收 / beat 缺失只续期）——Git Bash 无 `pgrep`，
+  本地用桩验分支逻辑，真 `pgrep -P` 行为由真机套件覆盖。
+- **文档**：`docs/session.md` 生命周期一节改写（进程清单加看门狗、空闲回收规则、`--attach`、
+  "本地关机"结论更新、保留"手工 rm -rf 目录后孤儿看不见"的已知边角）；SKILL 会话段与示例同步；
+  MCP `pyaissh_session` 描述 + README 增 TTL/attach 说明。

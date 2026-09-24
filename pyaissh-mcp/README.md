@@ -127,10 +127,12 @@ MCP 客户端 ──stdio JSON-RPC──> pyaissh_mcp.py ──进程内 main()�
 
 `pyaissh_session` 起的常驻会话是**远端进程**（`setsid+nohup`，SSH 断开、本地关机都不影响它——这正是它能在两次工具调用之间活下来的原因）。CLI 路径下没有"本地长命进程"可以依附，所以会话**不会自己退出**；MCP 路径补上了这一环：
 
+- **空闲回收（v0.3.1）**：`start` 时会在会话里放一个看门狗进程，**提示符空闲（没有命令在跑）且 `ttl`（默认 600s）内没有任何工具交互**就自动回收（进程 + 目录）。`send/run/read/ctrl-c/keys` 都算交互并续期，`list` 不算；`ttl=0` 关闭。默认值可用 `PYAISSH_SESSION_TTL` 改。
+- **`attach=true`**：同名会话还活着就接上（返回 `attached: true` + pid/age/idle，状态全保留），不存在或被回收才新建；不带 `attach` 时撞名仍报 `session_exists`（安全：不静默接上别的 agent 的同名会话）。
 - **MCP 进程退出时，自动清掉它自己 `start` 过的会话**（stdin EOF / 客户端关 stdio / `SIGINT` / `SIGTERM` 都会走到 `finally`）——本地 agent 会话结束 = 这轮工作结束，正好是清理时机。
 - **只清自己起的**：`start` 返回 `session_exists` 时不登记归属；别的 agent / 用 CLI 直接起的会话**绝不触碰**（真机用例 S2 就是这条安全断言）。
 - **显式 `kill` 会同步注销归属**，退出时不重复清理。
-- **覆盖不到**：`SIGKILL`、断电、宿主崩溃（`finally` 不执行）——那时残留靠 `session list`（`age_seconds`/`log_bytes`，挂超 24h 有提醒）与 `session kill all=true` 兜底。
+- **覆盖不到**：`SIGKILL`、断电、宿主崩溃（`finally` 不执行）——那时残留靠 `session list`（`age_seconds`/`idle_seconds`/`expires_in_seconds`，挂超 24h 有提醒）与 `session kill all=true` 兜底。
 - 预算：`PYAISSH_MCP_EXIT_CLEANUP_TIMEOUT`（默认 10s，`<=0` 关闭）；退出路径 best-effort——清理失败只写 stderr 日志，绝不拖住退出。
 
 ## 测试 / Tests

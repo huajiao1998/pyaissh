@@ -509,7 +509,9 @@ def build_parser():
 
     ssp = ss.add_parser("start", help="起会话（真 PTY；缺 script 时降级为非 PTY）",
                         description="setsid+nohup 起常驻 shell：SSH 断开不影响；"
-                                    "有 util-linux script 则分配真 PTY（可跑需要 tty 的程序）")
+                                    "有 util-linux script 则分配真 PTY（可跑需要 tty 的程序）。"
+                                    "**空闲回收**：提示符空闲（没有命令在跑）且 TTL 内没有任何 pyaissh "
+                                    "交互时，会话自动回收（进程 + 目录）——默认 600 秒，--ttl 0 关闭")
     add_conn(ssp)
     ssp.add_argument("--name", default="main", help="会话名（默认 main；字母/数字/._-）")
     ssp.add_argument("--session-dir", dest="session_dir", help="会话根目录（默认 %s）"
@@ -517,6 +519,10 @@ def build_parser():
     ssp.add_argument("--cols", type=_positive_int, default=200, help="PTY 列宽（默认 200，防折行）")
     ssp.add_argument("--no-pty", dest="no_pty", action="store_true",
                      help="强制非 PTY（无 tty，但状态与退出码照常）")
+    ssp.add_argument("--ttl", help="空闲回收秒数（默认 600=10 分钟；可写 30s/10m/2h；0 = 关闭回收）；"
+                                   "也可用环境变量 PYAISSH_SESSION_TTL")
+    ssp.add_argument("--attach", action="store_true",
+                     help="同名会话还活着就接上（返回 attached=true + pid/age），不存在才新建")
     ssp.add_argument("--wait-ready", dest="wait_ready", type=_positive_int,
                      default=SESSION_READY_WAIT, help="等会话就绪秒数（默认 %d）" % SESSION_READY_WAIT)
     ssp.set_defaults(func=cmd_session_start)

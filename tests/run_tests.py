@@ -337,9 +337,10 @@ def suite_unit_regression(s):
             and un("\\\\") == "\\" and un("plain") == "plain", repr((un("y\\n"), un("\\x03"))))
     # kill 命令（R1 加固）：两个根 + 根自证闸门 + ROOTS/HAD 回传
     _kc = m._session_kill_cmd(m._session_files("/tmp/pyaissh-sessions", "demo"))
-    s.check("kill 命令：根候选含 sess.pid / bash.pid / 会话 shell 的父进程",
-            "sess.pid" in _kc and "bash.pid" in _kc and 'ps -o ppid= -p "$B"' in _kc,
-            _kc[:160])
+    s.check("kill 命令：根候选含 sess.pid / bash.pid / watch.pid / 会话 shell 的父进程",
+            "sess.pid" in _kc and "bash.pid" in _kc and "watch.pid" in _kc
+            and 'for r in "$P" "$B" "$W"' in _kc and 'ps -o ppid= -p "$B"' in _kc,
+            _kc[:200])
     s.check("kill 命令：根自证闸门（argv 必须含本会话目录，防 pid 回收误杀）",
             'case "$A" in *"$D"*)' in _kc and 'D=' in _kc, _kc[:160])
     s.check("kill 命令：回传 ROOTS/HAD 供上层判 verified/是否告警",
@@ -349,6 +350,34 @@ def suite_unit_regression(s):
             'awk -v root="$r"' in _kc and 'awk -v root="$P"' not in _kc, _kc[:160])
     s.check("list 会话年龄常量（24h 提醒）", m._SESSION_STALE_HINT == 86400,
             repr(m._SESSION_STALE_HINT))
+    # 空闲回收（v2.3.0）：TTL 解析 + 看门狗脚本 + 会话路径/元信息
+    _p = m._session_parse_ttl
+    s.check("TTL 解析：默认 600s，支持 30s/10m/2h 与 0=关闭",
+            _p(None)[0] == 600 and _p("")[0] == 600 and _p("0")[0] == 0
+            and _p("30")[0] == 30 and _p("30s")[0] == 30 and _p("10m")[0] == 600
+            and _p("2h")[0] == 7200, repr([_p(x) for x in (None, "0", "30", "10m", "2h")]))
+    s.check("TTL 解析：非法值给可读错误",
+            _p("abc")[0] is None and "无法解析" in (_p("abc")[1] or "")
+            and _p("10x")[0] is None, repr(_p("abc")))
+    _f = m._session_files("/tmp/pyaissh-sessions", "demo")
+    s.check("会话路径表含 beat（活动时间戳）", _f["beat"].endswith("/beat"), _f["beat"])
+    _ws = m._session_watchdog_script(_f, 600)
+    s.check("看门狗：目录消失即退（不留常驻循环）", '[ -d "$D" ] || exit 0' in _ws, _ws[:120])
+    s.check("看门狗：有前台命令就续期 + beat 判闲",
+            'pgrep -P "$B"' in _ws and 'stat -c %Y "$BEAT"' in _ws and 'touch "$BEAT"' in _ws,
+            _ws[:200])
+    s.check("看门狗：自证闭包（argv 含会话目录）+ 先删目录再杀",
+            'case "$A" in *"$D"*)' in _ws and _ws.index('rm -rf "$D"') < _ws.index("kill -TERM $T"),
+            _ws[-260:])
+    s.check("看门狗：TTL/周期写进脚本且可关闭",
+            "TTL=600" in _ws and "TICK=%d" % m._SESSION_TTL_TICK in _ws
+            and "watch.sh" not in m._session_start_cmd(_f, 200, False, 0)
+            and "watch.sh" in m._session_start_cmd(_f, 200, False, 600), _ws[:80])
+    _sc6 = m._session_start_cmd(_f, 200, False, 600)
+    s.check("start 命令：meta 写 4 字段（pty/cols/起始秒/TTL）",
+            "printf '%s %s %s %s\\n' \"$PTY\" 200 \"$(date +%s)\" 600" in _sc6, _sc6[-420:-260])
+    s.check("start 命令：初始化 beat（否则首次判闲会把新会话当陈旧）",
+            "touch '/tmp/pyaissh-sessions/demo/beat'" in _sc6, _sc6[:200])
     # 哨兵包裹（真 bug 的护栏：哨兵必须与命令同一行被解析，否则被 read 吃掉）
     pl = m._session_payload_text("read -p 'x' V; echo $V", "abcd1234")
     s.check("命令与哨兵同一行（{ ...; }; echo 哨兵）",
@@ -1337,10 +1366,13 @@ def suite_live_session(s):
     #    必须 roots=0 + verified=false + warning（附 ps 自查）
     _ghost = name + "gh"
     _live_run(["session", "start", tgt, "--name", _ghost], timeout=90)
+    # 把三个自证根全部打掉（sess.pid / bash.pid / watch.pid 的进程）再删 pid 文件，
+    # 才真正构成"无根"场景——否则空闲回收看门狗本身就是一个活的自证根（v2.3.0 起）
     _live_run(["exec", tgt, "--cmd",
-               "kill -9 $(cat /tmp/pyaissh-sessions/{g}/sess.pid) "
-               "$(cat /tmp/pyaissh-sessions/{g}/bash.pid) 2>/dev/null; sleep 0.5; "
-               "rm -f /tmp/pyaissh-sessions/{g}/sess.pid /tmp/pyaissh-sessions/{g}/bash.pid".format(g=_ghost)],
+               "for k in sess bash watch; do kill -9 $(cat /tmp/pyaissh-sessions/{g}/$k.pid) "
+               "2>/dev/null; done; sleep 0.5; "
+               "rm -f /tmp/pyaissh-sessions/{g}/sess.pid /tmp/pyaissh-sessions/{g}/bash.pid "
+               "/tmp/pyaissh-sessions/{g}/watch.pid".format(g=_ghost)],
               timeout=60)
     rc, _jg, _ = _live_run(["session", "kill", tgt, "--name", _ghost], timeout=120)
     _rowg = ((_jg or {}).get("sessions") or [{}])[0]
@@ -1371,6 +1403,66 @@ def suite_live_session(s):
             bool(_jr2) and _jr2.get("exit_code") == 0 and "SECOND_OK" in _o2,
             "exit=%s 输出=%r" % ((_jr2 or {}).get("exit_code"), _o2[:120]))
     _live_run(["session", "kill", tgt, "--name", _idle], timeout=60)
+
+    # ---- T：空闲回收（v2.3.0，用户设计：提示符空闲 + TTL 内无交互 ⇒ 自动回收）----
+    # T1：--ttl 5 且完全不碰它（list 不算交互）→ 看门狗应在 ~15-30s 内回收进程与目录
+    _ttl = name + "ttl"
+    rc, _jt, _ = _live_run(["session", "start", tgt, "--name", _ttl, "--ttl", "5"], timeout=90)
+    s.check("T1a start --ttl 5 回传 ttl_seconds=5",
+            bool(_jt) and _jt.get("ok") is True and _jt.get("ttl_seconds") == 5,
+            repr(_jt)[:200])
+    time.sleep(32)
+    rc, _jl2, _ = _live_run(["session", "list", tgt], timeout=60)
+    s.check("T1b 空闲 32s 后会话已自动回收（list 里没了）",
+            bool(_jl2) and not any(x.get("session") == _ttl
+                                   for x in (_jl2.get("sessions") or [])), repr(_jl2)[:200])
+    rc, _jd, _ = _live_run(["exec", tgt, "--cmd",
+                            "ls -d /tmp/pyaissh-sessions/%s 2>/dev/null | wc -l; "
+                            "pgrep -fc '[p]yaissh-sessions/%s' || true" % (_ttl, _ttl)],
+                           timeout=60)
+    s.check("T1c 回收后目录与进程都没了",
+            bool(_jd) and ((_jd.get("stdout") or "").split() or [""])[0] == "0",
+            repr((_jd or {}).get("stdout")))
+
+    # T2：TTL 很小但**有命令在跑** → 不回收（构建/安装不会被误杀）
+    _ttlr = name + "run"
+    _live_run(["session", "start", tgt, "--name", _ttlr, "--ttl", "5"], timeout=90)
+    _live_run(["session", "send", tgt, "--name", _ttlr, "--cmd",
+               "sleep 25; echo TTLRUN_DONE"], timeout=60)
+    time.sleep(20)      # 跨过看门狗第一次检查（TICK=15s）：那会儿命令还在跑 ⇒ 必须续期
+    rc, _jlr, _ = _live_run(["session", "list", tgt], timeout=60)
+    _row = next((x for x in (_jlr or {}).get("sessions", []) if x.get("session") == _ttlr), None)
+    s.check("T2a 命令在跑时不回收（跨过看门狗检查仍 running）",
+            bool(_row) and _row.get("status") == "running", repr(_row)[:200])
+    rc, _jout, _ = _live_run(["session", "read", tgt, "--name", _ttlr, "--wait-rc", "20"],
+                             timeout=90)
+    s.check("T2b 长命令跑完能拿到输出（没被空闲回收误杀）",
+            bool(_jout) and "TTLRUN_DONE" in (_jout.get("stdout") or ""),
+            "status=%s 尾=%r" % ((_jout or {}).get("status"), ((_jout or {}).get("stdout") or "")[-40:]))
+    _live_run(["session", "kill", tgt, "--name", _ttlr], timeout=60)
+
+    # T3：--attach（活着就接上、没有才新建）+ 不带 --attach 时的提示
+    _at = name + "at"
+    rc, _ja1, _ = _live_run(["session", "start", tgt, "--name", _at, "--ttl", "60"], timeout=90)
+    rc, _ja2, _ = _live_run(["session", "start", tgt, "--name", _at, "--ttl", "60",
+                             "--attach"], timeout=90)
+    s.check("T3a --attach 接上旧会话（attached=true 且 pid 不变）",
+            bool(_ja2) and _ja2.get("ok") is True and _ja2.get("attached") is True
+            and _ja2.get("pid") == (_ja1 or {}).get("pid"),
+            "attached=%s pid=%s/%s" % ((_ja2 or {}).get("attached"), (_ja2 or {}).get("pid"),
+                                       (_ja1 or {}).get("pid")))
+    rc, _je, _e = _live_run(["session", "start", tgt, "--name", _at, "--ttl", "60"], timeout=90)
+    s.check("T3b 不带 --attach 撞名仍报 session_exists，但提示改为「直接继续用它」",
+            bool(_je) and _je.get("error") == "session_exists"
+            and "直接继续用它" in (_je.get("message") or ""),
+            repr(_je)[:220])
+    _live_run(["session", "kill", tgt, "--name", _at], timeout=60)
+    rc, _ja3, _ = _live_run(["session", "start", tgt, "--name", _at, "--ttl", "60",
+                             "--attach"], timeout=90)
+    s.check("T3c --attach 在会话不存在时新建（attached=false）",
+            bool(_ja3) and _ja3.get("ok") is True and _ja3.get("attached") is False
+            and isinstance(_ja3.get("pid"), int), repr(_ja3)[:200])
+    _live_run(["session", "kill", tgt, "--name", _at], timeout=60)
 
     # ---- 真机复现的 5 个 bug 的回归护栏（v2.3.0；外部评审报的，逐个先复现再修）----
     # B3：read --lines N 曾被完全忽略（20000 行日志 --lines 5 回传上万行）

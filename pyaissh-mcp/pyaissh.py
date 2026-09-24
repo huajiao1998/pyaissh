@@ -5294,13 +5294,42 @@ _SESSION_MARK_RE = re.compile(r"__PYAISSH_SESS__([A-Z_]+)=(\S*)")
 # list 里对"挂了超过这个时长还活着"的会话给一条提醒（用久了忘 kill 的护栏）
 _SESSION_STALE_HINT = 86400
 
+# 空闲回收（v2.3.0 空闲 TTL，用户设计）：会话是远端常驻进程，**不会自己退出**；
+# 但"没人用的会话"不该白占远端资源。规则（两个条件同时成立才回收）：
+#   ① 提示符空闲——没有前台子进程在跑（`pgrep -P <会话 shell>` 为空），所以构建/安装不会被误杀；
+#   ② 距上次 pyaissh 交互（beat 文件 mtime）超过 TTL。
+# 交互即续期：send/run/read/ctrl-c/keys/start(attach) 都刷新 beat；`list` 不算（看一眼≠在用）。
+# `--ttl 0` 关闭回收；环境变量 PYAISSH_SESSION_TTL 改默认值；看门狗每 _SESSION_TTL_TICK 秒查一次，
+# 所以实际回收时间在 TTL..TTL+TICK 之间。
+_SESSION_TTL_DEFAULT = 600
+_SESSION_TTL_TICK = 15
+
 
 def _session_files(root, name):
     """会话远端路径表（与作业同款：一个会话一个 0700 目录）。"""
     d = "%s/%s" % (root.rstrip("/"), name)
     return {"dir": d, "fifo": d + "/in", "log": d + "/out.log", "err": d + "/err.log",
             "pid": d + "/sess.pid", "meta": d + "/meta", "bash": d + "/bash.pid",
-            "token": d + "/last.token", "name": name, "root": root.rstrip("/")}
+            "token": d + "/last.token", "beat": d + "/beat", "watch": d + "/watch.pid",
+            "name": name, "root": root.rstrip("/")}
+
+
+def _session_parse_ttl(raw, default=None):
+    """`--ttl` / `PYAISSH_SESSION_TTL` 解析：纯数字=秒，或带后缀 `30s`/`10m`/`2h`；0=关闭。
+
+    返回 (秒数|None, 错误消息|None)。None 表示用默认值（调用方决定）。
+    """
+    base = _SESSION_TTL_DEFAULT if default is None else default
+    if raw is None or str(raw).strip() == "":
+        return base, None
+    s = str(raw).strip().lower()
+    mult = 1
+    if s and s[-1] in ("s", "m", "h"):
+        mult = {"s": 1, "m": 60, "h": 3600}[s[-1]]
+        s = s[:-1]
+    if not s.isdigit():
+        return None, "无法解析的 TTL %r（用秒数或 30s/10m/2h 形式；0 = 关闭空闲回收）" % (raw,)
+    return int(s) * mult, None
 
 
 def _session_check_name(use_json, name):
@@ -5361,13 +5390,99 @@ def _session_run(client, cmd, stdin_data=None, timeout=30):
     return rc, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
 
 
-def _session_start_cmd(f, cols, no_pty=False):
+def _session_watchdog_script(f, ttl):
+    """空闲回收看门狗脚本（v2.3.0 空闲 TTL）：以独立 setsid 进程跑，两个条件同时成立才回收。
+
+      ① 提示符空闲：`pgrep -P <会话 shell>` 为空（没有前台命令在跑）——构建/安装不会被误杀；
+      ② 距上次 pyaissh 交互超过 TTL：beat 文件的 mtime 由每次交互刷新（`_session_touch`）。
+    为什么独立进程而不是会话树内的一员：
+      - 会话是 `setsid nohup` 起的，看门狗也必须脱离发起它的那次 SSH 连接（否则 start 一返回
+        就随连接收到 SIGHUP 而死）；
+      - 独立进程不在会话树闭包内 ⇒ 它做清理时不会把自己先杀掉（能走完 TERM→KILL→校验）。
+    回收动作与 `kill` 同款：**自证**闭包（argv 含本会话目录才认，防 pid 回收误杀）→ 先删目录
+    （即使自己被信号打断也不留残留目录）→ TERM → 宽限 → KILL。
+    退出条件：会话目录消失（已被 kill/回收）就退，**不留常驻循环**。
+    beat 缺失时只续期不回收（宁可多留也不误杀）。
+    """
+    q = _sh_quote
+    return (
+        "#!/bin/bash\n"
+        "# pyaissh 空闲回收看门狗（自动生成；TTL=%d 秒，每 %d 秒检查一次）\n"
+        "D=%s; BEAT=%s; BPID=%s; SPID=%s; TTL=%d; TICK=%d\n"
+        "while :; do\n"
+        "  sleep \"$TICK\"\n"
+        "  [ -d \"$D\" ] || exit 0\n"
+        "  B=$(cat \"$BPID\" 2>/dev/null)\n"
+        "  if [ -n \"$B\" ] && [ -n \"$(pgrep -P \"$B\" 2>/dev/null)\" ]; then touch \"$BEAT\"; continue; fi\n"
+        "  NOW=$(date +%%s); LAST=$(stat -c %%Y \"$BEAT\" 2>/dev/null)\n"
+        "  [ -n \"$LAST\" ] || { touch \"$BEAT\"; continue; }\n"
+        "  [ $((NOW - LAST)) -gt \"$TTL\" ] || continue\n"
+        "  P=$(cat \"$SPID\" 2>/dev/null); T=\"\"; SEEN=\"\"; ROOTS=0; SNAP=$(ps -eo pid=,ppid=)\n"
+        "  for r in \"$P\" \"$B\" \"$(ps -o ppid= -p \"$B\" 2>/dev/null | tr -d ' ')\"; do\n"
+        "    [ -n \"$r\" ] || continue\n"
+        "    [ \"$r\" = 1 ] && continue\n"
+        "    case \" $SEEN \" in *\" $r \"*) continue ;; esac\n"
+        "    kill -0 \"$r\" 2>/dev/null || continue\n"
+        "    A=$(ps -o args= -p \"$r\" 2>/dev/null)\n"
+        "    case \"$A\" in *\"$D\"*) ;; *) continue ;; esac\n"
+        "    SEEN=\"$SEEN $r\"; ROOTS=$((ROOTS+1))\n"
+        "    T=\"$T $(echo \"$SNAP\" | %s)\"\n"
+        "  done\n"
+        "  [ \"$ROOTS\" -gt 0 ] || exit 0\n"
+        "  T=$(echo $T | tr ' ' '\\n' | sort -u -n | tr '\\n' ' ')\n"
+        "  rm -rf \"$D\"\n"
+        "  kill -TERM $T 2>/dev/null; sleep 0.5\n"
+        "  K=\"\"; for p in $T; do kill -0 \"$p\" 2>/dev/null && K=\"$K $p\"; done\n"
+        "  [ -n \"$K\" ] && kill -KILL $K 2>/dev/null\n"
+        "  exit 0\n"
+        "done\n"
+        % (int(ttl), _SESSION_TTL_TICK, q(f["dir"]), q(f["beat"]), q(f["bash"]), q(f["pid"]),
+           int(ttl), _SESSION_TTL_TICK, _SESSION_TREE_AWK % "$r"))
+
+
+def _session_watchdog_launch_cmd(f, ttl):
+    """把看门狗脚本落成文件并以 setsid 独立进程启动（base64 传输，绕开所有引号问题）。
+
+    TTL<=0 时返回空串（不装看门狗）。脚本落在会话目录内，随目录一起被清掉。
+
+    **整组后台任务必须自己重定向三个流**（实测教训：只给 `setsid` 那条加 `>/dev/null`、
+    却让同组的 `printf | base64 -d > watch.sh` / `chmod` 继承 SSH 通道的 stderr ⇒
+    通道永不 EOF ⇒ paramiko 的 `recv_exit_status()` 一直等，`session start` 20 秒超时
+    报 `session_failed`（消息为空），而会话其实已经起好了）。所以用 `{ ...; } >/dev/null
+    2>&1 </dev/null &` 把整组包住。
+    """
+    if not ttl or ttl <= 0:
+        return ""
+    q = _sh_quote
+    b64 = base64.b64encode(_session_watchdog_script(f, ttl).encode("utf-8")).decode("ascii")
+    w = f["dir"] + "/watch.sh"
+    return ("{ printf %%s '%s' | base64 -d > %s && chmod 700 %s && "
+            "setsid nohup bash %s >/dev/null 2>&1 </dev/null & echo $! > %s; } "
+            ">/dev/null 2>&1 </dev/null & "
+            % (b64, q(w), q(w), q(w), q(f["watch"])))
+
+
+def _session_touch(client, f):
+    """刷新会话的"最后交互时间"（beat mtime）——空闲回收据此判断"没人用了"。
+
+    失败不致命（旧会话没有 beat 文件、或远端 stat/touch 异常）：只记一条 WARN 到 stderr，
+    绝不让它影响正常调用。`list` 不算交互（看一眼不代表在用），故不调用本函数。
+    """
+    rc, out, err = _session_run(client, "touch %s 2>/dev/null || true" % _sh_quote(f["beat"]),
+                                timeout=10)
+    if rc != 0 and err.strip():
+        log("[WARN] 刷新会话活动时间失败（不影响本次调用）：%s" % err.strip()[:160])
+    return rc == 0
+
+
+def _session_start_cmd(f, cols, no_pty=False, ttl=0):
     """启动常驻会话的远端脚本（成功时输出 __PYAISSH_SESS__PID__<pid>__PTY__<0|1>）。
 
     - setsid + nohup：脱离本连接，SSH 断开不影响
     - `exec 9<>FIFO`：以**读写**方式持有 FIFO（否则写端每次关闭都会让读循环 EOF 退出）
     - script -qfc：给会话真 PTY（stty -echo 关输入回显、固定列宽；exec bash -i 交互壳）
     - 无 script 时降级为非 PTY 常驻 bash（状态与退出码都在，但没有 tty）
+    - ttl > 0：另起一个空闲回收看门狗（见 `_session_watchdog_script`），meta 第四字段记 TTL
     """
     q = _sh_quote
     pty_pref = "0" if no_pty else "1"
@@ -5390,8 +5505,11 @@ def _session_start_cmd(f, cols, no_pty=False):
         # read/run 永远 running+空输出——实测 --no-pty 完全不可用）
         "else setsid nohup bash -c '%s' >>%s 2>&1 </dev/null & fi; " % (plain, q(f["log"])) +
         "echo $! > %s; sleep 0.4; " % q(f["pid"]) +
-        "printf '%%s %%s %%s\\n' \"$PTY\" %d \"$(date +%%s)\" > %s; " % (cols, q(f["meta"])) +
+        "touch %s; chmod 600 %s 2>/dev/null; " % (q(f["beat"]), q(f["beat"])) +
+        "printf '%%s %%s %%s %%s\\n' \"$PTY\" %d \"$(date +%%s)\" %d > %s; " % (cols, int(ttl or 0),
+                                                                               q(f["meta"])) +
         "chmod 600 %s 2>/dev/null; " % q(f["meta"]) +
+        _session_watchdog_launch_cmd(f, ttl) +
         "if kill -0 \"$(cat %s)\" 2>/dev/null; then "
         "echo \"__PYAISSH_SESS__PID=$(cat %s)\"; echo \"__PYAISSH_SESS__PTY=$PTY\"; "
         "else echo __PYAISSH_SESS__DEAD=1; exit 1; fi"
@@ -5483,9 +5601,9 @@ def _session_kill_cmd(f, keep_dir=False):
     q = _sh_quote
     rm = "" if keep_dir else "rm -rf %s" % q(f["dir"])
     return ("D=%s; HAD=0; [ -d \"$D\" ] && HAD=1; "
-            "P=$(cat %s 2>/dev/null); B=$(cat %s 2>/dev/null); "
+            "P=$(cat %s 2>/dev/null); B=$(cat %s 2>/dev/null); W=$(cat %s 2>/dev/null); "
             "T=\"\"; SEEN=\"\"; ROOTS=0; SWEPT=0; LEFT=0; SNAP=$(ps -eo pid=,ppid=); "
-            "for r in \"$P\" \"$B\" \"$(ps -o ppid= -p \"$B\" 2>/dev/null | tr -d ' ')\"; do "
+            "for r in \"$P\" \"$B\" \"$W\" \"$(ps -o ppid= -p \"$B\" 2>/dev/null | tr -d ' ')\"; do "
             "[ -n \"$r\" ] || continue; [ \"$r\" = 1 ] && continue; "
             "case \" $SEEN \" in *\" $r \"*) continue ;; esac; "
             "kill -0 \"$r\" 2>/dev/null || continue; "
@@ -5503,9 +5621,9 @@ def _session_kill_cmd(f, keep_dir=False):
             "fi; "
             "echo \"__PYAISSH_SESS__SWEPT=$SWEPT\"; echo \"__PYAISSH_SESS__LEFT=$LEFT\"; "
             "echo \"__PYAISSH_SESS__ROOTS=$ROOTS\"; echo \"__PYAISSH_SESS__HAD=$HAD\"; "
-            "rm -f %s %s; %s; echo __PYAISSH_SESS__CLEANED=1"
-            % (q(f["dir"]), q(f["pid"]), q(f["bash"]), _SESSION_TREE_AWK % "$r",
-               q(f["pid"]), q(f["bash"]), rm))
+            "rm -f %s %s %s; %s; echo __PYAISSH_SESS__CLEANED=1"
+            % (q(f["dir"]), q(f["pid"]), q(f["bash"]), q(f["watch"]), _SESSION_TREE_AWK % "$r",
+               q(f["pid"]), q(f["bash"]), q(f["watch"]), rm))
 
 
 def _session_clean_text(s, strip_ansi=True):
@@ -5658,28 +5776,132 @@ def _session_poll_sentinel(sftp, path, offset, token, timeout, interval=0.25):
 
 # ---------------------------------------------------------------- 子命令
 
+def _fmt_age(sec):
+    """秒 → 人类可读（消息里用）。"""
+    if sec is None:
+        return "未知时长"
+    sec = int(sec)
+    if sec < 60:
+        return "%d 秒" % sec
+    if sec < 3600:
+        return "%d 分钟" % (sec // 60)
+    return "%.1f 小时" % (sec / 3600.0)
+
+
+def _session_info(client, f, sftp=None):
+    """读会话元信息：pid / pty / cols / started_at / age_seconds / ttl_seconds /
+    idle_seconds（距上次交互）/ log_bytes / mtime —— `list` 与 `start --attach` 共用。
+
+    缺什么就少什么字段，**绝不抛**（会话可能正好被回收/删除）。`alive`/`status` 由调用方补
+    （list 用一次批量探测，attach 分支已由 EXISTS 证明存活）。
+    """
+    info = {}
+    own = sftp is None
+    if own:
+        try:
+            sftp = open_sftp(client)
+        except Exception:
+            return info
+    try:
+        try:
+            with sftp.open(f["pid"], "r") as fh:
+                t = fh.read().decode("utf-8", "replace").strip()
+            info["pid"] = int(t) if t.isdigit() else t
+        except Exception:
+            pass
+        try:
+            with sftp.open(f["meta"], "r") as fh:
+                parts = fh.read().decode("utf-8", "replace").split()
+            if parts:
+                info["pty"] = parts[0] == "1"
+                if len(parts) > 1 and parts[1].isdigit():
+                    info["cols"] = int(parts[1])
+                if len(parts) > 2 and parts[2].isdigit():
+                    # meta 第三字段 = start 时的 epoch 秒（此前只用于 age，现在也报 TTL）
+                    info["started_at"] = int(parts[2])
+                    info["age_seconds"] = max(0, int(time.time()) - int(parts[2]))
+                if len(parts) > 3 and parts[3].isdigit():
+                    v = int(parts[3])
+                    info["ttl_seconds"] = v if v > 0 else None
+        except Exception:
+            pass
+        try:
+            st = sftp.stat(f["beat"])
+            info["idle_seconds"] = max(0, int(time.time()) - int(st.st_mtime or 0))
+        except Exception:
+            pass
+        try:
+            st = sftp.stat(f["log"])
+            info["log_bytes"] = st.st_size
+            info["mtime"] = int(st.st_mtime or 0)
+        except Exception:
+            pass
+    finally:
+        if own:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+    return info
+
+
 def cmd_session_start(args):
-    """起一个常驻会话（真 PTY）：setsid + script + FIFO。"""
+    """起一个常驻会话（真 PTY）：setsid + script + FIFO（v2.3.0 起带空闲回收 TTL）。
+
+    `--attach`：同名会话还活着就**接上**（不新建），返回 attached=true + pid/age；
+    会话不存在（或被空闲回收）则正常新建并返回 attached=false。
+    """
     start = time.time()
     root = getattr(args, "session_dir", None) or DEFAULT_SESSION_DIR
     name = args.name or "main"
     if not _session_check_name(args.json, name):
+        return 2
+    ttl, terr = _session_parse_ttl(getattr(args, "ttl", None),
+                                   _session_parse_ttl(os.environ.get("PYAISSH_SESSION_TTL"))[0])
+    if terr is not None:
+        emit_error(args.json, "bad_args", terr)
         return 2
     f = _session_files(root, name)
     conn, client, conn_ec = _connect_exec(args)
     if conn_ec is not None:
         return conn_ec
     try:
-        rc, out, err = _session_run(client, _session_start_cmd(f, args.cols, args.no_pty),
+        rc, out, err = _session_run(client, _session_start_cmd(f, args.cols, args.no_pty, ttl),
                                     timeout=max(20, args.timeout + 10))
         marks = _SESSION_MARK_RE.findall(out)
         kinds = [k for k, _ in marks]
         if "EXISTS" in kinds:
+            ex_pid = dict((k, v) for k, v in marks).get("EXISTS")
+            if args.attach:
+                # 接上旧会话：刷新活动时间（别让它刚接上就被空闲回收）
+                _session_touch(client, f)
+                extra = _session_info(client, f)
+                result = {
+                    "ok": True, "action": "session", "version": VERSION, "session": name,
+                    "attached": True, "dir": f["dir"], "fifo": f["fifo"], "log": f["log"],
+                    "pid": int(ex_pid) if str(ex_pid).isdigit() else ex_pid,
+                    "ready": True, "ttl_seconds": extra.get("ttl_seconds"),
+                    "age_seconds": extra.get("age_seconds"),
+                    "idle_seconds": extra.get("idle_seconds"),
+                    "host": conn["host"], "user": conn["user"], "port": conn["port"],
+                    "warnings": [],
+                    "next_action": ("已接上仍在运行的会话 %r（状态——cwd/变量——都保留）："
+                                    "直接 session run/send/read 继续；要重开先 session kill"
+                                    % name),
+                    "duration_ms": int((time.time() - start) * 1000),
+                }
+                _emit_result(args, result, header="[SESSION %s 接上 pid=%s] %s"
+                             % (name, ex_pid, f["dir"]))
+                return 0
             emit_error(args.json, "session_exists",
-                       "会话 %r 已在运行（pid %s）：换 --name，或先 pyaissh session kill"
-                       % (name, dict((k, v) for k, v in marks).get("EXISTS", "?")),
-                       extra={"session": name, "dir": f["dir"],
-                              "pid": dict((k, v) for k, v in marks).get("EXISTS")})
+                       "会话 %r 仍在运行（pid %s，已挂 %s）：**直接继续用它**——"
+                       "pyaissh session run/send/read --name %s（状态/cwd/变量都还在）；"
+                       "确实要重开：先 pyaissh session kill --name %s，"
+                       "或改用 pyaissh session start --attach 自动接上"
+                       % (name, ex_pid, _fmt_age(_session_info(client, f).get("age_seconds")),
+                          name, name),
+                       extra={"session": name, "dir": f["dir"], "pid": ex_pid,
+                              "attach_hint": "session start --attach 可自动接上"})
             return 2
         for bad, why in (("MKDIR_FAIL", "无法创建会话目录（权限/磁盘）"),
                          ("FIFO_FAIL", "无法创建 FIFO"), ("DEAD", "会话进程启动后立即退出")):
@@ -5714,9 +5936,12 @@ def cmd_session_start(args):
                     pass
         result = {
             "ok": True, "action": "session", "version": VERSION, "session": name,
+            "attached": False,
             "dir": f["dir"], "fifo": f["fifo"], "log": f["log"],
             "pid": int(pid) if str(pid).isdigit() else pid,
             "pty": pty, "cols": args.cols, "ready": ready, "ready_wait_ms": int(wait_s * 1000),
+            "ttl_seconds": ttl if ttl and ttl > 0 else None,
+            "idle_seconds": 0,
             "host": conn["host"], "user": conn["user"], "port": conn["port"],
             "permissions": {"dir": "0700", "fifo": "0600", "out.log": "0600", "meta": "0600"},
             "warnings": [],
@@ -5725,6 +5950,12 @@ def cmd_session_start(args):
                             "收尾：session kill" % name),
             "duration_ms": int((time.time() - start) * 1000),
         }
+        if ttl and ttl > 0:
+            result["next_action"] += ("。**空闲回收**：提示符空闲且 %s 内没有任何 pyaissh 交互"
+                                      "（send/run/read/ctrl-c/keys）就会自动回收（进程 + 目录），"
+                                      "需要保活就 --ttl 0" % _fmt_age(ttl))
+        else:
+            result["warnings"].append("空闲回收已关闭（--ttl 0）：会话会一直留着，用完记得 session kill")
         if not pty:
             result["warnings"].append(
                 "远端没有 util-linux `script`（或指定了 --no-pty）：本次为**非 PTY** 会话——"
@@ -5823,9 +6054,13 @@ def _session_load(args, root, name, need_alive=True):
     marks = dict(_SESSION_MARK_RE.findall(out))
     if "MISSING" in marks:
         emit_error(args.json, "session_not_found",
-                   "找不到会话 %r（%s 不存在）：先用 pyaissh session start 起会话，"
-                   "或用 pyaissh session list 看现有会话" % (name, f["pid"]),
-                   extra={"session": name, "dir": f["dir"]})
+                   "找不到会话 %r（%s 不存在）：可能从没起过，或**已被空闲回收**"
+                   "（默认提示符空闲 %s 就自动收，`--ttl 0` 可关）——"
+                   "用 pyaissh session start --name %s 重建（要接上还活着的旧会话用 --attach），"
+                   "或先用 pyaissh session list 看现有会话"
+                   % (name, f["pid"], _fmt_age(_SESSION_TTL_DEFAULT), name),
+                   extra={"session": name, "dir": f["dir"],
+                          "ttl_default_seconds": _SESSION_TTL_DEFAULT})
         close_all(client)
         return None, None, None, None, False, 2
     alive = "ALIVE" in marks
@@ -5838,6 +6073,7 @@ def _session_load(args, root, name, need_alive=True):
                           "dir": f["dir"]})
         close_all(client)
         return None, None, None, None, False, 2
+    _session_touch(client, f)      # 交互即续期：别让正在用的会话被空闲回收
     return conn, client, f, pid, alive, None
 
 
@@ -6298,41 +6534,18 @@ def cmd_session_list(args):
                 if not _SESSION_NAME_RE.match(name):
                     continue
                 f = _session_files(root, name)
-                pid, pty, cols, started = None, None, None, None
-                try:
-                    with sftp.open(f["pid"], "r") as fh:
-                        t = fh.read().decode("utf-8", "replace").strip()
-                    pid = int(t) if t.isdigit() else t
-                except Exception:
-                    pass
-                try:
-                    with sftp.open(f["meta"], "r") as fh:
-                        parts = fh.read().decode("utf-8", "replace").split()
-                    if parts:
-                        pty = parts[0] == "1"
-                        cols = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
-                        # meta 第三个字段是 start 时写的 epoch 秒——用来算"这会话挂了多久"
-                        # （AI 用完忘了 kill 的会话，此前在 list 里看不出年龄）
-                        started = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
-                except Exception:
-                    pass
-                log_bytes, mtime = None, None
-                try:
-                    st = sftp.stat(f["log"])
-                    log_bytes, mtime = st.st_size, int(st.st_mtime or 0)
-                except Exception:
-                    pass
-                sessions.append({"session": name, "pid": pid, "pty": pty, "cols": cols,
-                                 "started_at": started,
-                                 "age_seconds": (int(time.time()) - started) if started else None,
-                                 "log": f["log"], "log_bytes": log_bytes,
-                                 "mtime": mtime, "dir": f["dir"]})
-                if isinstance(pid, int):
-                    pids.append(pid)
+                s = _session_info(client, f, sftp=sftp)
+                s.update({"session": name, "log": f["log"], "dir": f["dir"]})
+                sessions.append(s)
+                if isinstance(s.get("pid"), int):
+                    pids.append(s["pid"])
             alive = _alive_map(client, pids) if pids else {}
             for s in sessions:
                 s["alive"] = alive.get(s["pid"]) if isinstance(s["pid"], int) else None
                 s["status"] = ("running" if s["alive"] else "dead") if s["pid"] else "unknown"
+                # 空闲回收进度（AI 据此判断"还能放多久"）：ttl - idle 就是剩余保活时间
+                if s.get("ttl_seconds") and s.get("idle_seconds") is not None:
+                    s["expires_in_seconds"] = max(0, s["ttl_seconds"] - s["idle_seconds"])
             result = {"ok": True, "action": "session", "version": VERSION,
                       "session_dir": root, "sessions": sessions, "count": len(sessions),
                       "host": conn["host"], "user": conn["user"], "port": conn["port"],
@@ -6343,12 +6556,20 @@ def cmd_session_list(args):
                 stale = [s for s in sessions
                          if s.get("alive") and (s.get("age_seconds") or 0) >= _SESSION_STALE_HINT]
                 if stale:
-                    # "用了忘了关"的护栏：会话不自退、out.log 只增不减，挂久了白占远端资源
+                    # "用了忘了关"的护栏：out.log 只增不减，挂久了白占远端资源
                     result["warnings"].append(
-                        "会话 %s 已常驻超过 %d 小时（会话不会自己退出；out.log 只增不减）——"
+                        "会话 %s 已常驻超过 %d 小时（out.log 只增不减）——"
                         "不再需要时请 session kill"
                         % (",".join("%s(%.1fh)" % (s["session"], s["age_seconds"] / 3600.0)
                                     for s in stale), _SESSION_STALE_HINT // 3600))
+                near = [s for s in sessions if s.get("status") == "running"
+                        and s.get("expires_in_seconds") is not None
+                        and s["expires_in_seconds"] <= 120]
+                if near:
+                    result["warnings"].append(
+                        "会话 %s 即将因空闲被回收（剩余 %s；想留住就发一条命令或 --ttl 0 重开）"
+                        % (",".join("%s(%s)" % (s["session"], _fmt_age(s["expires_in_seconds"]))
+                                    for s in near), _fmt_age(near[0]["expires_in_seconds"])))
             else:
                 result["next_action"] = "还没有会话：session start <target> [--name main]"
         finally:
@@ -6974,7 +7195,9 @@ def build_parser():
 
     ssp = ss.add_parser("start", help="起会话（真 PTY；缺 script 时降级为非 PTY）",
                         description="setsid+nohup 起常驻 shell：SSH 断开不影响；"
-                                    "有 util-linux script 则分配真 PTY（可跑需要 tty 的程序）")
+                                    "有 util-linux script 则分配真 PTY（可跑需要 tty 的程序）。"
+                                    "**空闲回收**：提示符空闲（没有命令在跑）且 TTL 内没有任何 pyaissh "
+                                    "交互时，会话自动回收（进程 + 目录）——默认 600 秒，--ttl 0 关闭")
     add_conn(ssp)
     ssp.add_argument("--name", default="main", help="会话名（默认 main；字母/数字/._-）")
     ssp.add_argument("--session-dir", dest="session_dir", help="会话根目录（默认 %s）"
@@ -6982,6 +7205,10 @@ def build_parser():
     ssp.add_argument("--cols", type=_positive_int, default=200, help="PTY 列宽（默认 200，防折行）")
     ssp.add_argument("--no-pty", dest="no_pty", action="store_true",
                      help="强制非 PTY（无 tty，但状态与退出码照常）")
+    ssp.add_argument("--ttl", help="空闲回收秒数（默认 600=10 分钟；可写 30s/10m/2h；0 = 关闭回收）；"
+                                   "也可用环境变量 PYAISSH_SESSION_TTL")
+    ssp.add_argument("--attach", action="store_true",
+                     help="同名会话还活着就接上（返回 attached=true + pid/age），不存在才新建")
     ssp.add_argument("--wait-ready", dest="wait_ready", type=_positive_int,
                      default=SESSION_READY_WAIT, help="等会话就绪秒数（默认 %d）" % SESSION_READY_WAIT)
     ssp.set_defaults(func=cmd_session_start)

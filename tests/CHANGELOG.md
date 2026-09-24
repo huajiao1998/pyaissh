@@ -334,3 +334,27 @@
   "本地关机后服务器会不会留进程"的确切答案：**会留，而且任务会继续跑**
 - 夹具坑：`pgrep -f pyaissh-sessions` 会匹配到**执行该命令的 shell 自己**（命令行里含这个字符串），
   判"零残留"要么用 `[p]yaissh-sessions` 括号转义，要么用 `ps | grep` —— 第一版探针因此误报 procs=1
+
+## [2026-09-24] v2.3.0 补七：会话空闲回收（idle TTL）与 --attach
+
+### 新增用例
+- unit_regression 92 → 102：TTL 解析（默认/空/0/30/30s/10m/2h + 非法值报错）、看门狗脚本关键片段
+  （目录消失即退 / 命令在跑续期 / beat 判闲 / 自证闭包 / 先删目录再 TERM）、TTL=0 不装看门狗、
+  `start` 命令 meta 写 4 字段 + 初始化 beat、路径表含 beat/watch、kill 根候选含 `watch.pid`
+- live_session 44 → 52：
+  - T1 空闲回收：`start --ttl 5` → 32s 不交互 → `list` 里没了 + 目录与进程都没了
+  - T2 命令在跑不回收：`--ttl 5` + `send 'sleep 25; echo TTLRUN_DONE'` → 跨过看门狗第一次检查
+    （15s）仍 `running`（说明被续期）→ 命令跑完拿到输出
+  - T3 `--attach`：接上旧会话（attached=true 且 pid 不变）/ 不带 --attach 撞名报 `session_exists`
+    且提示"直接继续用它" / 会话不存在时 `--attach` 新建（attached=false）
+- 既有 R1「无根时不误报」用例加固：现在必须把 `watch.pid` 的进程也杀掉才算"无根"
+  （否则看门狗本身就是活的自证根）——这条变更本身证明加固生效
+### 说明
+- 真机抓到的两个新代码 bug：① 看门狗启动组继承 SSH 通道 stderr ⇒ 通道不 EOF ⇒ `start` 20s 超时
+  误报 `session_failed`（会话其实起好了）；② `kill` 后看门狗多活 ≤15s ⇒ 残留断言失败。
+  两者都已在代码里修（整组重定向 / `watch.pid` 作为第三个根）
+- 夹具坑（复用价值）：Git Bash(MSYS) **没有 `pgrep`**，本地只能桩掉它验分支逻辑；
+  `bash -c 'sleep 60'` 会被 bash 优化成 exec（没有子进程），模拟"会话 shell 有前台命令"必须写
+  `bash -c 'sleep 60; :'`
+- 另一个真实边角（本次实验中亲手制造并记录）：手工 `rm -rf` 会话目录后，进程失去 pid 记录，
+  `session kill --all` 按目录枚举 ⇒ 看不见这些孤儿（文档已写明，正常路径不会进入该状态）
