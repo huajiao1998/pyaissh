@@ -21,7 +21,7 @@
 > 看门狗）换成 **tmux**，下面所有字段与 v2.3 契约基线**逐键相同**；仅按白名单**新增** `orphans` /
 > `orphans_total` / `orphan_remaining_total`（`kill` 结果**恒返回且恒空**，AI 侧零感知）。
 > **与 v2.3 的行为差异只有 SPEC §7.1 的 C1~C8（既知变化，不是缺陷，解析代码无需改）**：
-> ① `--no-pty` 变 no-op（结果恒 `pty: true`）；② 会话内 `TERM` = `tmux-256color`（tmux 强制决定）；
+> ① `--no-pty` 参数已删除（结果恒 `pty: true`）；② 会话内 `TERM` = `tmux-256color`（tmux 强制决定）；
 > ③ 新增的 `orphans*` 三字段恒空；④ 空闲回收从"服务器端准点"变为"**惰性扫 + 每主机一个 reaper**
 > （默认 300 秒一轮）"（`ttl_seconds`/`idle_seconds`/`expires_in_seconds` 字段与口径不变）；
 > ⑤ 会话目录少了 `in`/`sess.pid`/`bash.pid`/`watch.*`、多了 `tmux`；⑥ 依赖远端 tmux ≥ 3.0
@@ -29,7 +29,7 @@
 > 前台进程组（`ps -o tpgid=`）；⑧ 多一个"服务器级"对象 tmux server（闲置时随最后一个会话退出，
 > `list` 不受影响）。详见 `docs/session.md` 与 `docs/errors.md`。
 
-- **`session start`**：`session`（名字）、`dir`/`log`、`pid`（= tmux pane 的 `#{pane_pid}`，即会话 shell；`list` 里同一个值也放在 `shell_pid`）、`pty`（**恒 `true`**——tmux 永远提供 PTY）、`cols`、`ready`（就绪确认：初始化命令的哨兵是否按时出现）、`permissions`；**`fifo` 字段保留但恒为 `null`**（旧引擎的 FIFO 已不存在，留着只为键集不变）；**`--no-pty` 已废弃**：no-op + 一条 warning，结果仍是 `pty: true`（C1）
+- **`session start`**：`session`（名字）、`dir`/`log`、`pid`（= tmux pane 的 `#{pane_pid}`，即会话 shell；`list` 里同一个值也放在 `shell_pid`）、`pty`（**恒 `true`**——tmux 永远提供 PTY）、`cols`、`ready`（就绪确认：初始化命令的哨兵是否按时出现）、`permissions`；**`fifo` 字段保留但恒为 `null`**（旧引擎的 FIFO 已不存在，留着只为键集不变）；**`--no-pty` 已删除**：参数不复存在，传了被 argparse 拒绝，结果恒 `pty: true`（C1）
 - **`session send`**：`token`（这条命令的哨兵 id）、`offset`/`next_offset`（本次输出起点，接着 `read --offset` 就只读这条命令的输出）、`sent_bytes`
 - **`session read`**：载荷字段与 `log` 对齐——**`stdout`**（合并流，已清洗 CR/ANSI/哨兵行）、`bytes_returned`、`log_bytes`、`next_offset`、`has_more`、`status`（`done`|`running`）、`exit_code`/`exit_success`、`token`、`pid`、`waited_ms`/`wait_rc_secs`、`output_truncated`/`omitted_bytes`；默认剥离 ANSI（`--keep-ansi` 保留）
 - **`session run`**：与 `read` 同构（`stdout`/`exit_code`/`status`/`token`/`next_offset`/`waited_ms`），外加 `sent_bytes`

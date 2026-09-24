@@ -5,8 +5,8 @@
 > 或者需要**中断正在执行的命令**时。
 > **v2.4.0 起：进程引擎 = tmux**（旧的自研实现——`setsid`+`nohup`+util-linux `script`+FIFO+
 > 自写看门狗——整体删除）；**契约层完全不变**：stdout 单行 JSON 的字段集、哨兵协议、每条命令
-> 独立退出码、字节级 offset 读、CRLF/ANSI 清洗、错误类型都不动。`--no-pty`、`TERM`、
-> 回收方式（惰性扫 + reaper）、依赖 tmux 等**既知行为变化**见下文「边界与注意」与「已知边界」。
+> 独立退出码、字节级 offset 读、CRLF/ANSI 清洗、错误类型都不动。`TERM`、回收方式（惰性扫 + reaper）、
+> 依赖 tmux、**参数面收紧（`--no-pty` 已删除）**等变化见下文「边界与注意」与「已知边界」。
 
 ## 一句话定位
 
@@ -113,7 +113,8 @@ pyaissh session kill  h --name work                       # 收尾（tmux 会话
 
 根目录另有 `reap.sh`（reaper 脚本，0700）、`.reaper.pid`（pid + 间隔指纹）、`.reaper.log`
 （回收日志，超 64KB 只留尾 200 行）。**旧引擎的 `in`(FIFO)/`sess.pid`/`bash.pid`/`watch.*`/`wd.*`/
-`err.log` 都不再产生**——如果看到它们，说明这个目录是 tmux 迁移之前起的（见「旧引擎遗留目录」）。
+`err.log` 都不再产生**——如果看到它们，说明这个目录是 tmux 迁移之前起的；pyaissh 不识别这种目录
+（当陌生目录处理），自行 `rm -rf` 即可。
 
 ### 人类现场排障：attach 看直播
 
@@ -140,7 +141,7 @@ tmux -L pyaissh attach -t "=$(cat /tmp/pyaissh-sessions/work/tmux)"  # 看直播
    用完 `-d` 即删缓冲，不在 server 里堆积。
 4. **哨兵必须与命令在同一"解析单元"里**（否则被 `read` 吃掉）：载荷形态不变，仍是
    `{ ...; }; echo 哨兵`——命令与哨兵在同一行被 bash 解析；用 `{}` 而非 `()`，大括号是**同一个
-   shell**，`cd`/`export` 状态照常保留。（旧引擎的"非 PTY 降级模式"已随 `--no-pty` 一起删除。）
+   shell**，`cd`/`export` 状态照常保留。（`--no-pty` 参数与非 PTY 降级模式都已删除。）
 5. **输出镜像是"字节流"，但管道会静默死于文件被删**：`pipe-pane` 的 `cat` 若还在往**已 unlink 的
    inode** 写，新输出就丢了（`#{pane_pipe}` 仍是 1，看不出来）。所以 `read`/`run` 前会查
    `#{pane_pipe}` 与 `out.log` 是否存在：管道死了**带 `-o`** 重 arm（已有管道时是 no-op）；
@@ -177,8 +178,8 @@ tmux -L pyaissh attach -t "=$(cat /tmp/pyaissh-sessions/work/tmux)"  # 看直播
   `session ctrl-c` 打断再改对重发。
 - **会话内的 `TERM` = `tmux-256color`**（tmux 强制决定，与旧引擎"继承 SSH 通道环境"不同，属既知变化）
   ——对需要 256 色的程序反而更准。
-- **`--no-pty` 已废弃**：保留参数只为兼容旧调用，实际是 no-op + 一条 warning，结果恒 `pty: true`
-  （tmux 永远提供 PTY，旧的"非 PTY 降级常驻 shell"路径整体删除）。
+- **`--no-pty` 已删除**：参数不复存在，传了会被 argparse 直接拒绝（`rc=2`，不会静默忽略）；
+  tmux 永远提供 PTY，结果恒 `pty: true`（旧的"非 PTY 降级常驻 shell"路径整体删除）。
 - **被中断的命令由 ctrl-c 代补退出码**：`ctrl-c`（默认 SIGINT 或 `--force` SIGKILL）之后，被中断的
   命令自己不会产出哨兵（`bash` 收到 SIGINT 会丢弃当前命令行），所以 pyaissh **代它补一条**
   （SIGINT→`exit_code=130`、`--force`→`137`）；正等它的 `read --wait-rc --token` 会收敛。
@@ -306,9 +307,9 @@ python3 pyaissh.py session start root@1.2.3.4 --name work --attach    # 活着�
 warning（附 `ps -eo pid,ppid,tty,args | grep pyaissh-sessions` 自查命令），而**不是**宣称已清理。
 看到 `verified: false` 就按 note 手工确认一次。
 
-**旧引擎遗留目录**（tmux 迁移之前起的会话）：目录里有 `sess.pid`/`in` 却没有对应的 tmux 会话 ⇒
-`run/send/read` 报 `session_dead`（message 说明是旧引擎遗留），`list` 里带 `legacy_engine: true`，
-**pyaissh 不接管它**（也不被 reaper 误删）——用 `session kill` 清掉目录后重新 `start`。
+**目录里只有 `meta`、没有 tmux 会话**（会话里 `exit` 或被外部 `kill-session` 之后的正常残留）：
+`run/send/read` 报 `session_dead`，`list` 显示 `status: dead` 并提示清理；它不会被惰性扫/reaper 收走
+（没有 `tmux` 名文件一律跳过），用 `session kill` 清目录后重新 `start`。
 
 **怎么发现"忘了关"的会话**：`session list` 给出 `age_seconds`/`started_at`/`log_bytes`/`idle_seconds`；
 挂了超过 24 小时的会话会额外给一条 warning（`out.log` 只增不减）。

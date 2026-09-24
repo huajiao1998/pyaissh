@@ -332,10 +332,10 @@ def suite_unit_regression(s):
 
     # v2.3 会话单元（纯函数，不连远端）
     sf = m._session_files("/tmp/pyaissh-sessions", "demo")
-    s.check("会话路径表完整（dir/fifo/log/pid/meta/bash/token）",
-            sf["dir"] == "/tmp/pyaissh-sessions/demo" and sf["fifo"].endswith("/in")
-            and sf["log"].endswith("/out.log") and sf["pid"].endswith("/sess.pid")
-            and sf["bash"].endswith("/bash.pid") and sf["token"].endswith("/last.token"),
+    s.check("会话路径表完整（dir/log/meta/token/beat/tmux）",
+            sf["dir"] == "/tmp/pyaissh-sessions/demo" and sf["log"].endswith("/out.log")
+            and sf["meta"].endswith("/meta") and sf["token"].endswith("/last.token")
+            and sf["beat"].endswith("/beat") and sf["tmux"].endswith("/tmux"),
             repr(sf))
     s.check("会话名正则：接受合法、拒绝穿越/空/超长",
             bool(m._SESSION_NAME_RE.match("work-1.x")) and not m._SESSION_NAME_RE.match("../etc")
@@ -451,18 +451,16 @@ def suite_unit_regression(s):
             all(k in _cc for k in ("SESS__PID=", "SESS__SID=", "SESS__GROUPS=",
                                    "SESS__CHILDREN=", "SESS__SIGNALED=")))
     _kc = m._session_kill_cmd(_f, _tm, pane_pid=4242)
-    s.check("kill：闭包快照根 = tmux 给的 pane_pid（不再有 bash.pid/script 自证根）",
+    s.check("kill：闭包快照根 = tmux 给的 pane_pid + 去掉 last.token（不留旧引擎痕迹）",
             "P='4242'" in _kc and 'kill -0 "$P"' in _kc
-            and "bash.pid" not in _kc and "script -qfc" not in _kc, _kc[:200])
+            and "sess.pid" not in _kc and "bash.pid" not in _kc and "script -qfc" not in _kc
+            and "SESS__LEGACY" not in _kc and "/demo/last.token" in _kc, _kc[:200])
     s.check("kill：先快照再 kill-session（父进程被杀后子进程会 reparent，事后算会漏）",
             _kc.index("SNAP=") < _kc.index("kill-session"))
     s.check("kill：TERM → 校验 → KILL + 回传 SWEPT/LEFT/ROOTS/HAD/CLEANED",
             "kill -TERM $T" in _kc and "kill -KILL $K" in _kc
             and all(k in _kc for k in ("SESS__SWEPT=", "SESS__LEFT=", "SESS__ROOTS=",
                                         "SESS__HAD=", "SESS__CLEANED=1")))
-    s.check("kill：识别旧引擎遗留目录（有 sess.pid/in 却没有 tmux 会话）+ 去掉 last.token",
-            "SESS__LEGACY=$LEGACY" in _kc and "/demo/sess.pid" in _kc
-            and "/demo/last.token" in _kc)
     s.check("kill：--keep-dir 时不删目录", "rm -rf '/tmp/pyaissh-sessions/demo'" in _kc
             and "rm -rf" not in m._session_kill_cmd(_f, _tm, keep_dir=True, pane_pid=1))
     _rs = m._session_reap_script("/tmp/pyaissh-sessions")
@@ -477,7 +475,7 @@ def suite_unit_regression(s):
     s.check("reaper 脚本：没有会话目录时下一轮自退并清掉 pid 文件（不留空转常驻）",
             'if [ "$n" -eq 0 ]; then rm -f "$ROOT/.reaper.pid" 2>/dev/null; exit 0; fi' in _rs,
             _rs[-320:])
-    s.check("reaper 脚本：不碰旧引擎遗留目录（没有 tmux 名文件的目录直接跳过）",
+    s.check("reaper 脚本：不碰陌生目录（没有 tmux 名文件的目录直接跳过）",
             '[ -z "$TN" ]; then continue' in _rs)
     s.check("reaper 脚本：日志超限截断（只留尾 200 行）",
             "tail -n 200" in _rs and str(m.SESSION_TMUX_REAP_LOG_MAX) in _rs)
@@ -544,11 +542,13 @@ def suite_unit_regression(s):
     _o, rc_run, tok_run = m._session_slice_by_sentinel(log + "still running\n", "zzzz")
     s.check("目标 token 未出现 → running（rc=None）且给最后哨兵之后的输出",
             rc_run is None and tok_run is None and "still running" in _o, repr((rc_run, _o)))
-    # 输出清洗
+    # 输出清洗（v2.4.0 起不再特判 util-linux `script` 的头尾行——那是已删引擎的噪音，
+    # 现在它只是一行普通输出；这里顺带断言"不特判"）
     dirty = ("Script started on x [COMMAND=\"bash\"]\r\n\x1b[31mRED\x1b[0m\r\n"
              "%sab12__0\r\n" % m.SESSION_RC_PREFIX)
-    s.check("清洗：去 CR/ANSI/哨兵行/script 头",
-            m._session_clean_text(dirty) == "RED", repr(m._session_clean_text(dirty)))
+    s.check("清洗：去 CR/ANSI/哨兵行（script 头行不再特判，按普通输出保留）",
+            m._session_clean_text(dirty) == 'Script started on x [COMMAND="bash"]\nRED',
+            repr(m._session_clean_text(dirty)))
     s.check("--keep-ansi 时保留 ANSI 码",
             "\x1b[31m" in m._session_clean_text(dirty, strip_ansi=False))
 
@@ -1930,7 +1930,7 @@ def suite_live_session_engine(s):
             and _field(_e7s, "srv") == "0", repr(_e7s))
 
 def suite_live_session_lifecycle(s):
-    """会话消亡与账实分离（v2.4.0）：exit / 外部 kill-session / 目录被删 / 旧引擎遗留 / 同名重建。"""
+    """会话消亡与账实分离（v2.4.0）：exit / 外部 kill-session / 目录被删 / 只剩 meta 的残留 / 同名重建。"""
     if _missing_env(_REQ_EXEC):
         print("SKIP: 需配置 %s" % " / ".join(_REQ_EXEC))
         return None
@@ -2011,33 +2011,35 @@ def suite_live_session_lifecycle(s):
             "pid=%s→%s" % ((_j4a or {}).get("pid"), (_j4c or {}).get("pid")))
     _live_run(["session", "kill", tgt, "--name", _l4], timeout=120)
 
-    # L5：**旧引擎遗留目录**（有 sess.pid/in 却没有 tmux 会话）——不接管、不被清扫误删、kill 能清
+    # L5：目录里只有 meta、没有 tmux 会话（会话 `exit` 或被人 kill-session 后的正常残留）——
+    #     仍按 session_dead 处理，且不被惰性扫/reaper 收走，用 kill 能清掉
     _lg = name + "lg"
     _live_run(["exec", tgt, "--cmd",
                "D=/tmp/pyaissh-sessions/%s; rm -rf $D; mkdir -m 700 -p $D; "
-               "echo 999999 > $D/sess.pid; : > $D/in; "
                "printf '1 200 %%d 5\\n' $(( $(date +%%s) - 600 )) > $D/meta; "
                "printf '%%s\\n' $(( $(date +%%s) - 600 )) > $D/beat; echo made" % _lg],
               timeout=60)
     rc, _je5, _ = _live_run(["session", "read", tgt, "--name", _lg], timeout=60)
-    s.check("L5a 旧引擎遗留目录 → session_dead 且 message 点明是旧引擎遗留",
+    s.check("L5a 只有 meta 没有 tmux 会话 → session_dead（rc=2）+ 提示用 kill 清",
             rc == 2 and bool(_je5) and _je5.get("error") == "session_dead"
-            and "旧引擎遗留" in (_je5.get("message") or ""), repr(_je5)[:260])
+            and "session kill" in (_je5.get("message") or ""), repr(_je5)[:260])
     rc, _jl5, _ = _live_run(["session", "list", tgt], timeout=60)
     _row5 = next((x for x in (_jl5 or {}).get("sessions", []) if x.get("session") == _lg), None)
-    s.check("L5b list 标出 legacy_engine + 给出清理提示",
-            bool(_row5) and _row5.get("legacy_engine") is True
-            and any("旧引擎" in w for w in (_jl5.get("warnings") or [])), repr(_jl5)[:260])
+    s.check("L5b list 显示 dead 并提示清理（不再有 legacy_engine 字段）",
+            bool(_row5) and _row5.get("status") == "dead"
+            and "legacy_engine" not in _row5
+            and any("tmux 会话已不存在" in w for w in (_jl5.get("warnings") or [])),
+            repr(_jl5)[:260])
     rc, _jex5, _ = _live_run(["exec", tgt, "--cmd",
                               "[ -d /tmp/pyaissh-sessions/%s ] && echo still || echo gone" % _lg],
                              timeout=60)
-    s.check("L5c 过期但**不**被惰性扫/reaper 误删（不接管别人的账）",
+    s.check("L5c 过期也不被惰性扫/reaper 误删（没有 tmux 名文件 ⇒ 不碰）",
             "still" in ((_jex5 or {}).get("stdout") or ""), repr((_jex5 or {}).get("stdout")))
     rc, _jk5, _ = _live_run(["session", "kill", tgt, "--name", _lg], timeout=120)
     _krow5 = ((_jk5 or {}).get("sessions") or [{}])[0]
-    s.check("L5d kill 能清掉遗留目录，并标 legacy_engine",
-            bool(_jk5) and _krow5.get("legacy_engine") is True
-            and _krow5.get("cleaned") is True, repr(_krow5)[:240])
+    s.check("L5d kill 能清掉它（cleaned=true，且不再标 legacy_engine）",
+            bool(_jk5) and _krow5.get("cleaned") is True
+            and "legacy_engine" not in _krow5, repr(_krow5)[:240])
 
 def suite_live_session_orphan(s):
     """孤儿字段（v2.4.0）：tmux 引擎下结构性孤儿不复存在，`orphans*` **恒返回且恒空**；
@@ -2164,22 +2166,16 @@ def suite_live_session_bugs(s):
             "%.1fs status=%s" % (_dt1, (jb1 or {}).get("status")))
     _live_run(["session", "kill", tgt, "--name", name + "b1"], timeout=60)
 
-    # B2（v2.4.0 语义变化）：--no-pty 已废弃 → 仍是真 PTY + 一条 warning，但命令/状态/退出码必须正常
-    rc, jbnp, _ = _live_run(["session", "start", tgt, "--name", name + "np", "--no-pty"],
-                            timeout=90)
-    s.check("B2 --no-pty 变成 no-op：pty=True + ready=True + 明确 warning",
-            bool(jbnp) and jbnp.get("pty") is True and jbnp.get("ready") is True
-            and any("no-pty" in w for w in (jbnp.get("warnings") or [])), repr(jbnp)[:220])
-    rc, jbnp2, _ = _live_run(["session", "run", tgt, "--name", name + "np", "--cmd",
-                              "echo NOPTY_OK", "--wait-rc", "15"], timeout=60)
-    s.check("B2 --no-pty 下 run 能拿到输出与退出码（曾静默挂死）",
-            bool(jbnp2) and jbnp2.get("status") == "done" and jbnp2.get("exit_code") == 0
-            and "NOPTY_OK" in (jbnp2.get("stdout") or ""), repr(jbnp2)[:180])
-    rc, jbnp3, _ = _live_run(["session", "run", tgt, "--name", name + "np", "--cmd",
-                              "cd /tmp && pwd", "--wait-rc", "15"], timeout=60)
-    s.check("B2 --no-pty 下多行/复合命令与状态保留正常",
-            bool(jbnp3) and jbnp3.get("exit_code") == 0
-            and (jbnp3.get("stdout") or "").strip() == "/tmp", repr(jbnp3)[:160])
+    # B2（v2.4.0 收口）：`--no-pty` 参数已彻底删除（旧引擎的非 PTY 降级路径随之消失）——
+    #     传它必须被 argparse 当场拒绝（rc=2），不能静默忽略
+    rc, jbnp, errnp = _live_run(["session", "start", tgt, "--name", name + "np", "--no-pty"],
+                                timeout=90)
+    s.check("B2 --no-pty 已被删除：argparse 直接拒绝（rc=2，不静默接受）",
+            rc == 2 and "no-pty" in (errnp or ""), "rc=%s stderr=%r" % (rc, (errnp or "")[-120:]))
+    rc, jbnp2, _ = _live_run(["session", "start", tgt, "--name", name + "np"], timeout=90)
+    s.check("B2 不带 --no-pty 的普通会话仍正常（pty=True + ready）",
+            bool(jbnp2) and jbnp2.get("pty") is True and jbnp2.get("ready") is True,
+            repr(jbnp2)[:180])
     _live_run(["session", "kill", tgt, "--name", name + "np"], timeout=60)
 
     # 错误路径
@@ -2211,7 +2207,7 @@ SUITES = [
     # 全量（--session / --all）仍是这些块全跑（发布前用）
     ("live_session_ttl", "会话空闲回收（惰性扫 + reaper）/attach（真机）", suite_live_session_ttl),
     ("live_session_engine", "tmux 引擎（socket 隔离/输出镜像/无残留/开销，真机）", suite_live_session_engine),
-    ("live_session_lifecycle", "会话消亡/外部删目录/旧引擎遗留/同名重建（真机）", suite_live_session_lifecycle),
+    ("live_session_lifecycle", "会话消亡/外部删目录/残留目录/同名重建（真机）", suite_live_session_lifecycle),
     ("live_session_orphan", "孤儿字段恒空 + kill --all 幂等（真机）", suite_live_session_orphan),
     ("live_session_bugs", "B1~B5 回归护栏（真机）", suite_live_session_bugs),
 ]

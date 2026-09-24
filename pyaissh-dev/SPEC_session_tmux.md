@@ -46,7 +46,7 @@
 |---|---|---|---|
 | **INV-01a** | 每个子命令/错误路径的返回**键集必须包含基线全部键**（同输入同键集） | `python pyaissh-dev/contract_baseline.py --check tests/contract/session_contract_v2.json` | V1 ✅ |
 | **INV-01b** | 允许**新增**的键仅限白名单：`orphans` / `orphans_total` / `orphan_remaining_total`（恒空返回，AI 侧零感知）；白名单外新增即 FAIL | 同上（工具加 `--allow` 白名单） | V1 ✅ |
-| **INV-02** | 八个子命令与参数面不变：`start`(含 `--attach`/`--ttl`/`--cols`/`--no-pty`*)/`run`(`--cmd`/`--cmd-file`/`--wait-rc`/`--no-wait`)/`send`(`--keep-crlf`)/`read`(`--offset`/`--lines`/`--wait-rc`/`--token`/`--keep-ansi`)/`ctrl-c`(`--force`)/`keys`(`--data`/`--raw`/`--cmd-file`)/`list`/`kill`(`--name`/`--all`/`--keep-dir`)。\*`--no-pty` 保留为 **no-op + warning**（deprecated） | `pyaissh session --help` + `--suite live_session` | V3 ✅ |
+| **INV-02** | 八个子命令与参数面：`start`(含 `--attach`/`--ttl`/`--cols`)/`run`(`--cmd`/`--cmd-file`/`--wait-rc`/`--no-wait`)/`send`(`--keep-crlf`)/`read`(`--offset`/`--lines`/`--wait-rc`/`--token`/`--keep-ansi`)/`ctrl-c`(`--force`)/`keys`(`--data`/`--raw`/`--cmd-file`)/`list`/`kill`(`--name`/`--all`/`--keep-dir`)。\*`--no-pty` 保留为 **no-op + warning**（deprecated） | `pyaissh session --help` + `--suite live_session` | V3 ✅ |
 | **INV-03** | 错误类型不变：`session_not_found` / `session_exists` / `session_dead` / `bad_args` / `send_failed` / `keys_failed` / `session_failed` / `session_list_failed` / `session_read_failed` / `session_kill_failed`；新增仅限 ERR 表 | 基线 fixture 的错误用例 + `--suite live_session` | V1+V3 ✅ |
 | **INV-04** | **字节级增量契约**：`--offset`/`next_offset` 指向磁盘上的**追加文件** `out.log`（SFTP 读），非 `capture-pane`；连续读不重不漏；输出 >1MB 仍能看到哨兵（尾窗逻辑保留）；文件被删/缩小时重建基线并给 warning | `--suite live_session_ttl,live_session_bugs`（B3/B4） | V8 ✅ |
 | **INV-05** | 哨兵协议不变：`{ ...; }; echo "__PYAISSH_RC__<token>__$?"`，**哨兵与命令同一行被解析**（防 `read -p` 吃哨兵）；`last.token` 落盘 + 写失败重试 | `--unit`（`_session_payload_text`）+ `--suite live_session`（keys/交互提示） | V2+V3 ✅ |
@@ -74,7 +74,7 @@
 | **ENG-07** | 存活探测 `has-session -t =NAME`；**会话里 `exit` → 会话消失但目录仍在** ⇒ 按现有 `session_dead` 语义报错，目录留给 `kill` 清 | 账实分离时的旧语义保留 |
 | **ENG-08** | `ctrl-c` = `send-keys -t '=NAME:' C-c`；`--force` = `kill -KILL -- -$(ps -o tpgid= -p <pane_pid>)`（前台进程组），**不用 `C-\`(SIGQUIT)** | S8/S9：SIGQUIT 会 core dump（服务器上可能吐大文件）；SIGKILL 前台组后会话与状态保留 |
 | **ENG-09** | `kill` = 先取 pane_pid 的进程树闭包快照 → `kill-session -t '=NAME'` → 对闭包幸存者 TERM→KILL→校验 → `rm -rf 目录`（`--keep-dir` 跳过）；`swept` = 闭包大小，`roots` = 是否有自证根，`verified` = 有根且无幸存；`orphans*` 恒空返回 | 账实合一；闭包快照保留旧引擎"连作业一起清"的语义（S10 的脱离进程是共同盲区） |
-| **ENG-10** | `--no-pty` 变 no-op + warning（argparse 保留），文档标 deprecated；非 PTY 降级路径整体删除 | tmux 永远有 PTY（`pty: true`，与旧 `--no-pty` 行为不同，属既知变化） |
+| **ENG-10** | `--no-pty` 参数**已删除**（连同非 PTY 降级路径）：传了会被 argparse 拒绝（rc=2），不静默忽略 | tmux 永远有 PTY（`pty: true`） |
 | **ENG-11** | 依赖预检：`command -v tmux` + `tmux -V` 取版本号；`< 3.0` 报 `tmux_unsupported`；**不自动安装**，错误里给出可执行安装命令（apt/dnf/yum/apk） | 无包管理器/不可变系统装不了 ⇒ UPG-02 |
 | **ENG-12** | `out.log` 被外部删除/清空/轮转 ⇒ offset 读识别"变小/消失"→ 重建基线 + warning `log_recreated`，并不带 `-o` 重 arm 管道 | 会话状态在 tmux、日志在 /tmp，生命周期解耦（S5） |
 
@@ -130,7 +130,7 @@
 
 | ID | 判据 |
 |---|---|
-| **UPG-01** | 升级后遇到**旧引擎遗留目录**（有 `sess.pid`/`in` 但无同名 tmux 会话）→ 报 `session_dead`（message 说明"旧引擎遗留，请 kill 清理"）；**不自动接管** |
+| **UPG-01** | **不识别** tmux 迁移之前遗留的会话目录：没有 `tmux` 名文件的目录一律当陌生目录——`read/run` 按 `meta` 在不在分别报 `session_dead`/`session_not_found`，`kill --all` 只处理有 `tmux`/`meta` 的目录，reaper 直接跳过；遗留目录由人自行 `rm -rf` |
 | **UPG-02** | 无 tmux 的环境（air-gapped / 不可变系统 / 无包管理器）→ session 模式不可用并给出可执行提示；`exec` / `exec --detach` **不受影响**（长任务仍有出路） |
 | **UPG-03** | 旧引擎代码**删除**（不留 `PYAISSH_SESSION_ENGINE` 开关、不双引擎） |
 
@@ -150,7 +150,7 @@
 
 | # | 变化 | 原因 |
 |---|---|---|
-| C1 | `--no-pty` 变成 no-op，结果里 `pty: true` + 一条 warning | tmux 永远提供 PTY（旧：可降级为非 PTY 常驻 bash） |
+| C1 | `--no-pty` 参数已删除（argparse 直接拒绝）；结果里 `pty` 恒 `true` | tmux 永远提供 PTY（旧：可降级为非 PTY 常驻 bash） |
 | C2 | 会话内 `TERM` = `tmux-256color`（旧：继承 SSH 通道环境，常为空/`dumb`） | tmux 强制 pane 的 TERM（S12）；对需要 256 色的程序反而更好 |
 | C3 | `kill` 结果**总是**含 `orphans: []` / `orphans_total: 0` / `orphan_remaining_total: 0`（旧：空时省略） | 用户要求"字段继续返回、永远空"，AI 侧零感知（计入 INV-01b 白名单） |
 | C4 | 空闲回收从"服务器端准点（TTL..TTL+TICK）"变为"**惰性扫 + 每 5 分钟 reaper**" | 无每会话看门狗；`list` 字段口径不变 |
@@ -172,7 +172,7 @@
 | V3 会话 core | `python -u tests/run_tests.py --suite live_session` | INV-02/05/06/08/09/10, ENG-07/08, C9 | ✅ **30 PASS / 0 FAIL** |
 | V4 TTL/attach/list | `python -u tests/run_tests.py --suite live_session_ttl` | INV-12, REAP-01/02/03/04 | ✅ **16 PASS / 0 FAIL** |
 | V5 引擎与回收 | `python -u tests/run_tests.py --suite live_session_engine` | ENG-01..06/11/12, REAP-03, PERF-01..04 | ✅ **13 PASS / 0 FAIL**（含 PERF 实测断言） |
-| V6 消亡/账实分离 | `python -u tests/run_tests.py --suite live_session_lifecycle` | ENG-07/09/12, UPG-01, BND-01 | ✅ **13 PASS / 0 FAIL** |
+| V6 消亡/账实分离 | `python -u tests/run_tests.py --suite live_session_lifecycle` | ENG-07/09/12, UPG-01(残留目录), BND-01 | ✅ **13 PASS / 0 FAIL** |
 | V7 孤儿字段/幂等 | `python -u tests/run_tests.py --suite live_session_orphan` | INV-01b, ENG-09 | ✅ **7 PASS / 0 FAIL** |
 | V8 回归护栏 | `python -u tests/run_tests.py --suite live_session_bugs` | INV-04/07, B3/B4/B5, C1 | ✅ **11 PASS / 0 FAIL** |
 | V9 MCP 层 | `pyaissh-mcp/test/test_offline.py`（+ 真机 MCP 用例） | MCP 描述与实际一致 | ✅ 离线用例通过（真机会话用例由 `pyaissh-mcp/test/test_live_session.py` 覆盖，需 MCP 客户端环境） |
@@ -186,7 +186,7 @@
 
 ## 9. 交付物清单
 
-1. **代码**：`pyaissh-dev/domains/11_cmd_session.py`（进程层重写为 tmux；契约层保留）、`12_cli_main.py`（帮助文本/`--no-pty` 说明）、三份 `pyaissh.py`（`dist` 同步）。
+1. **代码**：`pyaissh-dev/domains/11_cmd_session.py`（进程层重写为 tmux；契约层保留）、`12_cli_main.py`（帮助文本）、三份 `pyaissh.py`（`dist` 同步）。
 2. **测试**：`tests/contract/session_contract_v2.json`（基线 fixture）、`tests/run_tests.py` 各会话块改写 + 新断言、本 SPEC 第 8 节填证据。
 3. **文档**：`skills/pyaissh/docs/session.md`（引擎/回收语义/边界重写）、`SKILL.md`（session 段）、`pyaissh-mcp/README.md`、MCP `pyaissh_session` 描述。
 4. **记录**：`CHANGELOG.md`（= `skills/pyaissh/CHANGELOG.md` = `pyaissh-mcp/CLI_CHANGELOG.md`）、`tests/CHANGELOG.md`。

@@ -110,7 +110,7 @@ python3 pyaissh.py session kill  h --name work                   # 收尾（tmux
 
 - **每条命令独立退出码**；**`cd`/`export`/函数跨命令保留**——**打错了就把那条命令改对再发一遍**（同一条重试）：像人打错文件名那样，报错 → 改对 → 重发 → 成功，上下文与上次完全一致
 - `run --wait-rc` 超时回 `status:"running"`（带 `token`，可 `read --wait-rc` 续等或 `ctrl-c` 中断）；`read` 载荷字段 `stdout`（合并流，已清洗 CR/ANSI/哨兵行）、`status`(`done`|`running`)、`exit_code`、`next_offset`
-- 子命令 `start/run/send/read/ctrl-c/keys/list/kill`；**引擎 = 远端 tmux**（专用 socket `pyaissh`，不碰用户自己的 tmux）——**依赖 tmux ≥ 3.0**（实测 3.5a），没有就报 `tmux_missing` 并给出安装命令（apt/dnf/apk），**不自动安装**；装不了（不可变系统/无包管理器）就用 `exec`/`exec --detach` 跑长任务。会话内 `TERM` = `tmux-256color`。`--no-pty` 已废弃（no-op + warning，永远真 PTY）。**实现细节、实测坑与边界 → `docs/session.md`**
+- 子命令 `start/run/send/read/ctrl-c/keys/list/kill`；**引擎 = 远端 tmux**（专用 socket `pyaissh`，不碰用户自己的 tmux）——**依赖 tmux ≥ 3.0**（实测 3.5a），没有就报 `tmux_missing` 并给出安装命令（apt/dnf/apk），**不自动安装**；装不了（不可变系统/无包管理器）就用 `exec`/`exec --detach` 跑长任务。会话内 `TERM` = `tmux-256color`。`--no-pty` 已删除（传了被 argparse 拒绝）。**实现细节、实测坑与边界 → `docs/session.md`**
 - **用完必须 `kill`（或让它自己到期）**：会话由**远端 tmux 常驻，不会自己退出**（SSH 断开照跑，**本地关机/断网也不影响它和正在跑的命令**——回头 `read --wait-rc` 能续拿 `exit_code` 与输出，cwd/变量都还在）。**空闲回收**：提示符空闲（没有命令在跑）且 `--ttl`（默认 600s）内没有任何交互（send/run/read/ctrl-c/keys）就自动回收——由**会话子命令（send/run/read/ctrl-c/keys/list）入口的惰性扫**与**每主机一个 reaper（默认 300 秒一轮）**触发（`kill` 不走惰性扫；`list` 不续期但会顺手扫；`start` 仅 `--ttl > 0` 时扫并拉起 reaper），没人再回来时**最迟 TTL+5 分钟**被收掉，`--ttl 0` 关闭；也可以 `kill` 立刻结束（默认连 tmux 会话、进程树、目录一起清，`--keep-dir` 留日志，`--all` 清该主机全部）。`start --attach` 接上还活着的同名会话（状态全保留，否则新建）；`list` 给 `age_seconds`/`log_bytes`/`expires_in_seconds`。清理是**进程树闭包 + `verified` 字段**（不会无声误报"清干净"）；`orphans` 系列字段恒返回且恒空（tmux 引擎下"目录没了进程还在"的结构性孤儿不存在）
 
 ### ls — 列远程目录

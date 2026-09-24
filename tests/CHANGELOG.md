@@ -460,6 +460,18 @@
   （有 `tmux` 文件；无 `in`/`sess.pid`/`bash.pid`/`watch.*`/`wd.*`）、`kill` 走
   pane_pid 闭包 + `tmux kill-session` + `swept`/`roots`/`verified` 校验
 
+### 2026-09-24 清理旧引擎兼容面（删功能 → 删用例，不是加用例）
+- `live_session_lifecycle` **L5 重写**：不再构造"旧引擎遗留目录"（`sess.pid`/`in`），改为"目录里只有
+  `meta`、没有 tmux 会话"的正常残留 —— 断言 `session_dead` + `list` 显示 `dead` + 不被惰性扫/reaper
+  收走 + `kill` 能清，且**断言不再出现 `legacy_engine` 字段**。
+- `live_session_bugs` **B2 重写**：`--no-pty` 参数已删除 ⇒ 断言"传了被 argparse 拒绝（rc=2，不静默
+  接受）"，并补一条"不带该参数的普通会话仍正常"。
+- 单元：删掉 `_session_files` 遗留路径键断言（改为 `dir/log/meta/token/beat/tmux`）、删掉 kill 里的
+  `SESS__LEGACY` 断言、`清洗：去 CR/ANSI/哨兵行/script 头` 改为"script 头行不再特判"。
+- 块描述同步：`live_session_lifecycle` → "会话消亡/外部删目录/残留目录/同名重建"；
+  reaper 断言措辞改为"不碰陌生目录"。
+- 本轮跑批：`--unit`（unit_regression 127 / artifacts 16，全 PASS）+ 一处定点（`--no-pty` 被拒）
+  + 冒烟脚本 `stest_tmp/tmuxspike/smoke1.py`（0 FAIL）。按规矩未跑整块/全量。
 ### 说明
 - 用例数与跑批结果由本轮实现方填入——本文档**不预填未实测的数字**。
 

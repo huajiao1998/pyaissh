@@ -42,7 +42,7 @@ _SESSION_STALE_HINT = 86400
 #      再扫一遍其它会话；`kill` 不需要扫（它本来就是清理）；
 #   ② **每主机 reaper**：`<root>/reap.sh --loop` 每 `_SESSION_REAP_INTERVAL` 秒扫一遍，
 #      无会话目录时下一轮自退；由 `start`（仅 --ttl>0）幂等拉起，会话全清后由 `kill` 停掉。
-# 所以"没人再回来"的会话最迟在 TTL + 间隔内被收掉（旧引擎是 TTL..TTL+TICK）。
+# 所以"没人再回来"的会话最迟在 TTL + 间隔内被收掉。
 _SESSION_TTL_DEFAULT = 600
 
 
@@ -70,16 +70,12 @@ def _session_reap_interval():
 def _session_files(root, name):
     """会话远端路径表（一个会话一个 0700 目录）。
 
-    tmux 引擎真正使用的只有 `out.log`/`meta`/`beat`/`last.token`/`tmux` 五个；
-    `fifo`/`pid`/`bash`/`watch` 是**旧引擎（setsid+script+FIFO+看门狗）的记账路径**，
-    保留只为识别"旧引擎遗留目录"（UPG-01：不自动接管，也不被 reaper 误删）。
+    tmux 引擎只用这五个文件：`out.log`(输出镜像) / `meta`(pty cols 起始时间 TTL) /
+    `beat`(最后交互 epoch 秒) / `last.token`(最近一条命令的 token) / `tmux`(tmux 会话名)。
     """
     d = "%s/%s" % (root.rstrip("/"), name)
     return {"dir": d, "log": d + "/out.log", "meta": d + "/meta",
             "token": d + "/last.token", "beat": d + "/beat", "tmux": d + "/tmux",
-            # 旧引擎遗留标记（只识别，不再写入）：
-            "fifo": d + "/in", "pid": d + "/sess.pid", "bash": d + "/bash.pid",
-            "watch": d + "/watch.pid", "err": d + "/err.log",
             "name": name, "root": root.rstrip("/")}
 
 
@@ -456,8 +452,7 @@ def _session_ctrl_c_cmd(f, tmux, force=False):
 _SESSION_KILL_TPL = """\
 @@PROLOGUE@@
 D='@@DIR@@'; HAD=0; [ -d "$D" ] && HAD=1
-TN='@@TMUX@@'; T=''; LEFT=0; SWEPT=0; ROOTS=0; KILLED=0; LEGACY=0
-if [ -e '@@LEGACY_FIFO@@' ] || [ -e '@@LEGACY_PID@@' ]; then LEGACY=1; fi
+TN='@@TMUX@@'; T=''; LEFT=0; SWEPT=0; ROOTS=0; KILLED=0
 P='@@PANE_PID@@'
 if [ -n "$P" ] && kill -0 "$P" 2>/dev/null; then
   SNAP=$(ps -eo pid=,ppid= 2>/dev/null)
@@ -483,7 +478,6 @@ echo "__PYAISSH_SESS__LEFT=$LEFT"
 echo "__PYAISSH_SESS__ROOTS=$ROOTS"
 echo "__PYAISSH_SESS__HAD=$HAD"
 echo "__PYAISSH_SESS__KILLED=$KILLED"
-echo "__PYAISSH_SESS__LEGACY=$LEGACY"
 echo __PYAISSH_SESS__CLEANED=1
 """
 
@@ -493,13 +487,12 @@ def _session_kill_cmd(f, tmux, keep_dir=False, pane_pid=None):
 
     闭包快照在 `kill-session` **之前**算（父进程被杀后子进程会被 reparent，事后再算会漏），
     根用 tmux 给的 `pane_pid`（权威、无需自证）；快照覆盖 shell 与它的作业。
-    实测（S10）：已经 reparent 到 1 的脱离进程（`nohup setsid ...`）不在闭包里——与旧引擎
-    同款盲区，文档写明（BND-01）。
+    实测（S10）：已经 reparent 到 1 的脱离进程（`nohup setsid ...`）不在闭包里——这是
+    进程树快照的固有盲区，文档写明（BND-01）。
     """
     rm = "" if keep_dir else "rm -rf '%s' 2>/dev/null" % f["dir"]
     return _tpl(_SESSION_KILL_TPL, PROLOGUE=_SESSION_TMUX_PROLOGUE, TMUX=tmux,
                 DIR=f["dir"], TMFILE=f["tmux"], TOKEN=f["token"],
-                LEGACY_FIFO=f["fifo"], LEGACY_PID=f["pid"],
                 PANE_PID=(pane_pid if pane_pid else ""),
                 AWK=(_SESSION_TREE_AWK % "$P"), RM=rm)
 
@@ -541,7 +534,7 @@ def _session_reap_body(root, body=None):
     """reaper 的单次清扫逻辑（纯文本生成，便于单测与内联复用）。
 
     判据（与惰性扫一致）：`meta` 第 4 字段 TTL > 0；`beat` 过期 > TTL；
-    `tmux` 名文件存在（否则视为**旧引擎遗留目录**，不碰——UPG-01）；
+    `tmux` 名文件存在（没有它的目录一律不碰——不是本引擎建的）；
     会话里的前台命令是 shell（空闲）才回收，判不出就不收（宁可多留）。
     """
     return _tpl(body or _SESSION_REAP_BODY_TPL, ROOT=root, TM=_SESSION_TMUX,
@@ -676,7 +669,7 @@ _SESSION_TREE_AWK = (
 
 
 def _session_clean_text(s, strip_ansi=True):
-    """会话输出清洗：CRLF/CR → LF、去掉哨兵行与 script 头尾、可选剥 ANSI、去首尾空行。"""
+    """会话输出清洗：CRLF/CR → LF、去掉哨兵行、可选剥 ANSI、去首尾空行。"""
     s = s.replace("\r\n", "\n").replace("\r", "\n")
     if strip_ansi:
         s = _strip_ansi(s)
@@ -684,8 +677,6 @@ def _session_clean_text(s, strip_ansi=True):
     for ln in s.split("\n"):
         if _SESSION_RC_RE.search(ln):
             continue
-        if ln.startswith("Script started on ") or ln.startswith("Script done on "):
-            continue      # util-linux script 的会话头/尾（纯噪音）
         lines.append(ln)
     while lines and not lines[0].strip():
         lines.pop(0)
@@ -741,7 +732,7 @@ def _session_find_sentinel(text, token=None):
 
 
 def _session_remote_exists(sftp, path):
-    """远端路径是否存在（含 FIFO/目录，不问类型）。"""
+    """远端路径是否存在（文件/目录/FIFO 都算存在，不问类型）。"""
     try:
         sftp.stat(path)
         return True
@@ -843,7 +834,7 @@ def _session_info(client, f, sftp=None, tmux_info=None):
 
     缺什么就少什么字段，**绝不抛**（会话可能正好被回收/删除）。`alive`/`status` 由调用方补。
     `tmux_info` 是 `_session_tmux_ls` 给的那条会话记录：pid/shell_pid 由它来（tmux 权威），
-    `meta` 只负责 pty/cols/started_at/ttl（字段格式与旧引擎一致）。
+    `meta` 只负责 pty/cols/started_at/ttl（四个字段）。
     """
     info = {}
     own = sftp is None
@@ -877,14 +868,10 @@ def _session_info(client, f, sftp=None, tmux_info=None):
         try:
             with sftp.open(f["beat"], "r") as fh:
                 b = fh.read().decode("utf-8", "replace").strip()
+            # beat 里是 epoch 秒；读不到内容就给 None（list/回收侧都按"未知"处理，不乱猜）
             info["idle_seconds"] = max(0, int(time.time()) - int(b)) if b.isdigit() else None
         except Exception:
-            try:
-                # 兼容：早期/异常情况下 beat 只有 mtime 语义
-                st = sftp.stat(f["beat"])
-                info["idle_seconds"] = max(0, int(time.time()) - int(st.st_mtime or 0))
-            except Exception:
-                pass
+            pass
         try:
             with sftp.open(f["tmux"], "r") as fh:
                 info["tmux_session"] = fh.read().decode("utf-8", "replace").strip() or None
@@ -986,8 +973,6 @@ def cmd_session_start(args):
         if ec is not None:
             return ec
         warnings = []
-        if args.no_pty:
-            warnings.append("--no-pty 已废弃（tmux 引擎永远提供 PTY）：本次仍是 **PTY** 会话")
         if "EXISTS" in marks:
             ex_pid = marks.get("PID")
             if args.attach:
@@ -998,7 +983,9 @@ def cmd_session_start(args):
                                                  else None})
                 result = {
                     "ok": True, "action": "session", "version": VERSION, "session": name,
-                    "attached": True, "dir": f["dir"], "fifo": None, "log": f["log"],
+                    # fifo 是**契约字段**（v2.3 起基线里就有）：tmux 引擎没有 FIFO，恒返回 None，
+            # 只为字段集不变、AI 侧解析不踩空
+            "attached": True, "dir": f["dir"], "fifo": None, "log": f["log"],
                     "pid": int(ex_pid) if str(ex_pid).isdigit() else ex_pid,
                     "ready": True, "ttl_seconds": extra.get("ttl_seconds"),
                     "age_seconds": extra.get("age_seconds"),
@@ -1048,7 +1035,7 @@ def cmd_session_start(args):
         result = {
             "ok": True, "action": "session", "version": VERSION, "session": name,
             "attached": False,
-            "dir": f["dir"], "fifo": None, "log": f["log"],
+            "dir": f["dir"], "fifo": None, "log": f["log"],   # 契约字段，恒 None
             "pid": int(pid) if str(pid).isdigit() else pid,
             "pty": True, "cols": args.cols, "ready": ready, "ready_wait_ms": int(wait_s * 1000),
             "ttl_seconds": ttl if ttl and ttl > 0 else None,
@@ -1107,7 +1094,7 @@ def _session_payload_text(cmd, token):
     之后真正的载荷在干净的输入行里解析 ⇒ 哨兵照常出现，AI 至少能拿到退出码。
 
     （tmux 引擎下这一层完全不变：载荷经 `paste-buffer` 原样灌入 pane 的输入流，
-    与旧引擎写 FIFO 的字节流等价。）
+    输入流是原样字节，因此状态保留、多行与二进制都安全。）
     """
     body = cmd.rstrip("\n")
     return "\n{\n%s\n}; echo \"%s%s__$?\"\n" % (body, SESSION_RC_PREFIX, token)
@@ -1116,8 +1103,8 @@ def _session_payload_text(cmd, token):
 def _session_send_payload(client, f, tmux, cmd, token=None):
     """把「命令 + 退出码哨兵」灌进会话（tmux `load-buffer` + `paste-buffer`）。返回 token。
 
-    与旧引擎的差别只有传输方式：以前是 base64 写 FIFO，现在是**原样字节**走 tmux 缓冲区
-    （tmux 缓冲区是数据通道，不经过它自己的命令行解析，二进制安全）。
+    传输走 tmux 缓冲区：`load-buffer` 是数据通道，不经过 tmux 自己的命令行解析
+    （零引号风险、二进制安全）。
     """
     token = token or os.urandom(4).hex()
     payload = _session_payload_text(cmd, token)
@@ -1146,10 +1133,10 @@ def _session_load(args, root, name, need_alive=True):
 
     返回 `(conn, client, f, tmux, pid, alive, ec)`（tmux = tmux 会话名）。
 
-    「会话不在」分两种（字段口径与旧引擎一致）：
+    「会话不在」分两种：
       - 目录里连 `meta` 都没有 ⇒ `session_not_found`（从没起过，或已被空闲回收）；
-      - `meta` 在但 tmux 会话没了 ⇒ `session_dead`（在会话里敲了 `exit`、被人 `kill-session`、
-        或旧引擎遗留目录）——状态不可恢复，提示用 `kill` 清目录后重开。
+      - `meta` 在但 tmux 会话没了 ⇒ `session_dead`（在会话里敲了 `exit`、被人 `kill-session`）
+        ——状态不可恢复，提示用 `kill` 清目录后重开。
     """
     if not _session_check_name(args.json, name):
         return None, None, None, None, None, False, 2
@@ -1175,8 +1162,6 @@ def _session_load(args, root, name, need_alive=True):
         sftp = open_sftp(client)
         try:
             has_meta = _session_remote_exists(sftp, f["meta"])
-            legacy = (_session_remote_exists(sftp, f["pid"])
-                      or _session_remote_exists(sftp, f["fifo"]))
         finally:
             try:
                 sftp.close()
@@ -1193,13 +1178,10 @@ def _session_load(args, root, name, need_alive=True):
                               "ttl_default_seconds": _SESSION_TTL_DEFAULT})
             close_all(client)
             return None, None, None, None, None, False, 2
-        msg = ("会话 %r 的 tmux 会话已消失（在会话里 `exit`、被人 kill-session，或宿主重启）："
-               "会话状态不可恢复——用 pyaissh session kill --name %s 清理残留目录后重新 start"
-               % (name, name))
-        if legacy:
-            msg += ("。（检测到**旧引擎遗留目录**：sess.pid/in 但没有 tmux 会话——"
-                    "这台机器上的会话是 tmux 引擎迁移之前起的，pyaissh 不接管它）")
-        emit_error(args.json, "session_dead", msg,
+        emit_error(args.json, "session_dead",
+                   "会话 %r 的 tmux 会话已消失（在会话里 `exit`、被人 kill-session，或宿主重启）："
+                   "会话状态不可恢复——用 pyaissh session kill --name %s 清理残留目录后重新 start"
+                   % (name, name),
                    extra={"session": name, "dir": f["dir"], "pid": None})
         close_all(client)
         return None, None, None, None, None, False, 2
@@ -1557,7 +1539,7 @@ def cmd_session_ctrl_c(args):
         if n:
             # 被中断的命令**不会自己产出哨兵**（bash 收到 SIGINT 后丢弃当前命令行，实测两次），
             # 于是正等着 `read --wait-rc --token X` 的调用方会一直 running。这里**代它补一条**
-            # 哨兵（退出码与信号一致：INT→130、KILL→137），让等待方收敛——保持旧引擎的可用体感。
+            # 哨兵（退出码与信号一致：INT→130、KILL→137），让正在等它的 read --wait-rc 能收敛。
             # 只对 `last.token`（最近一条命令）补：中断的几乎总是它。
             code = 137 if args.force else 130
             try:
@@ -1709,10 +1691,6 @@ def cmd_session_list(args):
                 else:
                     s.setdefault("pid", None)
                     s.setdefault("shell_pid", None)
-                    # 旧引擎遗留（sess.pid/in 还在）与"正常退出"要分开说，处置建议不同
-                    if (_session_remote_exists(sftp, f["pid"])
-                            or _session_remote_exists(sftp, f["fifo"])):
-                        s["legacy_engine"] = True
                 # 空闲回收进度（AI 据此判断"还能放多久"）：ttl - idle 就是剩余保活时间
                 if s.get("ttl_seconds") and s.get("idle_seconds") is not None:
                     s["expires_in_seconds"] = max(0, s["ttl_seconds"] - s["idle_seconds"])
@@ -1752,14 +1730,7 @@ def cmd_session_list(args):
                         "会话 %s 即将因空闲被回收（剩余 %s；想留住就发一条命令或 --ttl 0 重开）"
                         % (",".join("%s(%s)" % (s["session"], _fmt_age(s["expires_in_seconds"]))
                                     for s in near), _fmt_age(near[0]["expires_in_seconds"])))
-                legacy = [s["session"] for s in sessions if s.get("legacy_engine")]
-                if legacy:
-                    result["warnings"].append(
-                        "会话 %s 的目录是**旧引擎（tmux 迁移之前）遗留**的（有 sess.pid/in 却没有 "
-                        "tmux 会话）：pyaissh 不接管它，用 session kill 清掉后重新 start"
-                        % ",".join(legacy))
-                dead = [s["session"] for s in sessions
-                        if s.get("status") == "dead" and not s.get("legacy_engine")]
+                dead = [s["session"] for s in sessions if s.get("status") == "dead"]
                 if dead:
                     result["warnings"].append(
                         "会话 %s 的 tmux 会话已不存在（在会话里 `exit` 过？）："
@@ -1818,13 +1789,11 @@ def cmd_session_kill(args):
                     for e in sftp.listdir_attr(root):
                         if not _SESSION_NAME_RE.match(e.filename):
                             continue
-                        # 只认"看起来真是会话"的目录（tmux 名文件 / meta / 旧引擎 sess.pid 或 FIFO），
+                        # 只认"看起来真是会话"的目录（有 tmux 名文件或 meta），
                         # 避免把 --session-dir 指向共享目录时误删别人的东西
                         f = _session_files(root, e.filename)
                         if (_session_remote_exists(sftp, f["tmux"])
-                                or _session_remote_exists(sftp, f["meta"])
-                                or _session_remote_exists(sftp, f["pid"])
-                                or _session_remote_exists(sftp, f["fifo"])):
+                                or _session_remote_exists(sftp, f["meta"])):
                             names.append(e.filename)
                 except IOError:
                     names = []
@@ -1854,7 +1823,6 @@ def cmd_session_kill(args):
             swept = int(marks.get("SWEPT") or 0)
             roots = int(marks.get("ROOTS") or 0)
             had_dir = marks.get("HAD") == "1"
-            legacy = marks.get("LEGACY") == "1"
             entry = {"session": name, "swept": swept, "remaining": left, "roots": roots,
                      "dir": f["dir"],
                      "cleaned": (marks.get("CLEANED") == "1") and not args.keep_dir,
@@ -1863,12 +1831,7 @@ def cmd_session_kill(args):
                      "verified": bool(roots) and left == 0}
             if marks.get("KILLED") == "1":
                 entry["tmux_killed"] = True
-            if legacy:
-                entry["legacy_engine"] = True
-                entry["note"] = ("该目录来自**旧引擎（tmux 迁移之前）**：没有 tmux 会话可关，"
-                                 "只清理了目录；若疑似还有旧进程，请自查 "
-                                 "`ps -eo pid,args | grep -E 'script -qfc|pyaissh-sessions'`")
-            elif not roots and had_dir:
+            if not roots and had_dir:
                 entry["note"] = ("没拿到 pane pid（会话已先一步消失/被外部 kill）：无法核对进程树，"
                                  "按 tmux/会话语义应已无残留；如需自查："
                                  "`ps -eo pid,ppid,tty,args | grep pyaissh-sessions`")

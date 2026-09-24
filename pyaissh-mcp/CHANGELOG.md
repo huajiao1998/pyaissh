@@ -229,3 +229,5 @@
   （tpgid）、被中断那条命令的退出码哨兵不会出现、`no_pty` 标为**已废弃**（no-op + warning，恒
   `pty: true`）、`all=true` 不再扫孤儿（`orphans` 系列字段恒返回且恒空）。`README.md` 的工具表与
   「会话归属与退出清理」一节同步。
+- **补充（2026-09-24，收口）**：`no_pty` 参数从 schema 与映射里**整体删除**（CLI 侧 `--no-pty` 已删除，
+  传了会被 argparse 拒绝，不再是 no-op）；描述里"旧引擎遗留目录/`legacy_engine`"的表述一并去掉。

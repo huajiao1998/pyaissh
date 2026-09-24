@@ -524,8 +524,6 @@ def build_parser():
     ssp.add_argument("--session-dir", dest="session_dir", help="会话根目录（默认 %s）"
                      % DEFAULT_SESSION_DIR)
     ssp.add_argument("--cols", type=_positive_int, default=200, help="PTY 列宽（默认 200，防折行）")
-    ssp.add_argument("--no-pty", dest="no_pty", action="store_true",
-                     help="已废弃（tmux 引擎永远提供 PTY）：保留参数，仅回一条 warning")
     ssp.add_argument("--ttl", help="空闲回收秒数（默认 600=10 分钟；可写 30s/10m/2h；0 = 关闭回收）；"
                                    "也可用环境变量 PYAISSH_SESSION_TTL")
     ssp.add_argument("--attach", action="store_true",

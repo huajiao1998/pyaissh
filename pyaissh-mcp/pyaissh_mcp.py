@@ -453,7 +453,6 @@ TOOLS = [
                 "all": {"type": "boolean", "description": "kill：结束该主机全部会话（含会话目录已被外部删掉、只剩 tmux 会话的）"},
                 "keep_dir": {"type": "boolean", "description": "kill：只杀进程、保留会话目录（便于事后看 out.log）"},
                 "cols": {"type": "integer", "description": "start：PTY 列宽（默认 200，防折行）"},
-                "no_pty": {"type": "boolean", "description": "start：**已废弃**（tmux 引擎永远提供 PTY）——保留参数，仅回一条 warning，结果恒 pty=true"},
                 "keep_ansi": {"type": "boolean", "description": "read：保留 ANSI 颜色码（默认剥离，便于解析）"},
                 "no_wait": {"type": "boolean", "description": "run：只发送不等待（等价 send，之后自己 read）"},
                 "ttl": {"type": "string", "description": "start：空闲回收秒数（默认 600=10 分钟；可写 30s/10m/2h；0 = 关闭）。规则：**提示符空闲（没有命令在跑）**且 TTL 内没有任何 pyaissh 交互（send/run/read/ctrl-c/keys）才回收（tmux 会话 + 目录）；list 不算交互。回收由会话子命令（send/run/read/ctrl-c/keys/list）入口的惰性扫 + 每主机一个 reaper（默认 300 秒一轮）触发（kill 不走惰性扫；list 不续期但会顺手扫；start 仅 ttl>0 时扫并拉起 reaper）"},
@@ -482,7 +481,7 @@ _FLAG_MAP = {
     "force": "--force", "job_dir": "--job-dir",
     # v0.3.0 常驻会话
     "name": "--name", "data": "--data", "raw": "--raw", "all": "--all", "keep_dir": "--keep-dir",
-    "cols": "--cols", "no_pty": "--no-pty", "keep_ansi": "--keep-ansi",
+    "cols": "--cols", "keep_ansi": "--keep-ansi",
     "session_dir": "--session-dir", "keep_crlf": "--keep-crlf", "token": "--token",
     "no_wait": "--no-wait",
     # v0.3.1 会话空闲回收（ttl）+ 接上旧会话（attach）

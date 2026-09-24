@@ -53,7 +53,7 @@
 | `tmux_failed` | tmux **server/socket 起不来**（`TMUX_TMPDIR`/socket 目录不可写、`new-session` 非零退出），或 `tmux -V` 输出无法解析（退出码 255、**`retryable=true`**） | 看 `message`/`tmux_version`：确认远端 `/tmp/tmux-<uid>`（或 `TMUX_TMPDIR` 指向的目录）可写、磁盘未满，然后重试；持续失败先用 `exec` 手工跑一次 `tmux -L pyaissh -f /dev/null ls` 看真实报错 |
 | `session_exists` | `session start` 时同名会话已在运行（退出码 2） | 换 `--name`，或先 `session kill --name <名>`；`message` 里带现有 pid |
 | `session_not_found` | `session read/send/run/ctrl-c/keys` 找不到会话（退出码 2）：会话目录里连 `meta` 都没有（从没起过，或**已被空闲回收**） | 会话名拼错、已被 `kill` 清理或空闲回收，或 `--session-dir` 不一致；用 `session list` 看现有会话；先 `session start`（要接上还活着的旧会话加 `--attach`） |
-| `session_dead` | 会话目录还在但 **tmux 会话已消失**（退出码 2）：会话里 `exit`/`Ctrl-D`、被人 `kill-session`、宿主重启，或该目录是**旧引擎（tmux 迁移之前）遗留**（有 `sess.pid`/`in` 却没有对应的 tmux 会话） | 会话状态**不可恢复**：`session kill` 清掉残留目录后重新 `start`（`list` 里这类会话是 `dead`，旧引擎遗留目录还带 `legacy_engine: true`）；tmux 引擎**不接管**旧目录 |
+| `session_dead` | 会话目录还在但 **tmux 会话已消失**（退出码 2）：会话里 `exit`/`Ctrl-D`、被人 `kill-session`、宿主重启 | 会话状态**不可恢复**：`session kill` 清掉残留目录后重新 `start`（`list` 里这类会话是 `dead`）；没有 `tmux` 名文件的陌生目录一律不碰（reaper/惰性扫都跳过） |
 | `session_failed` | `session start` 失败（退出码 255）：会话目录建不出来（权限/磁盘）、`new-session` 之后拿不到 pane pid、初始化载荷迟迟不就绪 | 看 `message`/`stderr`：确认会话根目录（默认 `/tmp/pyaissh-sessions`，或 `--session-dir`）可写、远端有 `bash`；tmux 自身的缺失/版本过低/server 起不来会分别报 `tmux_missing`/`tmux_unsupported`/`tmux_failed`，不归本类 |
 | `send_failed` | `session send`/`run` 的命令没能灌进会话（退出码 255）：tmux `load-buffer`/`paste-buffer` 失败（会话可能刚好退出） | 用 `session list` 确认会话仍是 `running`，必要时 `session start` 重开；持续失败先 `exec` 手工跑一次 `tmux -L pyaissh -f /dev/null ls` 看 server 是否还在 |
 | `keys_failed` | `session keys` 的按键/文本没能灌进会话（退出码 255）：同 `send_failed`（tmux 缓冲区失败、会话可能刚退出） | 同上；另确认 `--data`/`--cmd-file` 至少给了一个 |

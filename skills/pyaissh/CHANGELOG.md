@@ -928,10 +928,10 @@
 - **会话目录内容变化**：**去掉** `in`(FIFO)/`err.log`/`sess.pid`/`bash.pid`/`watch.sh`/`watch.pid`/
   `wd.fifo`/`wd.log`，**保留** `out.log`/`meta`/`beat`/`last.token`，**新增** `tmux`
   （内容 = tmux 会话名，给 reaper 与人类 attach 用）；根目录新增 `reap.sh` / `.reaper.pid` / `.reaper.log`。
-- **升级路径**：旧引擎遗留目录（有 `sess.pid`/`in` 但没有同名 tmux 会话）**不自动接管**——
-  `run/send/read` 报 `session_dead`（message 说明是旧引擎遗留），`list` 标 `legacy_engine: true`
+- **升级路径**：tmux 迁移之前遗留的会话目录**不再识别**（没有 `tmux` 名文件的目录一律当陌生目录）——
+  `run/send/read` 按 `meta` 在不在分别报 `session_dead`/`session_not_found`
   并给 warning，用 `session kill` 清目录后重新 `start`。
-- **既知行为变化（不是 bug）**：① `--no-pty` 变 no-op + warning，结果恒 `pty: true`；
+- **既知行为变化（不是 bug）**：① `--no-pty` **参数已删除**（传了被 argparse 拒绝），结果恒 `pty: true`；
   ② 会话内 `TERM` = `tmux-256color`（tmux 强制决定，旧引擎继承 SSH 通道环境、常为空/dumb）；
   ③ `kill` 结果**总是**含 `orphans: []`/`orphans_total: 0`/`orphan_remaining_total: 0`（旧：空时省略）；
   ④ 空闲回收从"服务器端准点"变为"惰性扫 + 5 分钟一轮的 reaper"；⑤ 会话目录文件集变化（见上）；
@@ -955,3 +955,9 @@
   「进程与目录结构」「已知边界」）；`SKILL.md` 会话段、`pyaissh-mcp/pyaissh_mcp.py` 的
   `pyaissh_session` 工具描述与参数说明、`pyaissh-mcp/README.md` 同步更新（FIFO/`script`/看门狗/
   非 PTY 降级之类的旧措辞全部清掉）。
+- **兼容包袱清理（同日收口）**：既然只有两台测试机用过旧引擎、且它们已无遗留目录，删掉全部旧引擎兼容面——
+  `_session_files` 的遗留路径键（`in`/`sess.pid`/`bash.pid`/`watch.pid`/`err.log`）、kill 模板的 `LEGACY`
+  探测与 `legacy_engine` 字段、`list`/`_session_load` 的"旧引擎遗留目录"分支、清洗里对 util-linux
+  `script` 头尾行的过滤、`_session_info` 的 beat `st_mtime` 兜底；**并把 `--no-pty` 参数整体删除**
+  （传了会被 argparse 拒绝，不再 no-op）。`fifo` 作为**契约字段**保留（恒 `null`），字段集不变量不变。
+  净减：session 域 1935 → 1898 行（−37），制品 427 → 423 KB；行为面唯一变化是"陌生目录不再被特别标注"。
