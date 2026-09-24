@@ -171,13 +171,6 @@ t4   干完活，最后一条命令       ← 到期 = t4+TTL；之后没有任�
 160 MB（看门狗部分）+ 每 15 秒约 50 次 fork；在内存吃紧的小机器上，**内存是限制项，不是 CPU**。
 不需要回收就 `--ttl 0`，看门狗连进程带内存一起没有（会话回落到 ~8 MB）。
 
-**支持的系统**：看门狗脚本是 `#!/bin/bash`，依赖 bash ≥4.4（`read -t`／`-u fd` 早在 bash 2.04 就有；
-`$EPOCHSECONDS` 需要 bash≥5，缺了自动回落 `date +%s`）、util-linux 的 `script -qfc`、GNU coreutils
-（`mkfifo`/`stat -c`/`setsid`/`nohup`/`timeout`）、procps-ng（`pgrep -P`/`ps -eo`）与任一 POSIX `awk`。
-已核实版本：Ubuntu 20.04/22.04/24.04 = bash 5.0/5.1/5.2，Debian 13 = 5.2.37（真机实测），
-Linux Mint 22.3 = 5.2.21，Fedora 43/44 = 5.3/5.3.9，Arch = 5.3.20，openSUSE Tumbleweed = 5.3.15、
-Leap 15.6 = 4.4。**Alpine/BusyBox 与 macOS/BSD 不在支持范围**（没有 GNU `stat -c`，`script`/`pgrep` 语义不同）。
-
 - 取值：`--ttl 600`（默认）／`--ttl 30s`／`--ttl 10m`／`--ttl 2h`／`--ttl 0`（关闭回收）；
   环境变量 `PYAISSH_SESSION_TTL` 改默认值。检查周期 15 秒 ⇒ 实际回收落在 `TTL ~ TTL+15s`。
 - 回收动作与 `kill` 同款：**自证进程树闭包**（argv 含本会话目录才认，防 pid 回收误杀）→ 先删目录 → TERM → KILL；

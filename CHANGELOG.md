@@ -818,3 +818,12 @@
   开销实测表（1 进程 3.2 MB、每检查点 1 次 fork、整会话 ≈12 MB）与新旧对比，并补一节
   **支持的系统**（bash/util-linux/coreutils/procps-ng/awk + 已核实的各发行版 bash 版本；
   Alpine/BusyBox 与 macOS/BSD 明确不在范围内）。
+
+### 文档：删掉刚加的「支持的系统」小节（v2.3.0）
+
+- 用户意见："主流的都支持，不用写支持矩阵"。已从 `docs/session.md` 删除该小节——
+  它本来也和同文档「边界与注意」里既有的**依赖**一条重复（`bash` + `mkfifo` 必需、
+  真 PTY 需要 util-linux `script`、缺失自动降级为非 PTY）。
+- 版本核实结论仍留在本轮 CHANGELOG 里备查（Ubuntu 20.04/22.04/24.04 = bash 5.0/5.1/5.2，
+  Debian 13 = 5.2.37 真机实测，Mint 22.3 = 5.2.21，Fedora 43/44 = 5.3/5.3.9，Arch = 5.3.20，
+  openSUSE Tumbleweed 5.3.15 / Leap 15.6 4.4），但**不再写进对外技能文档**以免啰嗦。
