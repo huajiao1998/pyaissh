@@ -2168,11 +2168,15 @@ def suite_live_session_bugs(s):
     _live_run(["session", "kill", tgt, "--name", name + "b1"], timeout=60)
 
     # B2（v2.4.0 收口）：`--no-pty` 参数已彻底删除（旧引擎的非 PTY 降级路径随之消失）——
-    #     传它必须被 argparse 当场拒绝（rc=2），不能静默忽略
+    #     传它必须被 argparse 当场拒绝（rc=2），不能静默忽略。
+    #     注意断言通道：具体错误走 **stdout 的结构化 JSON**（`error=bad_args` + `message` 里点明参数名），
+    #     stderr 只有 argparse 的 usage 行——所以判据看 JSON，不看 stderr。
     rc, jbnp, errnp = _live_run(["session", "start", tgt, "--name", name + "np", "--no-pty"],
                                 timeout=90)
-    s.check("B2 --no-pty 已被删除：argparse 直接拒绝（rc=2，不静默接受）",
-            rc == 2 and "no-pty" in (errnp or ""), "rc=%s stderr=%r" % (rc, (errnp or "")[-120:]))
+    s.check("B2 --no-pty 已被删除：rc=2 + stdout JSON 里点明参数名（不静默接受）",
+            rc == 2 and (jbnp or {}).get("error") == "bad_args"
+            and "no-pty" in ((jbnp or {}).get("message") or ""),
+            "rc=%s json=%r stderr=%r" % (rc, jbnp, (errnp or "")[-80:]))
     rc, jbnp2, _ = _live_run(["session", "start", tgt, "--name", name + "np"], timeout=90)
     s.check("B2 不带 --no-pty 的普通会话仍正常（pty=True + ready）",
             bool(jbnp2) and jbnp2.get("pty") is True and jbnp2.get("ready") is True,
