@@ -174,3 +174,47 @@
   **改完 CLI 记得同步 MCP 副本**
 - **真机验证数据**：MCP 离线 41 + 真机 **23** 全绿（新增 `B17a` run 拿 exit_code+输出、
   `B17b` run wait_rc 超时 → running 且 token 保留）
+
+## [0.3.1] - 2026-09-24
+
+### 新增：会话归属与退出清理（MCP 进程退出时自动收掉自己起的会话）
+
+- **背景**：CLI 路径没有"本地长命进程"可依附（每次调用一条新连接），会话只能显式 `kill`；
+  而 **MCP server 本身就是本地长命进程**——"本地这轮工作结束"（stdin EOF / 客户端关 stdio /
+  `SIGINT` / `SIGTERM`）正好是清理时机。
+- **实现**：进程内归属表 `_OWNED`（target → 会话名集合 + 最小认证参数，仅内存）→
+  `pyaissh_session` 的 `start` 成功才登记、`kill`（含 `all=true`）同步注销；
+  `main()` 的 `finally` 里、**关连接池之前**跑 `cleanup_owned_sessions()`
+  （逐会话发 `session kill --name X` 并透传原认证参数；best-effort，超预算跳过，
+  失败只写 stderr，绝不拖住退出；预算 `PYAISSH_MCP_EXIT_CLEANUP_TIMEOUT`，默认 10s，`<=0` 关闭）。
+- **安全边界**：只清**本进程自己起的**会话——`start` 回 `session_exists` 时不登记，
+  别的 agent / 别的 MCP 实例 / 用 CLI 直接起的会话**一律不碰**（宁可留下也不误杀）。
+- **覆盖不到**：`SIGKILL`、断电、宿主崩溃（`finally` 不执行）——那时靠 CLI 侧
+  `session list`（`age_seconds`/`idle_seconds`/`expires_in_seconds`）与 `session kill all=true` 兜底。
+- `SERVER_VERSION` 0.3.0 → **0.3.1**；`pyaissh_session` 工具描述与 `README.md` 增该行为说明。
+
+### 跟随 CLI v2.3.0：空闲回收 `ttl` 与接上旧会话 `attach`
+
+- 新增两个参数（`_FLAG_MAP` 透传）：**`ttl`**（start：空闲回收秒数，默认 600；可写 `30s`/`10m`/`2h`；
+  `0` = 关闭；规则是"**提示符空闲且 TTL 内无任何交互**才回收"，有命令在跑不回收，
+  `send/run/read/ctrl-c/keys` 都续期、`list` 不算）与 **`attach`**（start：同名会话还活着就接上，
+  返回 `attached=true` + pid/age/idle，不存在或被回收才新建）。
+- 工具描述同步更新：`list` 会回 `age_seconds`/`log_bytes`/`expires_in_seconds`；`kill` 结果带
+  `swept`/`remaining`/`verified`（不会无声误报"清干净"），`all=true` 还会**按 argv 自证身份扫孤儿**
+  （目录已被删、只剩进程的会话），且不误杀"只是提到路径"的旁观进程。
+- **固定副本**：随 CLI v2.3.0 全量同步（`sync_check.py` 13 个镜像文件逐一 md5 校验）。
+
+### 测试
+
+- 离线 `test/test_offline.py` 41 → **49 PASS**：新增 T19a~T19h 覆盖归属登记去重 / 只留认证参数 /
+  按名注销 / 清理 argv 与认证透传 / 清理后清表 / 失败记 failed 不抛异常 / `budget<=0` 关闭 / 空表 no-op。
+- 真机新增 `test/test_live_session.py`（**12 PASS / 0 FAIL**）：MCP 起会话 → 关闭 MCP（等价本地 agent
+  会话结束）→ 会话与目录都被清掉；**同时用 CLI 直接起的会话不受影响**（S2 安全断言）；
+  显式 `kill` 过的会话退出时不重复清（S1d）；收尾零残留目录与零 `script -qfc` 进程（S4b）。
+- CLI 侧真机 `live_session` 同步扩到 **62 PASS / 0 FAIL**（含会话空闲回收 T1~T3、单进程看门狗 W1/W2、
+  孤儿扫描 O1a~O1d 等，详见 CLI CHANGELOG）。
+
+### 顺带
+
+- 修一处自身失误：给工具描述追加"不会无声误报「清干净」"时误用了半角双引号，导致 `pyaissh_mcp.py`
+  语法错误（`py_compile` 不过、离线套件直接 EOF 失败）——已改为 `「」` 并补了 `py_compile` 习惯。
