@@ -961,6 +961,10 @@
   `sess.pid`/`in` ⇒ `session_not_found`，已实测）；② `log_recreated` 明确为 **`warnings[]` 文本 +
   stderr WARN**（不是独立 JSON 字段）；③ reaper 自退/被 `kill` 停掉时顺手删 `reap.sh` 与 `.reaper.pid`
   （下次 `start` 重写），根目录只留 `.reaper.log` 台账。
+- **技能包打包修复（同日）**：`skills/pyaissh/pyaissh` 在 git 里一直是 `100644`（无执行位），
+  历届 release zip 里 mode=0 ⇒ Linux 上 `./pyaissh` 报 `Permission denied`（实测 v2.2.4 与 v2.4.0 首包
+  都一样）。现在 git 里标为 `100755`，重打包的 zip 带 `0o755`；同时统一 **LF** 行尾（旧 zip 是 CRLF，
+  直接执行会 `bad interpreter`）。主调用路径 `python3 pyaissh.py` 不受影响。
 - **`fifo` 字段删除（同日）**：`session start` 不再返回旧引擎遗留的 `fifo`（曾经恒 `null`，只为迁移期
   字段集不变）；契约基线 `tests/contract/session_contract_v2.json` 的 `start_created`/`start_attach`
   两个用例同步去掉该键，`docs/contract.md`/`docs/session.md` 的说明一并删除。迁移期的"字段集一字不变"
