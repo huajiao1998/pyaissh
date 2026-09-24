@@ -143,3 +143,25 @@ python3 pyaissh.py session kill root@1.2.3.4 --all               # 一次清掉�
 
 **本地侧永远是干净的**：每次 `pyaissh …` 都是短命客户端，不会因为远端有会话而占本地资源，
 也不会阻塞你继续用 `exec`——残留只在远端（几个进程 + `/tmp` 文件）。
+
+### 本地关机 / 断网会怎样（实测）
+
+**会话和"正在跑的命令"都留在远端，什么都不丢**——这正是 `setsid+nohup` 的目的。实测（v2.3.0）：
+`send 'cd /etc; sleep 20; echo AFTER_RECONNECT_OK; pwd'` 之后 **26 秒完全不连服务器**（等价本地关机），
+期间 `list` 仍报 `running`；连回来后 `read --wait-rc` 直接拿到 `status:done`、`exit_code:0`、
+输出里的 `AFTER_RECONNECT_OK` 与 `pwd=/etc`——**命令跑完了、退出码与输出在、`cd` 状态也在**。
+所以"本地关机"不是问题；问题是**会话不会自己收尾**，下次上机记得 `list` 看一眼、`kill`（或 `kill --all`）。
+
+### 半截写入：本地在"写命令半途"断线（R2，已加固）
+
+pyaissh 是"把整条命令写进 FIFO"的：如果本地正好在写入中途关机/断网，远端 tty 的输入缓冲里会留下
+**没有换行的半行**。下一轮写入若直接接上，就会与这半行**串成同一行**——加固前的实测后果是
+`bash: syntax error near unexpected token`，且**哨兵永不出现**（`run` 只能回 running、拿不到退出码，
+AI 被卡住，只能人工 `ctrl-c`）。
+
+v2.3.0 起载荷**以换行开头**：先把那半行终结掉（它会被当**一条独立命令**执行——可能是半截命令，
+报错会留在 `out.log` 里，值得扫一眼），随后真正的命令在干净的输入行里解析，哨兵照常出现。
+加固后实测同一个场景：`exit_code: 0`、输出 `PARTIAL_HALF\nSECOND_OK`。
+
+**遇到卡住怎么办**：`session ctrl-c`（清掉未提交的输入行 + 打断前台命令）后重发即可——
+实测 `ctrl-c` 之后重发命令 `exit_code: 0`、输出正常。

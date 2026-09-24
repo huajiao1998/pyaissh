@@ -490,13 +490,19 @@ def _session_payload_text(cmd, token, plain=False):
       降级模式的读取循环是**逐行 eval**，多行载荷会被拆成多段（`{` 单独一行直接 syntax error，
       哨兵永不出现 —— 实测 `--no-pty` 完全不可用）。base64 保证是**一行**，且 eval 在同一 shell
       里执行 ⇒ 状态保留 + 多行命令 + 长命令都不受限。
+
+    v2.3.0 加固（R2）：载荷**以换行开头**。本地如果在上一次写入的**半途**断线（关机/断网/被杀），
+    远端的 tty 行规程里会留下**没有换行的半行**；下一次写入会与它**串成同一行**——
+    实测后果是语法错误且**哨兵永不出现**（`run` 只能回 running/无 exit_code，AI 被卡住）。
+    前置一个换行先把那半行终结掉（它作为一条垃圾命令执行、报错留在 out.log），
+    之后真正的载荷在干净的输入行里解析 ⇒ 哨兵照常出现，AI 至少能拿到退出码并从输出看出异常。
     """
     body = cmd.rstrip("\n")
     if plain:
         b64 = base64.b64encode(body.encode("utf-8")).decode("ascii")
-        return "eval \"$(printf %%s '%s' | base64 -d)\"; echo \"%s%s__$?\"\n" % (
+        return "\neval \"$(printf %%s '%s' | base64 -d)\"; echo \"%s%s__$?\"\n" % (
             b64, SESSION_RC_PREFIX, token)
-    return "{\n%s\n}; echo \"%s%s__$?\"\n" % (body, SESSION_RC_PREFIX, token)
+    return "\n{\n%s\n}; echo \"%s%s__$?\"\n" % (body, SESSION_RC_PREFIX, token)
 
 
 def _session_pty_mode(sftp, f):

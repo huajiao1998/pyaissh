@@ -421,7 +421,7 @@ TOOLS = [
     },
     {
         "name": "pyaissh_session",
-        "description": "常驻会话（真 PTY）：多步且带状态的远端操作——逐条喂命令、cd/export 跨命令保留、每条独立退出码、可中断执行中的命令、可应答交互提示。action 取值与用法：start（起会话，返回 pid/pty/ready）→ run（跑一条并等结果，一步一次调用；--wait-rc 超时回 status=running，--no-wait 只发送）→ read（读输出：offset 增量 / wait_rc 等这条结束拿 exit_code；载荷字段 stdout）→ ctrl-c（中断执行中的命令，会话不死；force=true 用 SIGKILL）→ keys（注入按键文本应答提示，data 支持 \\n \\r \\t \\xNN）→ list（列会话：status/age_seconds/log_bytes，挂了超过 24 小时会提醒）→ kill（结束会话，进程树全清+删目录；结果带 swept/remaining/verified，不会无声误报「清干净」）。**会话是 setsid+nohup 起的远端常驻进程、不会自己退出（SSH 断开照跑）——用完必须 kill**（或 all=true 清该主机全部会话）。典型：start → send 'cd /opt/app' → send 'git pull' → read wait_rc=45 → send 'make -j8' → （错了）ctrl-c → send 'make -j4' → kill。",
+        "description": "常驻会话（真 PTY）：多步且带状态的远端操作——逐条喂命令、cd/export 跨命令保留、每条独立退出码、可中断执行中的命令、可应答交互提示。action 取值与用法：start（起会话，返回 pid/pty/ready）→ run（跑一条并等结果，一步一次调用；--wait-rc 超时回 status=running，--no-wait 只发送）→ read（读输出：offset 增量 / wait_rc 等这条结束拿 exit_code；载荷字段 stdout）→ ctrl-c（中断执行中的命令，会话不死；force=true 用 SIGKILL）→ keys（注入按键文本应答提示，data 支持 \\n \\r \\t \\xNN）→ list（列会话：status/age_seconds/log_bytes，挂了超过 24 小时会提醒）→ kill（结束会话，进程树全清+删目录；结果带 swept/remaining/verified，不会无声误报「清干净」）。**会话是 setsid+nohup 起的远端常驻进程、不会自己退出（SSH 断开、本地关机/断网都不影响它和正在跑的命令——连回来 read wait_rc 能续拿 exit_code 与输出，cwd/变量还在）——用完必须 kill**（或 all=true 清该主机全部会话）。典型：start → send 'cd /opt/app' → send 'git pull' → read wait_rc=45 → send 'make -j8' → （错了）ctrl-c → send 'make -j4' → kill。",
         "inputSchema": {
             "type": "object",
             "properties": {

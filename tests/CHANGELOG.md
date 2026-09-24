@@ -320,3 +320,17 @@
   SWEPT 计数正确；自证闸门 reject/pass
 - 夹具坑记录：`kill -9` starter 后要 `sleep 0.5` 再查 `kill -0 bash.pid`，否则可能读到"还在"的假象；
   无根场景必须**先杀进程再删 pid 文件**，顺序反了会退化成"孤儿兜底"分支（用例就测不到无根路径）
+
+## [2026-09-24] v2.3.0 补六：本地关机 / 半截写入（R2）
+
+### 新增用例
+- unit_regression +1（93 PASS）：`_session_payload_text` 两种形态（PTY / plain）都以换行开头
+- live_session 43 → 44（**44 PASS / 0 FAIL**）：R2 —— 用 `keys --data 'echo PARTIAL_HALF'` 造出
+  "没有换行的半行"（等价本地写命令半途断线），随后 `run 'echo SECOND_OK'` 必须仍拿到
+  `exit_code=0` 且输出含 `SECOND_OK`（加固前实测 `exit_code=None` + syntax error，AI 卡在 running）
+### 说明
+- 另外用独立探针（不进套件，因为要 26 秒静默）实测："26 秒完全不连服务器"期间会话仍在跑，
+  连回来 `read --wait-rc` 能拿到 `status:done`/`exit_code:0`/输出/`cd` 状态 —— 这才是
+  "本地关机后服务器会不会留进程"的确切答案：**会留，而且任务会继续跑**
+- 夹具坑：`pgrep -f pyaissh-sessions` 会匹配到**执行该命令的 shell 自己**（命令行里含这个字符串），
+  判"零残留"要么用 `[p]yaissh-sessions` 括号转义，要么用 `ps | grep` —— 第一版探针因此误报 procs=1

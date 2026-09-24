@@ -352,8 +352,11 @@ def suite_unit_regression(s):
     # 哨兵包裹（真 bug 的护栏：哨兵必须与命令同一行被解析，否则被 read 吃掉）
     pl = m._session_payload_text("read -p 'x' V; echo $V", "abcd1234")
     s.check("命令与哨兵同一行（{ ...; }; echo 哨兵）",
-            pl.startswith("{\n") and "\n}; echo \"%sabcd1234__$?\"\n" % m.SESSION_RC_PREFIX in pl,
+            pl.startswith("\n{\n") and "\n}; echo \"%sabcd1234__$?\"\n" % m.SESSION_RC_PREFIX in pl,
             repr(pl))
+    s.check("载荷以换行开头（R2：先把上次断线残留的半行终结掉，防串行）",
+            pl.startswith("\n") and m._session_payload_text("echo x", "tk", plain=True).startswith("\n"),
+            repr(pl[:6]))
     s.check("多行命令也被包裹且状态留在同一 shell（用 {} 非 ()）",
             "(" not in pl.split("\n")[0] and "{\n" in pl)
     # 哨兵切分：只回"这条命令"的输出
@@ -1354,6 +1357,19 @@ def suite_live_session(s):
     s.check("闲置 35s 后会话仍可用（常驻不自退、无 idle 超时）",
             bool(_ji) and _ji.get("exit_code") == 0 and "IDLE_OK" in (_ji.get("stdout") or ""),
             repr(_ji)[:160])
+
+    # ④ R2 半行残留（本地在写命令半途断线）：tty 输入缓冲里留下没有换行的半行，
+    #    下一次写入会与它串成一行 → 旧版哨兵永不出现（run 卡在 running、拿不到退出码）。
+    #    加固后载荷以换行开头：先终结那半行，再执行新命令，退出码照常拿到。
+    rc, _jk2, _ = _live_run(["session", "keys", tgt, "--name", _idle, "--data",
+                             "echo PARTIAL_HALF"], timeout=60)
+    time.sleep(0.5)
+    rc, _jr2, _ = _live_run(["session", "run", tgt, "--name", _idle, "--cmd", "echo SECOND_OK",
+                             "--wait-rc", "15"], timeout=90)
+    _o2 = (_jr2 or {}).get("stdout") or ""
+    s.check("R2 半行残留后下一条命令仍拿得到退出码（不再卡 running）",
+            bool(_jr2) and _jr2.get("exit_code") == 0 and "SECOND_OK" in _o2,
+            "exit=%s 输出=%r" % ((_jr2 or {}).get("exit_code"), _o2[:120]))
     _live_run(["session", "kill", tgt, "--name", _idle], timeout=60)
 
     # ---- 真机复现的 5 个 bug 的回归护栏（v2.3.0；外部评审报的，逐个先复现再修）----

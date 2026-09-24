@@ -619,3 +619,26 @@
   仍 `swept>=2`、`remaining=0`、`verified=true`、无残留进程；**无根场景**（两个根都杀 + 删 pid 文件）
   回 `roots:0` + `verified:false` + warning（未获确认）而不再谎报；**闲置 35 秒**后会话仍能跑命令
   （不自退、无 idle 超时）。
+
+### 补充：会话"本地关机 / 半截写入"实测 + R2 加固（v2.3.0）
+
+- **用户追问**："任务做完本地直接关机，服务器上进程还会留着吗？" —— **会**（这正是 `setsid+nohup`
+  的设计目的），并做了两个针对性真机实验（测试机 A）：
+  - **无客户端 26 秒**（等价本地关机，期间一条连接都没有）：`list` 仍 `running`；连回来后
+    `read --wait-rc` 直接拿到 `status:done`、`exit_code:0`，输出含 `AFTER_RECONNECT_OK` 与 `pwd=/etc`
+    —— **命令跑完了、退出码与输出在、`cd` 状态也在**。"本地关机"不是问题，**会话不会自己收尾**才是。
+  - **卡住场景**：`kill` 后收尾核查 `ls -d /tmp/pyaissh-sessions/*` 为空、`pgrep -x script` 为 0；
+    注意 `pgrep -f pyaissh-sessions` 会**匹配到自查命令自己**（命令行里含该字符串）——判残留要用
+    `ps -eo pid,ppid,tty,args | grep '[p]yaissh-sessions'` 这类不自匹配的写法。
+- **R2：本地在"写命令半途"断线 → 会话被卡死（真机复现）**：pyaissh 把整条命令写进 FIFO，
+  本地若在写入中途关机/断网，远端 tty 输入缓冲会留下**没有换行的半行**；下一轮写入与它**串成一行**
+  ⇒ 实测 `bash: syntax error near unexpected token '}'`，且**哨兵永不出现**（`run` 只回 running、
+  拿不到 `exit_code`，AI 被卡住，只能人工 `ctrl-c`）。
+  修：**载荷以换行开头**（PTY 与非 PTY 两种形态都加）——先把那半行终结掉（它会被当**一条独立命令**
+  执行，可能是半截命令、报错留在 `out.log`，值得扫一眼），随后真正的命令在干净输入行里解析。
+  实测同一场景：修前 `exit_code=None` + syntax error；修后 `exit_code=0`、输出 `PARTIAL_HALF\nSECOND_OK`。
+- **文档**：`docs/session.md` 新增「本地关机 / 断网会怎样（实测）」与「半截写入（R2）」两节
+  （含 `ctrl-c` 恢复步骤）；SKILL 会话段补"本地关机/断网不影响它和正在跑的命令"。
+- **验证**：`--unit` +1（载荷以换行开头，93 PASS）；真机 `--session` **44 PASS / 0 FAIL**
+  （新增「R2 半行残留后下一条命令仍拿得到退出码」）；另跑独立探针脚本覆盖 26s 无客户端、
+  半行前后对比、收尾零残留三件事。
