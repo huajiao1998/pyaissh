@@ -231,3 +231,15 @@
   「会话归属与退出清理」一节同步。
 - **补充（2026-09-24，收口）**：`no_pty` 参数从 schema 与映射里**整体删除**（CLI 侧 `--no-pty` 已删除，
   传了会被 argparse 拒绝，不再是 no-op）；描述里"旧引擎遗留目录/`legacy_engine`"的表述一并去掉。
+
+## [0.3.2] - 2026-09-24
+
+**为什么升版本**：工具 **schema 变了**（`pyaissh_session` 的 `no_pty` 参数删除），不只是描述文本，
+所以要跟 `SERVER_VERSION` 一起标记。
+
+- `no_pty` 参数从 `pyaissh_session` 的 schema 与 argv 映射里**整体删除**：CLI 侧 `--no-pty` 已删除，
+  传了会被 argparse 拒绝（`error=bad_args`、`message` 点明参数名，rc=2）——不再 no-op 静默接受。
+- `pyaissh_session` 描述与参数说明同步 tmux 引擎：**远端需 tmux ≥ 3.0**（缺则 `tmux_missing` + 安装命令，
+  不自动安装）、空闲回收为**惰性扫 + 每主机一个 reaper**（`ttl`/`list` 字段口径不变）、`force=true`
+  用内核 `tpgid` 打前台进程组、被中断命令的哨兵由 ctrl-c 代补（INT→130 / force→137）。
+- `README.md` 工具表（6 → 7 个工具，含 `session`）与「会话归属与退出清理」一节同步。

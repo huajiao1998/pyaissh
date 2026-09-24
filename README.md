@@ -2,9 +2,9 @@
 
 **给 AI 用的结构化 SSH 工具 — A structured SSH tool built for AI agents**
 
-当前版本：**v2.3.0**（v2.1 系列五项反馈修复 + v2.2 后台作业：`exec --detach` + `pyaissh log` 长任务边跑边看 / 默认输出保留量 64KB 防宿主裁中段 + 截断 `next_action` / `exec --help` 场景参数表）
+当前版本：**v2.4.0**（**`session` 常驻会话换 tmux 引擎**：真 PTY + 前台作业与状态跨调用保持 + 长程任务断线续读，进程开销 3 会话 45.5MB → 23.2MB / 12 → 5 进程；另有 v2.2 后台作业 `exec --detach` + `pyaissh log`、64KB 输出保留 + 截断 `next_action`）
 
-**Current version: v2.3.0** — v2.1 feedback fixes plus v2.2 background jobs (`exec --detach` + `pyaissh log` for long tasks), 64KB default output retention with spill `next_action`, and a scenario→flags table in `exec --help`.
+**Current version: v2.4.0** — the `session` persistent shell now runs on **tmux**: real PTY, foreground job + state preserved across calls, long tasks survive disconnects and stay re-readable at ~half the process/memory cost (3 idle sessions: 45.5MB/12 procs → 23.2MB/5). Also includes v2.2 background jobs (`exec --detach` + `pyaissh log`).
 
 裸 `ssh` 给 AI 用有四个坑：
 
@@ -26,6 +26,8 @@ pyaissh upload root@1.2.3.4 --local big.bin --remote /tmp/big.bin --parallel 8  
 pyaissh download root@1.2.3.4 --remote big.tar.gz --local . --parallel 8
 pyaissh test root@1.2.3.4
 pyaissh ls root@1.2.3.4 --path /etc --long
+pyaissh session start root@1.2.3.4 --name work          # 常驻会话（真 PTY，需远端 tmux ≥ 3.0）
+pyaissh session run   root@1.2.3.4 --name work --cmd 'cd /opt/app && make -j8' --wait-rc 30
 ```
 
 ## 为什么给 AI 用 / Why for AI
@@ -36,6 +38,7 @@ pyaissh ls root@1.2.3.4 --path /etc --long
 | 🔍 `--field` 字段提取 | `--field stdout,-stderr` 直接消费单字段（裸值到 stdout/stderr，多字段每行一个）——省去 `json.loads` 样板；工具错误仍完整 JSON | Field extraction: consume one field at a time without JSON boilerplate; tool errors still return full JSON |
 | ⚙️ `--sudo` 提权 | 普通用户登录 + `--sudo` 提权执行（`--sudo-password` / `PYAISSH_SUDO_PASSWORD`；无密码自动免密探测），命令整链提权 | Sudo elevation for normal-user logins (password via flag/env; NOPASSWD auto-detected) |
 | 🛡 防挂死 | 三重超时（静默/总时长/看门狗）——AI 调它永远不会卡死 | Triple timeout protection — never hangs |
+| 🖥 常驻会话（真 PTY）| `session`：远端常驻真 PTY shell——`cd`/`export`/函数跨调用保持，**前台命令在 SSH 断开后继续跑**；断线回来 `read --wait-rc` 接着拿退出码与输出；可 `ctrl-c` 中断、可 `keys` 应答交互提示、可喂多步长任务（引擎=tmux，远端需 tmux ≥ 3.0）| Persistent session: real PTY, state + foreground job preserved across calls and disconnects, interruptible, can answer interactive prompts |
 | 🔄 可靠传输 | `.part` 原子写 + `--resume` 断点续传 + **并行分片下载/上传**（`--parallel 1-8`）+ `file_list` 断点重试 | Atomic transfer + resumable upload/download + **parallel-sharded upload & download** + retryable file lists |
 | 🔋 零 token 传输 | 文件内容从不回传 JSON——AI 只消费元数据，大文件不烧上下文 | Zero-token transfer: file content never enters the LLM context |
 | 🔤 `--encoding` | exec/test 输出按指定字符集解码（如 GBK）——处理非 UTF-8 服务器 | Specify output decoding charset (e.g. GBK) for non-UTF-8 servers |
@@ -115,6 +118,28 @@ pyaissh download root@10.0.0.1 --remote /var/log/big.log --local . --resume   # 
 # 5. 中断/失败重试：错误 JSON 的 retryable + file_list 精确续传，md5 复核
 ```
 
+## 常驻会话：真 PTY + 长程任务 / Persistent session (real PTY, long-running)
+
+`exec` 是"一条命令一次调用"，**无状态**；需要多步、要保留状态、要跑长任务、要中途改主意时用 `session`：
+
+```bash
+pyaissh session start root@1.2.3.4 --name work --ttl 10m     # 起会话（返回 pid/pty/log；空闲 10 分钟自动回收）
+pyaissh session run   root@1.2.3.4 --name work --cmd 'cd /opt/app && git pull' --wait-rc 60
+pyaissh session run   root@1.2.3.4 --name work --cmd 'make -j8' --wait-rc 5    # 超时回 status=running（状态还在）
+pyaissh session read  root@1.2.3.4 --name work --offset <next_offset>          # 增量读输出（字节级 offset）
+pyaissh session ctrl-c root@1.2.3.4 --name work                               # 中断正在跑的命令（会话不死）
+pyaissh session keys  root@1.2.3.4 --name work --data 'y\n'                   # 应答 y/n、密码等交互提示
+pyaissh session kill  root@1.2.3.4 --name work                                # 收尾（tmux 会话 + 进程树 + 目录）
+```
+
+- **真 PTY**：`tty` 真分配（`test -t 0` 为真），能跑需要 TTY 的程序、能应答 `read -p` 这类提示；每条命令**独立退出码**。
+- **前台保持**：会话由远端 tmux 常驻，**不会被 SSH 断开/本地关机带走**——正在跑的命令继续跑，重连后 `read --wait-rc` 接着拿退出码与输出，`cd`/`export`/函数等状态原样还在。
+- **长程任务**：`run --no-wait`（或 `send`）+ 循环 `read --offset` 边跑边看；跑错了 `ctrl-c` 中止再发一条（同一条改对重发，上下文不变）；适合构建/部署/长时脚本。
+- **开销**：远端每主机只有 1 个 tmux server + 每会话 1 个 shell + 1 个 reaper（3 个空闲会话实测 **23.2MB / 5 进程**；旧实现 45.5MB / 12 进程）。空闲回收：提示符空闲且 TTL（默认 600s）内无交互就自动回收，`--ttl 0` 关闭。
+- **依赖**：远端需 **tmux ≥ 3.0**；没有会明确报 `tmux_missing` 并给出安装命令（不自动安装）——装不了的环境仍可用 `exec` / `exec --detach` 跑长任务。
+
+**Persistent session** — for multi-step work, state that must survive between calls, long-running jobs, and changing your mind mid-flight: real PTY (independent exit code per command), state and foreground job preserved across SSH disconnects, byte-level incremental output reads (`--offset`), `ctrl-c` to interrupt without killing the session, `keys` to answer prompts, and idle auto-reclaim (default 10 min, `--ttl 0` to disable). Requires **tmux ≥ 3.0** on the remote host; missing tmux is reported explicitly (`tmux_missing`) with install hints. Idle cost measured at **23.2MB / 5 processes for 3 sessions** (previous implementation: 45.5MB / 12).
+
 ## 文档 / Docs
 
 - 完整 SKILL 文档（含契约、错误类型、传输语义）：`skills/pyaissh/SKILL.md` + `skills/pyaissh/docs/`
@@ -133,11 +158,11 @@ Full skill docs: `skills/pyaissh/SKILL.md` + `skills/pyaissh/docs/`. Changelog: 
 
 ## MCP 适配层 / MCP adapter (`pyaissh-mcp/`)
 
-给支持 MCP 的智能体（Claude Desktop / Cursor / DSH 等）用：把 pyaissh 暴露为 6 个 MCP 工具——`pyaissh_test` / `exec` / `log` / `ls` / `upload` / `download`。JSON 传参彻底消灭 shell 引号问题；**会话式连接池**（exec/ls/log 复用连接，空闲 300s 自动淘汰）；**后台作业准流式**（`exec(detach=true)` → 循环 `log(offset=next_offset)` → `log(wait_rc)` → `log(kill,cleanup)`，长任务边跑边看）。
+给支持 MCP 的智能体（Claude Desktop / Cursor / DSH 等）用：把 pyaissh 暴露为 7 个 MCP 工具——`pyaissh_test` / `exec` / `log` / `ls` / `upload` / `download` / **`session`**（常驻会话：真 PTY + 多步状态 + 长程任务）。JSON 传参彻底消灭 shell 引号问题；**会话式连接池**（exec/ls/log 复用连接，空闲 300s 自动淘汰）；**后台作业准流式**（`exec(detach=true)` → 循环 `log(offset=next_offset)` → `log(wait_rc)` → `log(kill,cleanup)`，长任务边跑边看）。
 
 它是 pyaissh 的**薄适配层**：进程内直接调用与 CLI 逐字节一致的固定副本（`sync_check.py` 校验），对副本的全部干预只有两个 monkey-patch 点（`connect`/`close_all`），CLI 的超时/截断/错误分类/retryable 契约**零旁路零复制**；不实现任何 CLI 没有的 SSH 逻辑。凭据走同目录 `.env`（由 CLI 每次调用时读取；**不要**写进 MCP 客户端配置的 `env`——那会在 spawn 时把密码放进进程环境）。详见 [`pyaissh-mcp/README.md`](pyaissh-mcp/README.md)。
 
-**Adapter for MCP-capable agents** — exposes pyaissh as 6 MCP tools with JSON arguments (no shell-quoting bugs), a session-scoped connection pool, and quasi-streaming background jobs (`exec(detach=true)` + incremental `log`). It is a **thin adapter**: it calls a byte-identical pinned copy of the CLI in-process (two monkey-patch seams only) and duplicates no SSH logic. Credentials belong in `pyaissh-mcp/.env`, not in the client's `env` block.
+**Adapter for MCP-capable agents** — exposes pyaissh as 7 MCP tools (incl. `session`) with JSON arguments (no shell-quoting bugs), a session-scoped connection pool, and quasi-streaming background jobs (`exec(detach=true)` + incremental `log`). It is a **thin adapter**: it calls a byte-identical pinned copy of the CLI in-process (two monkey-patch seams only) and duplicates no SSH logic. Credentials belong in `pyaissh-mcp/.env`, not in the client's `env` block.
 
 ## 工程可信度 / Engineering rigor
 

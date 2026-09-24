@@ -58,7 +58,7 @@ import time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CLI_PATH = os.path.join(BASE_DIR, "pyaissh.py")
-SERVER_VERSION = "0.3.1"
+SERVER_VERSION = "0.3.2"
 SERVER_NAME = "pyaissh-mcp"
 
 SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
