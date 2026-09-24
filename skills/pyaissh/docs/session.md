@@ -125,6 +125,26 @@ pyaissh session kill  h --name work                       # 收尾（进程树�
 
 **什么算交互（会续期）**：`start`（含 `--attach`）、`send`、`run`、`read`、`ctrl-c`、`keys`；
 **`list` 不算**（看一眼不代表在用）。有命令在跑时看门狗每轮都续期，命令跑完后再从那一刻起算 TTL。
+实测（绝对时间戳，逐个命令核对 beat 是否前进）：`read / run / send / keys / ctrl-c / start --attach`
+**都续期**，`list` **不续期**（连续两次 `list` beat 都不动）。
+
+**计时口径（重要）**：TTL 是从**最后一次"续期交互"**算起的滑动窗口，不是从会话创建/首次使用算起。
+每次交互都把到期时间往后推 TTL：
+
+```
+t0   start                     ← beat=t0，到期 t0+TTL
+t1   run 'make'                ← beat=t1，到期 t1+TTL（重新计时）
+t2   （什么都不做，TTL 内）      ← 仍存活
+t3   read/run/send/...         ← beat=t3，到期 t3+TTL（再次重新计时）
+t4   干完活，最后一条命令       ← 到期 = t4+TTL；之后没有任何交互才会被回收
+```
+
+看门狗每 15 秒检查一次 ⇒ **实际回收落在"最后一次续期 + TTL" 到 "+15 秒"之间**。
+`list` 给出的 `expires_in_seconds = TTL - idle_seconds`；它显示 **0 只表示"下一个检查点就会被收"**，
+不是立刻消失（实测：`idle=22s / ttl=20s` 时仍是 `running`，下一次 tick 才回收）。
+
+**超过 TTL 才回来的后果**：会话已被回收 ⇒ `run/send/read` 报 `session_not_found`（提示"可能已被空闲回收"），
+`start --attach` 会当成不存在而**新建**（`attached: false`，cwd/变量丢失）；`--ttl 0` 可彻底关掉回收。
 
 - 取值：`--ttl 600`（默认）／`--ttl 30s`／`--ttl 10m`／`--ttl 2h`／`--ttl 0`（关闭回收）；
   环境变量 `PYAISSH_SESSION_TTL` 改默认值。检查周期 15 秒 ⇒ 实际回收落在 `TTL ~ TTL+15s`。
