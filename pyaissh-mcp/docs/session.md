@@ -173,13 +173,31 @@ python3 pyaissh.py session start root@1.2.3.4 --name work --attach    # 活着�
 python3 pyaissh.py session list root@1.2.3.4                     # 看有几个、挂了多久、多大、还剩多久
 python3 pyaissh.py session kill root@1.2.3.4 --name work         # 立刻结束（进程树 + 目录）
 python3 pyaissh.py session kill root@1.2.3.4 --name work --keep-dir   # 只杀进程、留日志
-python3 pyaissh.py session kill root@1.2.3.4 --all               # 一次清掉该主机全部会话
+python3 pyaissh.py session kill root@1.2.3.4 --all               # 一次清掉该主机全部会话（含 argv 扫到的孤儿）
 ```
 
-**已知边角**：如果会话目录被**手工 `rm -rf`** 掉，它的进程就失去了 pid 记录，而 `session kill --all`
-是按目录枚举会话的 ⇒ 那些孤儿它看不见（只能 `ps -eo pid,args | grep pyaissh-sessions` 手工收，
-或用空闲回收看门狗——它见到目录消失就自己退出，不会替你杀孤儿）。正常路径（`kill`、空闲回收、
-shell 自己退出后再 `kill`）都不会走到这个状态。
+**已知边角**：如果会话目录被**手工 `rm -rf`** 掉，它的进程就失去了 pid 记录 —— 逐目录枚举看不见它们，
+所以 `session kill --all`（或 `--name X`）会**额外按 argv 扫一遍孤儿**（见下），把这类残留收掉。
+
+### 孤儿兜底：`kill` 按 argv 自证身份扫一遍
+
+`session kill --all`（以及 `--name X`）在正常清理之后，会跑一次 `ps -eo pid=,args=`，挑出
+**目录已不在、但命令行里还带着会话路径**的会话进程并清掉（整棵进程树 TERM→KILL→校验，
+结果在 `orphans[]` 里，带 `via: "argv-scan"`/`kind`/`swept`/`remaining`/`verified`）。
+
+**只认"以会话身份出现"的进程**，避免误杀只是"提到路径"的东西（`tail -f …/out.log`、编辑器、
+备份脚本、以及 argv 里恰好带路径的旁观进程）。判定要同时满足：
+
+1. argv 里出现 `<会话根>/<名字>/`，且名字合法（防路径穿越）；
+2. argv 里含 `script -qfc`（PTY 包装）／`<会话根>/<名字>/in`（starter 的 FIFO 路径）／
+   `<会话根>/<名字>/watch.sh`（看门狗）之一；
+3. 该名字的目录**不在**（目录还在 ⇒ 走正常 kill 路径，不在这里重复处理）。
+
+真机用例里专门放了一个"argv 里带会话路径的旁观进程"当诱饵，断言它**不被杀**。
+
+**仍然找不到的**：如果 starter 与 `script` 都死了、只剩一个 `bash -i`，它的 argv 只有 `bash -i`
+（没有任何路径）⇒ 无法自证身份，工具**不会**碰它（宁可留下也不误杀）。这种残留只能靠
+`ps -eo pid,tty,args | grep bash` 人工判断，或远端重启。
 
 **本地侧永远是干净的**：每次 `pyaissh …` 都是短命客户端，不会因为远端有会话而占本地资源，
 也不会阻塞你继续用 `exec`——残留只在远端（几个进程 + `/tmp` 文件）。

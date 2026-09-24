@@ -358,3 +358,21 @@
   `bash -c 'sleep 60; :'`
 - 另一个真实边角（本次实验中亲手制造并记录）：手工 `rm -rf` 会话目录后，进程失去 pid 记录，
   `session kill --all` 按目录枚举 ⇒ 看不见这些孤儿（文档已写明，正常路径不会进入该状态）
+
+## [2026-09-24] v2.3.0 补八：`session kill` 按 argv 扫孤儿
+
+### 新增用例
+- unit_regression 102 → 108：`_session_orphan_candidates()` 合成 ps 输出矩阵（starter / `script -qfc` /
+  `watch.sh` 三种类型；`tail -f .../out.log` 与 argv 带路径的旁观进程**必须不入选**；目录还在的
+  会话不入选；`../etc` 这类路径穿越名字被拒）+ `_session_pid_kill_cmd()` 含闭包 awk 与 SWEPT/LEFT
+- live_session 52 → 56（**56 PASS / 0 FAIL**）：
+  - O1a `session start` 后**手工 `rm -rf` 会话目录**（进程失去 pid 记录），`kill --all` 必须按 argv 扫到
+  - O1b `orphan_remaining_total == 0` 且每条 `verified`
+  - O1c 事后远端无 `script -qfc` 包装、无 starter
+  - O1d **诱饵进程**（`setsid nohup bash -c 'sleep 120; :' <会话根>/<名字>/out.log`，argv 里带路径
+    但不是会话进程）仍活着 ⇒ 证明"只认以会话身份出现的进程"这条规则真的生效
+### 说明
+- 夹具坑（复用价值）：`bash -c 'sleep 120' <arg>` 会被 bash 做 exec 优化（连带丢掉 $0），
+  要让诱饵进程的 argv 保留路径必须写成 `bash -c 'sleep 120; :' <arg>`
+- 该用例复现的正是"手工删目录 ⇒ 逐目录枚举失效"这一盲区；正常路径（kill / 空闲回收 /
+  shell 自己退出后再 kill / MCP 退出清理）都不会进入该状态

@@ -111,7 +111,7 @@ python3 pyaissh.py session kill  h --name work                   # 收尾（立�
 - **每条命令独立退出码**；**`cd`/`export`/函数跨命令保留**——**打错了就把那条命令改对再发一遍**（同一条重试）：像人打错文件名那样，报错 → 改对 → 重发 → 成功，上下文与上次完全一致
 - `run --wait-rc` 超时回 `status:"running"`（带 `token`，可 `read --wait-rc` 续等或 `ctrl-c` 中断）；`read` 载荷字段 `stdout`（合并流，已清洗 CR/ANSI/哨兵行）、`status`(`done`|`running`)、`exit_code`、`next_offset`
 - 子命令 `start/run/send/read/ctrl-c/keys/list/kill`；真 PTY 需 util-linux `script`（缺则自动降级为非 PTY）。**实现细节、实测坑与边界 → `docs/session.md`**
-- **用完必须 `kill`（或让它自己到期）**：会话是 `setsid+nohup` 的**远端常驻进程，不会自己退出**（SSH 断开照跑，**本地关机/断网也不影响它和正在跑的命令**——回头 `read --wait-rc` 能续拿 `exit_code` 与输出，cwd/变量都还在）。**空闲回收**：提示符空闲（没有命令在跑）且 `--ttl`（默认 600s）内没有任何交互（send/run/read/ctrl-c/keys）就自动回收（进程+目录），`--ttl 0` 关闭；也可以 `kill` 立刻结束（默认连目录删，`--keep-dir` 留日志，`--all` 清该主机全部）；`start --attach` 接上还活着的同名会话（状态全保留，否则新建）。`list` 给 `age_seconds`/`log_bytes`/`expires_in_seconds`。清理是**进程树闭包 + `verified` 字段**（不会无声误报"清干净"）
+- **用完必须 `kill`（或让它自己到期）**：会话是 `setsid+nohup` 的**远端常驻进程，不会自己退出**（SSH 断开照跑，**本地关机/断网也不影响它和正在跑的命令**——回头 `read --wait-rc` 能续拿 `exit_code` 与输出，cwd/变量都还在）。**空闲回收**：提示符空闲（没有命令在跑）且 `--ttl`（默认 600s）内没有任何交互（send/run/read/ctrl-c/keys）就自动回收（进程+目录），`--ttl 0` 关闭；也可以 `kill` 立刻结束（默认连目录删，`--keep-dir` 留日志，`--all` 清该主机全部 + **按 argv 收掉"目录已删、只剩进程"的孤儿**）；`start --attach` 接上还活着的同名会话（状态全保留，否则新建）。`list` 给 `age_seconds`/`log_bytes`/`expires_in_seconds`。清理是**进程树闭包 + `verified` 字段**（不会无声误报"清干净"）
 
 ### ls — 列远程目录
 ```bash

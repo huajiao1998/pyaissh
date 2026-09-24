@@ -606,7 +606,8 @@ def build_parser():
                                     "只按 sess.pid 会在 starter 已被 OOM/外力杀掉时漏掉 reparent 的孤儿")
     add_conn(ssz)
     ssz.add_argument("--name", help="会话名")
-    ssz.add_argument("--all", action="store_true", help="结束该主机全部会话")
+    ssz.add_argument("--all", action="store_true",
+                     help="结束该主机全部会话；并**按 argv 扫描孤儿**（目录已被删、只剩进程的会话）")
     ssz.add_argument("--session-dir", dest="session_dir", help="会话根目录")
     ssz.add_argument("--keep-dir", dest="keep_dir", action="store_true",
                      help="保留会话目录（只杀进程，便于事后看 out.log）")

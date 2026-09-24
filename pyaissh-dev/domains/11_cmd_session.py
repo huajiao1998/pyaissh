@@ -356,6 +356,66 @@ def _session_kill_cmd(f, keep_dir=False):
                q(f["pid"]), q(f["bash"]), q(f["watch"]), rm))
 
 
+def _session_orphan_candidates(ps_text, root, live_dirs):
+    """从 `ps -eo pid=,args=` 输出里挑出"**目录已不在**、但 argv 里还带着会话路径"的会话进程。
+
+    纯函数（便于单测）。三条同时成立才算孤儿：
+      ① argv 里出现 `<root>/<名字>/`，且名字过 `_SESSION_NAME_RE`（防路径穿越/误判）；
+      ② **看起来真是会话进程**——含 `script -qfc`（PTY 包装）／`<root>/<名字>/in`（starter 的 FIFO
+         路径）／`<root>/<名字>/watch.sh`（空闲回收看门狗）之一。
+         ③ 该名字的目录**不在** `live_dirs` 里（目录还在 ⇒ 走正常 kill 路径，不在这里重复处理）。
+
+    为什么②不能省：argv 里"提到"会话路径的进程很多（人肉 `tail -f .../out.log`、编辑器、
+    备份脚本），只按路径匹配就会误杀无关进程——这正是自证原则的延伸（argv 必须**以会话身份**出现）。
+
+    返回 `[(pid, 名字, 类型)]`（pid 去重）。
+    """
+    pref = root.rstrip("/") + "/"
+    out, seen = [], set()
+    for line in (ps_text or "").splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        pid, args = int(parts[0]), parts[1]
+        if pid in seen or pref not in args:
+            continue
+        name = args.split(pref, 1)[1].split("/", 1)[0]
+        if not _SESSION_NAME_RE.match(name) or name in live_dirs:
+            continue
+        d = pref + name
+        if "script -qfc" in args:
+            kind = "pty-wrapper"
+        elif d + "/in" in args:
+            kind = "starter"
+        elif d + "/watch.sh" in args:
+            kind = "watchdog"
+        else:
+            continue            # 只是"提到"路径的无关进程：不动
+        seen.add(pid)
+        out.append((pid, name, kind))
+    return out
+
+
+def _session_pid_kill_cmd(pid):
+    """按给定 pid 的**进程树闭包** TERM→KILL（孤儿清理用）。
+
+    pid 已经由 argv 扫描自证过身份，所以这里不需要再判一遍；闭包是为了连带清掉
+    `script` 的 pty 子 shell 与它正在跑的命令（孤儿场景里这些正是残留主体）。
+    """
+    return ("SNAP=$(ps -eo pid=,ppid=); T=$(echo \"$SNAP\" | %s); "
+            "T=$(echo $T | tr ' ' '\\n' | sort -u -n | tr '\\n' ' '); "
+            "SWEPT=$(echo $T | wc -w | tr -d ' '); LEFT=0; "
+            "if [ -n \"$T\" ]; then "
+            "kill -TERM $T 2>/dev/null; sleep 0.5; "
+            "K=\"\"; for p in $T; do kill -0 \"$p\" 2>/dev/null && K=\"$K $p\"; done; "
+            "[ -n \"$K\" ] && kill -KILL $K 2>/dev/null; sleep 0.3; "
+            "for p in $T; do kill -0 \"$p\" 2>/dev/null && LEFT=$((LEFT+1)); done; "
+            "fi; "
+            "echo \"__PYAISSH_SESS__SWEPT=$SWEPT\"; echo \"__PYAISSH_SESS__LEFT=$LEFT\"; "
+            "echo __PYAISSH_SESS__DONE=1"
+            % (_SESSION_TREE_AWK % str(int(pid))))
+
+
 def _session_clean_text(s, strip_ansi=True):
     """会话输出清洗：CRLF/CR → LF、去掉哨兵行与 script 头尾、可选剥 ANSI、去首尾空行。"""
     s = s.replace("\r\n", "\n").replace("\r", "\n")
@@ -1381,16 +1441,47 @@ def cmd_session_kill(args):
             results.append(entry)
             if rc != 0 and not marks:
                 results[-1]["note"] = (kerr or out or "")[-200:]
+
+        # ---- 按 argv 扫孤儿（v2.3.0）：目录已不在、但命令行里还带着会话路径的会话进程 ----
+        # 为什么需要：手工 `rm -rf` 掉会话目录（或半清理）后，进程失去 pid 记录，而上面的
+        # 逐目录枚举看不见它们 ⇒ 永久残留。这里按 argv **自证身份**（starter 的 FIFO 路径 /
+        # `script -qfc` / `watch.sh`）挑出来，再用"该 pid 的进程树闭包" TERM→KILL。
+        # 只为"目录已不在"的会话做（目录还在 = 正常路径已处理，避免重复杀与误杀）。
+        orphans = []
+        scan_rc, scan_out, _scan_err = _session_run(client, "ps -eo pid=,args=", timeout=20)
+        if scan_rc == 0:
+            _cands = _session_orphan_candidates(scan_out, root, set(names))
+            if args.name:
+                _cands = [c for c in _cands if c[1] == args.name]
+            for _pid, _nm, _kind in _cands:
+                rc2, out2, _ = _session_run(client, _session_pid_kill_cmd(_pid), timeout=30)
+                marks2 = dict(_SESSION_MARK_RE.findall(out2))
+                orphans.append({"session": _nm, "via": "argv-scan", "kind": _kind, "pid": _pid,
+                                "swept": int(marks2.get("SWEPT") or 0),
+                                "remaining": int(marks2.get("LEFT") or 0),
+                                "verified": marks2.get("DONE") == "1"
+                                            and int(marks2.get("LEFT") or 0) == 0})
+                if rc2 != 0 and not marks2:
+                    orphans[-1]["note"] = (out2 or "")[-160:]
         result = {"ok": True, "action": "session", "version": VERSION,
                   "sessions": results, "count": len(results),
                   "remaining_total": sum(r["remaining"] for r in results),
                   "verified_total": sum(1 for r in results if r.get("verified")),
                   "host": conn["host"], "user": conn["user"], "port": conn["port"],
                   "warnings": [], "duration_ms": int((time.time() - start) * 1000)}
+        if orphans:
+            result["orphans"] = orphans
+            result["orphans_total"] = len(orphans)
+            result["orphan_remaining_total"] = sum(o["remaining"] for o in orphans)
         if result["remaining_total"]:
             result["warnings"].append(
                 "仍有 %d 个进程属于被结束会话的进程树（可能正在退出或有 SIGKILL 也杀不掉的状态）"
                 % result["remaining_total"])
+        if orphans and result.get("orphan_remaining_total"):
+            result["warnings"].append(
+                "按 argv 扫到的 %d 个孤儿里仍有 %d 个进程没死（SIGKILL 也杀不掉的状态？）："
+                "ps -eo pid,args | grep pyaissh-sessions 自查"
+                % (len(orphans), result["orphan_remaining_total"]))
         unverified = [r["session"] for r in results if r.get("note") and not r.get("verified")]
         if unverified:
             result["warnings"].append(
@@ -1398,8 +1489,11 @@ def cmd_session_kill(args):
                 "按 note 里的 ps 自查，必要时手工 kill 或 pyaissh session kill --all"
                 % ",".join(unverified))
         result["next_action"] = ("会话已清理。重开：session start <target> --name <name>"
-                                 if names else "没有需要清理的会话")
-        _emit_result(args, result, header="[SESSION KILL] %d 个会话" % len(results))
+                                 if names else
+                                 ("已按 argv 清掉 %d 个孤儿会话进程" % len(orphans) if orphans
+                                  else "没有需要清理的会话"))
+        _emit_result(args, result, header="[SESSION KILL] %d 个会话%s"
+                     % (len(results), "，孤儿 %d" % len(orphans) if orphans else ""))
         return 0
     except KeyboardInterrupt:
         emit_error(args.json, "interrupted", _interrupt_msg())

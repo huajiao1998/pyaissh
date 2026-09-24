@@ -439,7 +439,7 @@ TOOLS = [
                 "wait_rc": {"type": "integer", "description": "read：阻塞等待某条命令结束最多 N 秒（MCP 层上限 45s），结束即返回 exit_code；不带 token 时等最近一次 send 的那条"},
                 "token": {"type": "string", "description": "read：只等这个 token 的哨兵（send 返回）"},
                 "force": {"type": "boolean", "description": "ctrl-c：用 SIGKILL（默认 SIGINT→自动升级 SIGTERM）"},
-                "all": {"type": "boolean", "description": "kill：结束该主机全部会话（与 name 二选一）"},
+                "all": {"type": "boolean", "description": "kill：结束该主机全部会话；并**按 argv 自证身份扫一遍孤儿**（目录已被删、只剩进程的会话）——只认 starter/`script -qfc`/watch.sh 这类会话进程，不误杀只是提到路径的旁观进程"},
                 "keep_dir": {"type": "boolean", "description": "kill：只杀进程、保留会话目录（便于事后看 out.log）"},
                 "cols": {"type": "integer", "description": "start：PTY 列宽（默认 200，防折行）"},
                 "no_pty": {"type": "boolean", "description": "start：强制非 PTY（无 tty，但状态与退出码照常）"},

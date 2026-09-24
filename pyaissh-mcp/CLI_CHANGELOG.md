@@ -710,3 +710,29 @@
 - **文档**：`docs/session.md` 生命周期一节改写（进程清单加看门狗、空闲回收规则、`--attach`、
   "本地关机"结论更新、保留"手工 rm -rf 目录后孤儿看不见"的已知边角）；SKILL 会话段与示例同步；
   MCP `pyaissh_session` 描述 + README 增 TTL/attach 说明。
+
+### 新增：`session kill` 按 argv 扫孤儿（v2.3.0）
+
+- **起因**：真机实验里发现（并亲手制造过）一个残留盲区——**手工 `rm -rf` 掉会话目录**后，进程失去
+  pid 记录，而 `session kill` 是**按目录枚举**的 ⇒ 那些进程永远看不见（真实发生过：一个 starter +
+  `script` + `bash -i` 留在机器上无人认领）。用户拍板：给 `kill --all` 加"按 argv 扫孤儿"。
+- **实现**：
+  - `kill --all`（以及 `kill --name X`）在正常清理之后跑一次 `ps -eo pid=,args=`，用**纯函数**
+    `_session_orphan_candidates()` 挑出候选；再对每个候选执行"该 pid 的**进程树闭包**"清理
+    （`_session_pid_kill_cmd()`，TERM → 宽限 → KILL → 校验），结果放进 `orphans[]`
+    （`via: "argv-scan"` / `kind` / `swept` / `remaining` / `verified`），并汇总
+    `orphans_total` / `orphan_remaining_total`。
+  - **自证身份**（避免误杀"只是提到路径"的进程）：同时满足三条才算孤儿——① argv 里出现
+    `<会话根>/<名字>/` 且名字合法（防路径穿越）；② argv 含 `script -qfc`／`<根>/<名字>/in`
+    （starter 的 FIFO）／`<根>/<名字>/watch.sh`（看门狗）之一；③ 该名字的目录**不在**
+    （目录还在就交给正常 kill 路径，不重复处理）。
+  - **仍然找不到的**（文档写明）：starter 与 `script` 都死、只剩 `bash -i` 时，它的 argv 只有
+    `bash -i`（无任何路径）⇒ 无法自证，工具不碰它（宁可留下也不误杀）。
+- **测试**：
+  - `--unit` 102 → **108 PASS**：合成 `ps` 输出覆盖 starter / pty 包装 / 看门狗三种类型 +
+    `tail -f .../out.log`、argv 带路径的旁观进程（**断言不杀**）+ 目录还在的会话（不在扫描范围）+
+    路径穿越名字（拒）；孤儿清理命令含闭包 awk 与 SWEPT/LEFT 回传。
+  - 真机 `--session` 52 → **56 PASS / 0 FAIL**：O1a 扫到孤儿（`orphans_total>=1`）、O1b 无残留且
+    `verified`、O1c 事后无 `script` 包装与 starter、**O1d 诱饵旁观进程仍活着**（不被误杀）。
+- **顺带修的自身失误**：加函数时误删了 `_session_clean_text()` 的 `def` 行（函数体被并进上一个函数，
+  语法合法、运行必炸）——被"重建 + 立即调用一次"的检查抓到，已修复并复验。

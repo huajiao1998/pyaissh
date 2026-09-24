@@ -378,6 +378,33 @@ def suite_unit_regression(s):
             "printf '%s %s %s %s\\n' \"$PTY\" 200 \"$(date +%s)\" 600" in _sc6, _sc6[-420:-260])
     s.check("start 命令：初始化 beat（否则首次判闲会把新会话当陈旧）",
             "touch '/tmp/pyaissh-sessions/demo/beat'" in _sc6, _sc6[:200])
+    # 孤儿扫描（kill --all 的 argv 自证）：只认"以会话身份出现"的进程，不误杀"提到路径"的进程
+    _ps = "\n".join([
+        "  101 root  bash -c umask 077; exec 9<>'/tmp/pyaissh-sessions/gone1/in'; sleep 9",
+        "  102 root  script -qfc stty -echo /tmp/pyaissh-sessions/gone1/out.log",
+        "  103 root  bash /tmp/pyaissh-sessions/gone2/watch.sh",
+        "  104 root  tail -f /tmp/pyaissh-sessions/gone1/out.log",
+        "  105 root  bash -c 'sleep 300' /tmp/pyaissh-sessions/gone1/out.log",
+        "  106 root  bash -c exec 9<>'/tmp/pyaissh-sessions/alive/in'; sleep 9",
+        "  107 root  bash -c exec 9<>'/tmp/pyaissh-sessions/../etc/in'; x",
+        "  108 root  ps -eo pid=,args=",
+    ])
+    _cands = m._session_orphan_candidates(_ps, "/tmp/pyaissh-sessions", {"alive"})
+    _kinds = dict((p, k) for p, _n, k in _cands)
+    s.check("孤儿扫描：认出 starter/pty 包装/看门狗（目录已不在的那些）",
+            sorted(p for p, _n, _k in _cands) == [101, 102, 103], repr(_cands))
+    s.check("孤儿扫描：类型标注正确",
+            _kinds.get(101) == "starter" and _kinds.get(102) == "pty-wrapper"
+            and _kinds.get(103) == "watchdog", repr(_kinds))
+    s.check("孤儿扫描：不误杀「只是提到路径」的进程（tail / argv 里带路径的旁观者）",
+            104 not in _kinds and 105 not in _kinds, repr(_cands))
+    s.check("孤儿扫描：目录还在的会话不在这里处理（走正常 kill 路径）",
+            106 not in _kinds, repr(_cands))
+    s.check("孤儿扫描：路径穿越/非法名字被拒", 107 not in _kinds, repr(_cands))
+    _kc2 = m._session_pid_kill_cmd(101)
+    s.check("孤儿清理命令：按 pid 做闭包 + TERM→KILL + 回传 SWEPT/LEFT",
+            'awk -v root="101"' in _kc2 and "kill -TERM $T" in _kc2
+            and "kill -KILL $K" in _kc2 and "SESS__SWEPT=$SWEPT" in _kc2, _kc2[:160])
     # 哨兵包裹（真 bug 的护栏：哨兵必须与命令同一行被解析，否则被 read 吃掉）
     pl = m._session_payload_text("read -p 'x' V; echo $V", "abcd1234")
     s.check("命令与哨兵同一行（{ ...; }; echo 哨兵）",
@@ -1463,6 +1490,41 @@ def suite_live_session(s):
             bool(_ja3) and _ja3.get("ok") is True and _ja3.get("attached") is False
             and isinstance(_ja3.get("pid"), int), repr(_ja3)[:200])
     _live_run(["session", "kill", tgt, "--name", _at], timeout=60)
+
+    # ---- O：按 argv 扫孤儿（v2.3.0）：目录被手工删掉、只剩进程的会话，`kill --all` 也要收掉 ----
+    _orph2 = name + "o2"
+    _live_run(["session", "start", tgt, "--name", _orph2], timeout=90)
+    # 旁观者诱饵：argv 里"提到"会话路径，但不是会话进程（不该被杀）
+    rc, _jdec, _ = _live_run(["exec", tgt, "--cmd",
+                              "setsid nohup bash -c 'sleep 120; :' "
+                              "/tmp/pyaissh-sessions/%s/out.log >/dev/null 2>&1 </dev/null & echo $!"
+                              % _orph2], timeout=60)
+    _decoy = ((_jdec or {}).get("stdout") or "").strip().splitlines()[-1:] or [""]
+    _decoy = _decoy[0].strip()
+    # 手工删掉会话目录：进程失去 pid 记录 ⇒ 逐目录枚举看不见它们（本次加固要解决的场景）
+    _live_run(["exec", tgt, "--cmd", "rm -rf /tmp/pyaissh-sessions/%s; sleep 0.5; "
+                                     "ps -eo pid,args | grep -c '[p]yaissh-sessions/%s'"
+                                     % (_orph2, _orph2)], timeout=60)
+    rc, _jall, _ = _live_run(["session", "kill", tgt, "--all"], timeout=120)
+    _orph_rows = [o for o in (_jall or {}).get("orphans", []) if o.get("session") == _orph2]
+    s.check("O1a kill --all 按 argv 扫到孤儿（目录已不在的 starter/pty 包装）",
+            bool(_orph_rows) and (_jall or {}).get("orphans_total", 0) >= 1, repr(_jall)[:260])
+    s.check("O1b 孤儿清理无残留（orphan_remaining_total=0 且 verified）",
+            bool(_jall) and (_jall.get("orphan_remaining_total") or 0) == 0
+            and all(o.get("verified") for o in _orph_rows), repr(_orph_rows)[:220])
+    rc, _jo2, _ = _live_run(["exec", tgt, "--cmd",
+                             "echo -n 'script='; ps -eo args | grep -c '[s]cript -qfc' || true; "
+                             "echo -n 'starter='; ps -eo args | grep -c \"[e]xec 9<>'/tmp/pyaissh-sessions/%s/in'\" || true; "
+                             "echo -n 'decoy='; kill -0 %s 2>/dev/null && echo alive || echo gone"
+                             % (_orph2, _decoy)], timeout=60)
+    _o2s = (_jo2 or {}).get("stdout") or ""
+    s.check("O1c 孤儿进程真被杀掉（无 script 包装、无 starter）",
+            "script=0" in _o2s and "starter=0" in _o2s, repr(_o2s))
+    s.check("O1d 旁观者（argv 提到路径但不是会话进程）**没被误杀**",
+            "decoy=alive" in _o2s, repr(_o2s))
+    if _decoy.isdigit():
+        _live_run(["exec", tgt, "--cmd", "kill -9 %s 2>/dev/null; echo decoy_cleaned" % _decoy],
+                  timeout=60)
 
     # ---- 真机复现的 5 个 bug 的回归护栏（v2.3.0；外部评审报的，逐个先复现再修）----
     # B3：read --lines N 曾被完全忽略（20000 行日志 --lines 5 回传上万行）
