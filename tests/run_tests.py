@@ -48,6 +48,18 @@ sys.stdout.reconfigure(encoding="utf-8")
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 仓库根
 _py_module = None
 
+# 看门狗检查周期：与 CLI 同源（PYAISSH_SESSION_TTL_TICK）。开发用 `--fast` 调到 3s，
+# 那些"等一个 tick"的用例随之缩短；发布前全量跑默认 15s（真实生产值）。
+_FAST_TICK = 3
+_TICK = int(os.environ.get("PYAISSH_SESSION_TTL_TICK") or 15)
+
+
+def _wait(ticks=1, extra=3):
+    """等 n 个看门狗检查周期（随 --fast 自动缩短）。`extra` 是覆盖 SSH 往返的余量。"""
+    return max(2, int(ticks) * int(_TICK) + int(extra))
+
+_py_module = None
+
 # ============================================================
 # 框架：被测加载 / 断言 / live 工具
 # ============================================================
@@ -410,6 +422,28 @@ def suite_unit_regression(s):
     s.check("看门狗 C：beat 非法/缺失只续期不回收",
             "case \"$LAST\" in ''|*[!0-9]*)" in _ws, _ws[:300])
     s.check("看门狗 C：无 %% 转义残留（生成脚本里不该出现双百分号）", "%%" not in _ws, _ws[:160])
+    # tick 可配（`--fast` 用；生产默认 15）
+    _save_tick = os.environ.get("PYAISSH_SESSION_TTL_TICK")
+    try:
+        os.environ.pop("PYAISSH_SESSION_TTL_TICK", None)
+        _t1 = m._session_tick_default()
+        os.environ["PYAISSH_SESSION_TTL_TICK"] = "3"
+        _t2 = m._session_tick_default()
+        for _bad in ("0", "abc", "9999", "2.5"):
+            os.environ["PYAISSH_SESSION_TTL_TICK"] = _bad
+            globals()["_t_" + _bad.replace(".", "_")] = m._session_tick_default()
+        _t3, _t4 = globals()["_t_0"], globals()["_t_abc"]
+        _t5, _t6 = globals()["_t_9999"], globals()["_t_2_5"]
+    finally:
+        if _save_tick is None:
+            os.environ.pop("PYAISSH_SESSION_TTL_TICK", None)
+        else:
+            os.environ["PYAISSH_SESSION_TTL_TICK"] = _save_tick
+    s.check("看门狗 tick 可配：默认 15 / 3 生效 / 0・abc・9999・2.5 一律回落 15（只收整数）",
+            (_t1, _t2, _t3, _t4, _t5, _t6) == (15, 3, 15, 15, 15, 15),
+            repr((_t1, _t2, _t3, _t4, _t5, _t6)))
+    s.check("测试等待随 tick 缩短：_wait(2) = 2*tick+3（--fast 时 33s→9s）",
+            _wait(2) == 2 * _TICK + 3, "_TICK=%s _wait(2)=%s" % (_TICK, _wait(2)))
     s.check("看门狗：TTL/周期写进脚本且可关闭",
             "TTL=600" in _ws and "TICK=%d" % m._SESSION_TTL_TICK in _ws
             and "watch.sh" not in m._session_start_cmd(_f, 200, False, 0)
@@ -1271,6 +1305,13 @@ def suite_live_transfer(s):
 #     ③ ctrl-c 只发 SIGINT 杀不死（setsid+nohup 起，SIGINT 处置被继承）→ 自动升级 TERM
 # ============================================================
 
+def _field(txt, key):
+    """从 `key=value` 多行文本里取值（live 断言常用）。"""
+    for _ln in (txt or "").splitlines():
+        if _ln.startswith(key + "="):
+            return _ln.split("=", 1)[1].strip()
+    return ""
+
 def suite_live_session(s):
     if _missing_env(_REQ_EXEC):
         print("SKIP: 需配置 %s" % " / ".join(_REQ_EXEC))
@@ -1468,10 +1509,10 @@ def suite_live_session(s):
     # ③ 会话不自退：放着不动 35s（超过看门狗窗口）后仍能跑命令
     _idle = name + "id"
     _live_run(["session", "start", tgt, "--name", _idle], timeout=90)
-    time.sleep(35)
+    time.sleep(_wait(2))
     rc, _ji, _ = _live_run(["session", "run", tgt, "--name", _idle, "--cmd", "echo IDLE_OK",
                             "--wait-rc", "10"], timeout=60)
-    s.check("闲置 35s 后会话仍可用（常驻不自退、无 idle 超时）",
+    s.check("闲置 %ds 后会话仍可用（常驻不自退、无 idle 超时）" % _wait(2),
             bool(_ji) and _ji.get("exit_code") == 0 and "IDLE_OK" in (_ji.get("stdout") or ""),
             repr(_ji)[:160])
 
@@ -1489,6 +1530,16 @@ def suite_live_session(s):
             "exit=%s 输出=%r" % ((_jr2 or {}).get("exit_code"), _o2[:120]))
     _live_run(["session", "kill", tgt, "--name", _idle], timeout=60)
 
+def suite_live_session_ttl(s):
+    if _missing_env(_REQ_EXEC):
+        print("SKIP: 需配置 %s" % " / ".join(_REQ_EXEC))
+        return None
+    tgt = os.environ["PYAISSH_TEST_HOST"]
+    name = "ts1"
+    _live_run(["session", "kill", tgt, "--name", name], timeout=120)
+    _live_run(["session", "kill", tgt, "--all"], timeout=120)
+
+    rc, j, _ = _live_run(["session", "start", tgt, "--name", name], timeout=120)
     # ---- T：空闲回收（v2.3.0，用户设计：提示符空闲 + TTL 内无交互 ⇒ 自动回收）----
     # T1：--ttl 5 且完全不碰它（list 不算交互）→ 看门狗应在 ~15-30s 内回收进程与目录
     _ttl = name + "ttl"
@@ -1496,9 +1547,9 @@ def suite_live_session(s):
     s.check("T1a start --ttl 5 回传 ttl_seconds=5",
             bool(_jt) and _jt.get("ok") is True and _jt.get("ttl_seconds") == 5,
             repr(_jt)[:200])
-    time.sleep(32)
+    time.sleep(_wait(2, 6))
     rc, _jl2, _ = _live_run(["session", "list", tgt], timeout=60)
-    s.check("T1b 空闲 32s 后会话已自动回收（list 里没了）",
+    s.check("T1b 空闲 %ds 后会话已自动回收（list 里没了）" % _wait(2, 6),
             bool(_jl2) and not any(x.get("session") == _ttl
                                    for x in (_jl2.get("sessions") or [])), repr(_jl2)[:200])
     rc, _jd, _ = _live_run(["exec", tgt, "--cmd",
@@ -1514,7 +1565,7 @@ def suite_live_session(s):
     _live_run(["session", "start", tgt, "--name", _ttlr, "--ttl", "5"], timeout=90)
     _live_run(["session", "send", tgt, "--name", _ttlr, "--cmd",
                "sleep 25; echo TTLRUN_DONE"], timeout=60)
-    time.sleep(20)      # 跨过看门狗第一次检查（TICK=15s）：那会儿命令还在跑 ⇒ 必须续期
+    time.sleep(_wait(1, 6))   # 跨过看门狗第一次检查：那会儿命令还在跑 ⇒ 必须续期
     rc, _jlr, _ = _live_run(["session", "list", tgt], timeout=60)
     _row = next((x for x in (_jlr or {}).get("sessions", []) if x.get("session") == _ttlr), None)
     s.check("T2a 命令在跑时不回收（跨过看门狗检查仍 running）",
@@ -1549,13 +1600,18 @@ def suite_live_session(s):
             and isinstance(_ja3.get("pid"), int), repr(_ja3)[:200])
     _live_run(["session", "kill", tgt, "--name", _at], timeout=60)
 
+def suite_live_session_watchdog(s):
+    if _missing_env(_REQ_EXEC):
+        print("SKIP: 需配置 %s" % " / ".join(_REQ_EXEC))
+        return None
+    tgt = os.environ["PYAISSH_TEST_HOST"]
+    name = "ts1"
+    _live_run(["session", "kill", tgt, "--name", name], timeout=120)
+    _live_run(["session", "kill", tgt, "--all"], timeout=120)
+
+    rc, j, _ = _live_run(["session", "start", tgt, "--name", name], timeout=120)
     # ---- W：单进程看门狗（设计 C）的实机开销 + 防 spin 护栏 ----
 
-    def _field(txt, key):
-        for _ln in (txt or "").splitlines():
-            if _ln.startswith(key + "="):
-                return _ln.split("=", 1)[1].strip()
-        return ""
 
     _wdc = name + "wd"
     rc, _jw, _ = _live_run(["session", "start", tgt, "--name", _wdc, "--ttl", "300"], timeout=90)
@@ -1570,7 +1626,7 @@ def suite_live_session(s):
                                  "echo \"cpu=$(awk '{print $14+$15}' /proc/$W/stat)\"" % (_wdc, _wdc)],
                                 timeout=60)
         _w0 = (_jc0 or {}).get("stdout") or ""
-        time.sleep(32)      # 2 个检查点
+        time.sleep(_wait(2, 2))      # 2 个检查点
         rc, _jc1, _ = _live_run(["exec", tgt, "--cmd",
                                  "W=$(cat /tmp/pyaissh-sessions/%s/watch.pid); "
                                  "echo \"cpu=$(awk '{print $14+$15}' /proc/$W/stat)\"; "
@@ -1587,7 +1643,7 @@ def suite_live_session(s):
                 _field(_w0, "procs") == "1" and _field(_w0, "kids") == "0", repr(_w0)[:160])
         s.check("W1 RSS < 4 MB（比 sleep 版省 ~1.9 MB）",
                 _rss.isdigit() and int(_rss) < 4000, "rss=%s KB" % _rss)
-        s.check("W1 32 秒（2 个检查点）CPU ≤ 2 jiffy（内建睡眠不烧 CPU）",
+        s.check("W1 %d 秒（2 个检查点）CPU ≤ 2 jiffy（内建睡眠不烧 CPU）" % _wait(2, 2),
                 0 <= _dcpu <= 2, "cpu_delta=%s jiffy" % _dcpu)
         s.check("W1 beat 里是 epoch 秒，且与远端 now 相差 < TTL（判闲靠内容）",
                 _field(_w1, "beat").isdigit() and _field(_w1, "now").isdigit()
@@ -1611,7 +1667,7 @@ def suite_live_session(s):
                "/tmp/pyaissh-sessions/guard1/watch.sh; chmod 700 /tmp/pyaissh-sessions/guard1/watch.sh; "
                "setsid nohup bash /tmp/pyaissh-sessions/guard1/watch.sh >/dev/null 2>&1 </dev/null & "
                "echo started"], timeout=60)
-    time.sleep(35)
+    time.sleep(_wait(1, 6))
     rc, _jg2, _ = _live_run(["exec", tgt, "--cmd",
                              "P=$(pgrep -f '/tmp/pyaissh-sessions/guard1/[w]atch[.]sh' | head -1); "
                              "echo \"guardlog=$(grep -c 'guard: read -t' /tmp/pyaissh-sessions/guard1/wd.log 2>/dev/null)\"; "
@@ -1621,28 +1677,38 @@ def suite_live_session(s):
     _g2 = (_jg2 or {}).get("stdout") or ""
     s.check("W2 防 spin 护栏生效：read 立刻返回时写 wd.log 并退回 sleep",
             _field(_g2, "guardlog") not in ("", "0"), repr(_g2)[:200])
-    s.check("W2 护栏兜底期间不烧 CPU（≤3 jiffy / 35 秒）",
+    s.check("W2 护栏兜底期间不烧 CPU（≤3 jiffy / %d 秒）" % _wait(1, 6),
             _field(_g2, "cpu").isdigit() and int(_field(_g2, "cpu")) <= 3,
             "cpu=%s jiffy" % _field(_g2, "cpu"))
 
+def suite_live_session_lifecycle(s):
+    if _missing_env(_REQ_EXEC):
+        print("SKIP: 需配置 %s" % " / ".join(_REQ_EXEC))
+        return None
+    tgt = os.environ["PYAISSH_TEST_HOST"]
+    name = "ts1"
+    _live_run(["session", "kill", tgt, "--name", name], timeout=120)
+    _live_run(["session", "kill", tgt, "--all"], timeout=120)
+
+    rc, j, _ = _live_run(["session", "start", tgt, "--name", name], timeout=120)
     # ---- L：看门狗"临终带走"（v2.3.0 用户提案）：有人 rm -rf 会话目录时，看门狗最后收一次再自退 ----
     import base64 as _b64b
     # L1 主用例：start(ttl>0) → 等 >15s（看门狗已记下 pid）→ rm -rf 目录 → 等 ≤20s
     #    → starter/script/bash -i 与看门狗全消失，且随后 kill --all 没有孤儿可扫（证明是看门狗干的）
     _lz = name + "lz"
     rc, _jl, _ = _live_run(["session", "start", tgt, "--name", _lz, "--ttl", "300"], timeout=90)
-    time.sleep(20)
+    time.sleep(_wait(1, 3))
     rc, _jpre, _ = _live_run(["exec", tgt, "--cmd",
                               "rm -rf /tmp/pyaissh-sessions/%s; sleep 0.5; "
                               "echo -n 'before='; pgrep -fc '[p]yaissh-sessions/%s' || true"
                               % (_lz, _lz)], timeout=60)
     _before = _field(((_jpre or {}).get("stdout") or ""), "before")
-    time.sleep(20)
+    time.sleep(_wait(2, 4))
     # 路径用变量拼（cmdline 里不出现完整路径）⇒ pgrep -f 不会匹配到执行本命令的 shell 自己
     _l1cmd = ("R=$(printf '/tmp/pyaissh-%s' sessions); D=\"$R/" + _lz + "\"; "
               "echo -n 'after='; pgrep -fc \"$D\" || true; "
               "echo -n 'dir='; [ -d \"$D\" ] && echo 1 || echo 0; "
-              "echo -n 'script='; pgrep -xc script || true")
+              "echo -n 'script='; ps -eo args | grep -c \"[s]cript -qfc.*$D\" || true")
     rc, _jz, _ = _live_run(["exec", tgt, "--cmd", _l1cmd], timeout=60)
     _lzs = (_jz or {}).get("stdout") or ""
     s.check("L1 孤儿确实存在过（rm -rf 目录后还有 >=3 个进程）",
@@ -1671,7 +1737,7 @@ def suite_live_session(s):
     _decoy2 = _field(((_jdec2 or {}).get("stdout") or ""), "decoy")
     time.sleep(3)
     _live_run(["exec", tgt, "--cmd", "rm -rf " + _D2], timeout=60)
-    time.sleep(20)
+    time.sleep(_wait(2, 4))
     rc, _jl2b, _ = _live_run(["exec", tgt, "--cmd",
                               "echo -n 'decoy='; kill -0 %s 2>/dev/null && echo alive || echo gone; "
                               "echo -n 'wd='; pgrep -fc '%s/[w]atch[.]sh' || true; "
@@ -1685,10 +1751,10 @@ def suite_live_session(s):
     # L3 名字被接管：rm -rf 目录后立刻同名重建 → 老看门狗必须退出、新会话必须活着
     _lz3 = name + "lz3"
     _live_run(["session", "start", tgt, "--name", _lz3, "--ttl", "300"], timeout=90)
-    time.sleep(20)
+    time.sleep(_wait(1, 3))
     _live_run(["exec", tgt, "--cmd", "rm -rf /tmp/pyaissh-sessions/%s" % _lz3], timeout=60)
     rc, _jnew, _ = _live_run(["session", "start", tgt, "--name", _lz3, "--ttl", "300"], timeout=90)
-    time.sleep(25)      # 给老看门狗足够时间 tick（它会看到 watch.pid/meta 变了，应自行退出）
+    time.sleep(_wait(2, 4))   # 给老看门狗足够时间 tick（它会看到 watch.pid/meta 变了，应自行退出）
     rc, _jl3, _ = _live_run(["session", "run", tgt, "--name", _lz3, "--cmd", "echo NEWALIVE",
                              "--wait-rc", "10"], timeout=60)
     rc, _jc3, _ = _live_run(["exec", tgt, "--cmd",
@@ -1702,6 +1768,16 @@ def suite_live_session(s):
             repr((_jc3 or {}).get("stdout"))[:160])
     _live_run(["session", "kill", tgt, "--name", _lz3], timeout=60)
 
+def suite_live_session_orphan(s):
+    if _missing_env(_REQ_EXEC):
+        print("SKIP: 需配置 %s" % " / ".join(_REQ_EXEC))
+        return None
+    tgt = os.environ["PYAISSH_TEST_HOST"]
+    name = "ts1"
+    _live_run(["session", "kill", tgt, "--name", name], timeout=120)
+    _live_run(["session", "kill", tgt, "--all"], timeout=120)
+
+    rc, j, _ = _live_run(["session", "start", tgt, "--name", name], timeout=120)
     # ---- O：按 argv 扫孤儿（v2.3.0）：目录被手工删掉、只剩进程的会话，`kill --all` 也要收掉 ----
     _orph2 = name + "o2"
     # 用 --ttl 0：新语义下"目录被删"的孤儿会由看门狗临终带走，argv 扫描只能在**没有看门狗**时被验证
@@ -1740,6 +1816,16 @@ def suite_live_session(s):
         _live_run(["exec", tgt, "--cmd", "kill -9 %s 2>/dev/null; echo decoy_cleaned" % _decoy],
                   timeout=60)
 
+def suite_live_session_bugs(s):
+    if _missing_env(_REQ_EXEC):
+        print("SKIP: 需配置 %s" % " / ".join(_REQ_EXEC))
+        return None
+    tgt = os.environ["PYAISSH_TEST_HOST"]
+    name = "ts1"
+    _live_run(["session", "kill", tgt, "--name", name], timeout=120)
+    _live_run(["session", "kill", tgt, "--all"], timeout=120)
+
+    rc, j, _ = _live_run(["session", "start", tgt, "--name", name], timeout=120)
     # ---- 真机复现的 5 个 bug 的回归护栏（v2.3.0；外部评审报的，逐个先复现再修）----
     # B3：read --lines N 曾被完全忽略（20000 行日志 --lines 5 回传上万行）
     rc, jb3s, _ = _live_run(["session", "start", tgt, "--name", name + "b3"], timeout=90)
@@ -1837,8 +1923,19 @@ SUITES = [
     ("live_sudo", "--sudo 提权（真机）", suite_live_sudo),
     ("live_exec_field", "exec+field（真机）", suite_live_exec_field),
     ("live_transfer", "传输往返（真机：默认/并行/续传/排除）", suite_live_transfer),
-    ("live_session", "会话（真机：PTY/状态保留/退出码/ctrl-c/keys/kill 无孤儿）", suite_live_session),
+    ("live_session", "会话 core（真机：PTY/状态保留/退出码/ctrl-c/keys/kill）", suite_live_session),
+    # v2.3.0：live_session 按"改动路径"拆块——开发时只跑动过的那块（`--suite live_session_watchdog`），
+    # 全量（--session / --all）仍是这些块全跑（发布前用）
+    ("live_session_ttl", "会话空闲回收 TTL/attach（真机）", suite_live_session_ttl),
+    ("live_session_watchdog", "会话看门狗（单进程/护栏，真机）", suite_live_session_watchdog),
+    ("live_session_lifecycle", "看门狗临终带走/自证闸门/同名接管（真机）", suite_live_session_lifecycle),
+    ("live_session_orphan", "argv 扫孤儿（真机）", suite_live_session_orphan),
+    ("live_session_bugs", "B1~B5 回归护栏（真机）", suite_live_session_bugs),
 ]
+
+#: `--session` 展开成哪些套件（保持"全部会话用例"的语义）
+_SESSION_SUITES = ["live_session", "live_session_ttl", "live_session_watchdog",
+                   "live_session_lifecycle", "live_session_orphan", "live_session_bugs"]
 
 
 def _run_suite(idx):
@@ -1893,34 +1990,71 @@ def main():
     ap.add_argument("--sudo", action="store_true")
     ap.add_argument("--exec", action="store_true")
     ap.add_argument("--transfer", action="store_true")
-    ap.add_argument("--session", action="store_true", help="仅会话真机集")
+    ap.add_argument("--session", action="store_true", help="会话真机集（= 下面 6 块全跑）")
+    ap.add_argument("--suite", help="按名字选套件（逗号分隔，见 --list）——开发时只跑动过的路径，"
+                                   "例如 --suite live_session_watchdog,live_session_lifecycle")
+    ap.add_argument("--fast", action="store_true",
+                    help="快跑：把看门狗检查周期调到 %ds（PYAISSH_SESSION_TTL_TICK），"
+                         "并把用例里「等一个 tick」的等待按比例缩短（默认 15s，真实生产值）"
+                         % _FAST_TICK)
+    ap.add_argument("--release", action="store_true",
+                    help="发布前全量（**唯一**允许 --all / --session 的场合；也可用 "
+                         "PYAISSH_TEST_RELEASE=1）。开发期禁止全量与整个模式测试——见 AGENTS.md")
     ap.add_argument("--list", action="store_true", help="列出测试集")
     a = ap.parse_args()
 
+    _release = a.release or os.environ.get("PYAISSH_TEST_RELEASE") == "1"
+    if (a.all or a.session) and not _release:
+        print("拒绝：开发期禁止全量测试与「整个模式」测试（AGENTS.md『测试只测代码动过的路径』）。\n"
+              "  只跑改动落点： python -u tests/run_tests.py --suite <块名> [--fast]   （--list 看块名）\n"
+              "  发布前全量：   python -u tests/run_tests.py --all --release")
+        return 2
+
     if a.list:
+        print("  套件（--suite 用名字选）：")
         for i, (name, desc, _) in enumerate(SUITES, 1):
-            print("  %d) %s — %s" % (i, name, desc))
+            print("  %2d) %-26s %s" % (i, name, desc))
+        print("\n  常用组合：")
+        print("   开发（只跑动过的路径，示例）：--suite live_session_watchdog,live_session_lifecycle --fast")
+        print("   发布前全量：                    --all")
         return 0
+    if a.fast:
+        os.environ["PYAISSH_SESSION_TTL_TICK"] = str(_FAST_TICK)
+        globals()["_TICK"] = _FAST_TICK
+        print("[fast] 看门狗 tick=%ds（默认 15s），等待按比例缩短" % _FAST_TICK)
     if a.all:
         order = list(range(len(SUITES)))
     elif a.unit:
         order = [0, 1, 2, 3]
     elif a.artifacts:
         order = [2]
+    elif a.suite:
+        want = [x.strip() for x in a.suite.split(",") if x.strip()]
+        names = [s[0] for s in SUITES]
+        order = []
+        for w in want:
+            if w not in names:
+                print("未知套件 %r（用 --list 看可选）" % w)
+                return 2
+            order.append(names.index(w))
     elif a.sudo or a.exec or a.transfer or a.session:
+        names = [s[0] for s in SUITES]
         order = []
         if a.sudo:
-            order.append(4)
+            order.append(names.index("live_sudo"))
         if a.exec:
-            order.append(5)
+            order.append(names.index("live_exec_field"))
         if a.transfer:
-            order.append(6)
+            order.append(names.index("live_transfer"))
         if a.session:
-            order.append(7)
+            order += [names.index(n) for n in _SESSION_SUITES]
     else:
         order = _interactive()
         if order is None:
             return 0
+        if len(order) == len(SUITES) and not _release:
+            print("拒绝：开发期禁止全量测试（AGENTS.md）。请用 --suite <块名> [--fast]。")
+            return 2
 
     results = []
     for idx in order:

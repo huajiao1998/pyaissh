@@ -425,3 +425,23 @@
   避免 `pgrep -f` 匹配到执行采样的 shell 自己（这次又踩了一次自匹配假阳性）。
 - 耗时现状（供后续优化）：`live_session` 有 11 处 `time.sleep` 合计 **262 秒**，加 ~109 次 CLI 调用
   （每次新 SSH 连接）⇒ 单跑约 7-10 分钟；已记为待优化项（tick 可配 / 并行等待 / 拆快慢套件）。
+
+## [2026-09-24] v2.3.0 补十一：测试按"块"选择 + tick 可配 + 全量闸门 + 自证前缀修复
+
+### 背景（用户纠正）
+开发期禁止全量/整个模式测试：全量是发布到 GitHub 前的工作。此前把"相关套件"当成整条
+`live_session`（68 项、7–10 分钟）每次都跑，属浪费。工具层已上闸，不再依赖自觉。
+
+### 改动
+- `live_session` 拆成 6 个可独立运行的套件：`live_session` / `_ttl` / `_watchdog` / `_lifecycle` /
+  `_orphan` / `_bugs`；`_field()` 提到模块级共用；新增 `--suite <名字>[,<名字>]`、`--release`、`--fast`
+- 等待随 tick 缩短：`_wait(n) = n*tick + extra`（`--fast` 时 tick=3）
+- CLI 新增 `_session_tick_default()`：`PYAISSH_SESSION_TTL_TICK` 覆盖看门狗 tick（默认 15，整数 1~600）
+- **自证前缀匹配修复**（源码）：`case "$A" in *"$D/"*)`——此前 `*"$D"*` 会让会话名互为前缀的
+  清理互相误伤（`work` 命中 `work2` 的进程）；`L1` 的 `script` 计数也从全局 `pgrep -xc script`
+  改成"本次会话目录下的 script"，避免别的会话干扰断言
+
+### 本次验证（只跑动过的路径）
+- `--unit` 123 PASS；`--all` / `--session` 被闸门拒绝（exit 2）
+- `--suite live_session_watchdog,live_session_ttl --fast`：14 PASS / 0 FAIL（105 秒）
+- `--suite live_session_lifecycle,live_session,live_session_bugs --fast`：结果见下

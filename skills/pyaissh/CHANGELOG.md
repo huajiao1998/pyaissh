@@ -857,3 +857,32 @@
   - **O1a~O1d 改用 `--ttl 0` 会话**：有了临终带走后，带看门狗的会话不再把孤儿留给 `kill --all`，
     argv 扫描必须在"没有看门狗"的场景验证（语义对齐，非削弱）。
   - **T2a/T2b** 保持原样——它们正是这次回归的护栏。
+
+### 测试工程：只测"代码动过的路径"（拆块 + tick 可配 + `--release` 闸门）+ 自证前缀匹配修复（v2.3.0）
+
+- **用户两次强调后的收紧**：开发期**禁止全量测试，也禁止"整个模式"测试**（`--all` 与 `--session` 都算）；
+  **全量是"发布到 GitHub 前"的工作，不是开发时的工作**。此前我把"相关的套件"理解成整条
+  `live_session`（68 项、7–10 分钟）每次改完都跑 —— 已被明确纠正。
+- **落地成机制（不靠自觉）**：
+  1. **`live_session` 拆成 6 个可按块选的套件**：`live_session`(core) / `_ttl` / `_watchdog` /
+     `_lifecycle` / `_orphan` / `_bugs`（沿用原有注释分块标记切分，每块自带宽前前置：缺凭据跳过 + 清场）。
+     `--session`/`--all` 仍是全跑（发布前用），新增 **`--suite <名字>[,<名字>]`** 精确选择。
+  2. **看门狗 tick 可配**：`PYAISSH_SESSION_TTL_TICK`（整数 1~600，默认 **15**；非法值 WARN 回落；
+     只收整数——脚本里用 `TICK=%d` 落值，小数会被截成 0 从而退化成忙循环）。测试新增 **`--fast`**
+     （tick=3），用例里"等一个 tick"的等待换成 `_wait(n)` 随 tick 缩短（2 个 tick：33s → 9s）。
+  3. **工具层闸门**：`--all` / `--session` 必须显式带 `--release`（或 `PYAISSH_TEST_RELEASE=1`），
+     否则 `exit 2` 并提示"只跑改动落点：`--suite <块名> --fast`"；交互式选"全部"同样被拦。
+  4. 纪律写进 `AGENTS.md`（含"禁止为了看数字重复跑整条套件"——我为了拿"快了多少"的数字又跑了一整条
+     `--session --fast`，同样是浪费）。
+- **顺带修掉一个真 bug（自证前缀匹配）**：清理时的"自证"用 `case "$A" in *"$D"*)`，`$D` 是会话目录
+  **不带尾部斜杠** ⇒ 会话名互为前缀时会误匹配（`/tmp/pyaissh-sessions/work` 命中 `.../work2/out.log`）
+  ⇒ `work` 的看门狗/`kill` 可能把 `work2` 的进程当自己的杀掉。改判据为 `*"$D/"*`（会话自身进程的
+  argv 里目录后面必然跟 `/`：starter 的 `…/in`、`script` 的 `…/out.log`、看门狗的 `…/watch.sh`）。
+  现象来源：整条 `--session --fast` 跑动时 `B1`（`sleep 32` 长等待）会话在 17.4s 消失，怀疑是被同前缀
+  会话的清理误伤。
+- **本次验证（遵守新规，只跑动过的路径）**：
+  - `--unit` **123 PASS**（新增 tick 6 种取值 + `_wait` 断言）；
+  - 闸门自证：`--all` / `--session` 均被拒（exit 2，秒回不联网）；
+  - `--suite live_session_watchdog,live_session_ttl --fast`：**14 PASS / 0 FAIL，105 秒**
+    （对比整条 `--session --fast` 406 秒、默认 tick 下 ~10 分钟）；
+  - `--suite live_session_lifecycle,live_session,live_session_bugs --fast`：见 tests/CHANGELOG。

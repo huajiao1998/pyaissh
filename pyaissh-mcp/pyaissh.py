@@ -5302,7 +5302,31 @@ _SESSION_STALE_HINT = 86400
 # `--ttl 0` 关闭回收；环境变量 PYAISSH_SESSION_TTL 改默认值；看门狗每 _SESSION_TTL_TICK 秒查一次，
 # 所以实际回收时间在 TTL..TTL+TICK 之间。
 _SESSION_TTL_DEFAULT = 600
-_SESSION_TTL_TICK = 15
+
+
+def _session_tick_default():
+    """看门狗检查周期（秒，**整数**）。默认 15；`PYAISSH_SESSION_TTL_TICK` 可覆盖（**测试用**：
+    设 3 可让"等一个 tick"的用例快 5 倍；生产别乱调——周期越短 fork 越多、回收越及时）。
+    非法值（非数字/小于 1/大于 600）只打 WARN 并回落默认 15。
+
+    只接受整数：脚本里用 `TICK=%d` 与 `sleep "$TICK"` 落值，小数会被 `%d` 截成 0 ⇒
+    `read -t 0` 立刻返回，看门狗会退化成忙循环（护栏能兜住，但没必要冒这个险）。
+    """
+    raw = (os.environ.get("PYAISSH_SESSION_TTL_TICK") or "").strip()
+    if not raw:
+        return 15
+    try:
+        v = int(raw)
+    except ValueError:
+        log("[WARN] PYAISSH_SESSION_TTL_TICK 值 %r 非整数，用默认 15" % raw)
+        return 15
+    if v < 1 or v > 600:
+        log("[WARN] PYAISSH_SESSION_TTL_TICK 值 %r 超范围（1~600 秒），用默认 15" % raw)
+        return 15
+    return v
+
+
+_SESSION_TTL_TICK = _session_tick_default()
 
 
 def _session_files(root, name):
@@ -5431,7 +5455,8 @@ def _session_watchdog_script(f, ttl):
         "FAST=0; P=\"\"; B=\"\"; M0=\"\"\n"
         "\n"
         "# 共用清理（TTL 到期与\"临终带走\"都走这里，只有一套实现）：\n"
-        "#   自证闭包（argv 必须仍含本会话目录 ⇒ 防 pid 被内核复用后误杀无关进程）→ 可选删目录 → TERM→KILL\n"
+        "#   自证闭包（argv 必须仍含本会话目录**加斜杠** ⇒ 防 pid 被内核复用后误杀无关进程）→ 可选删目录 → TERM→KILL\n"
+        "#   用 \"$D/\" 而不是 \"$D\"：会话名互为前缀时（work 与 work2）后者会误匹配到另一个会话的进程\n"
         "#   参数 rm ⇒ 连目录一起删（TTL 到期路径）；不带参数 ⇒ 目录已不在，只收进程（临终路径）\n"
         "cleanup_tree() {\n"
         "  T=\"\"; SEEN=\"\"; ROOTS=0; SNAP=$(ps -eo pid=,ppid=)\n"
@@ -5442,7 +5467,7 @@ def _session_watchdog_script(f, ttl):
         "    case \" $SEEN \" in *\" $r \"*) continue ;; esac\n"
         "    kill -0 \"$r\" 2>/dev/null || continue\n"
         "    A=$(ps -o args= -p \"$r\" 2>/dev/null)\n"
-        "    case \"$A\" in *\"$D\"*) ;; *) continue ;; esac\n"
+        "    case \"$A\" in *\"$D/\"*) ;; *) continue ;; esac\n"
         "    SEEN=\"$SEEN $r\"; ROOTS=$((ROOTS+1))\n"
         "    T=\"$T $(echo \"$SNAP\" | %s)\"\n"
         "  done\n"
@@ -5681,7 +5706,7 @@ def _session_kill_cmd(f, keep_dir=False):
             "case \" $SEEN \" in *\" $r \"*) continue ;; esac; "
             "kill -0 \"$r\" 2>/dev/null || continue; "
             "A=$(ps -o args= -p \"$r\" 2>/dev/null); "
-            "case \"$A\" in *\"$D\"*) ;; *) continue ;; esac; "
+            "case \"$A\" in *\"$D/\"*) ;; *) continue ;; esac; "
             "SEEN=\"$SEEN $r\"; ROOTS=$((ROOTS+1)); T=\"$T $(echo \"$SNAP\" | %s)\"; "
             "done; "
             "T=$(echo $T | tr ' ' '\\n' | sort -u -n | tr '\\n' ' '); "
