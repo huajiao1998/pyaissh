@@ -286,3 +286,14 @@
   曾被读成 dead）
 - 首次跑新用例出现一次 `exec --detach` 未返回 job_id（未复现，isolated 3/3 正常），失败详情
   已改为打印原始 JSON
+
+## [2026-09-24] v2.3.0 补四：PYAISSH_SFTP_IO_TIMEOUT（看门狗窗口可配）
+
+### 新增用例
+- unit_regression +4：未设 env 无覆盖 / env 生效（90）/ 接受小数（90.5）/ 非法值（abc、0、-5、空白）
+  一律忽略并回落默认
+- live_transfer +2：设 PYAISSH_SFTP_IO_TIMEOUT=90 后 ls 正常；非法值只 WARN 不影响功能
+### 说明
+- 该变量的定位是"极慢链路单次大读 >30s"的逃生阀，**语义不变**（仍是"多久无成功往返判死"），
+  默认仍 30 秒；优先级：显式 open_sftp(io_timeout) > 环境变量 > 默认
+- B1 的主修法仍是轮询记账（touch），不是绕过/调大——这条只是给极慢链路留的多余退路

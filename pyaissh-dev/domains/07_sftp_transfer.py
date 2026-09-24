@@ -52,6 +52,29 @@ def _sftp_watchdog(sftp):
         pass
 
 
+def _sftp_env_timeout():
+    """`PYAISSH_SFTP_IO_TIMEOUT`：全局放宽看门狗"静默即断"的判据（默认 30 秒）。
+
+    适用场景：极慢链路（<~33KB/s）上**单次**大读可能超过 30 秒——例如会话首轮读 1MB 尾窗。
+    看门狗语义不变（仍是"多久没有成功往返判死"），只是把数字放大；
+    非法值忽略并 WARN，不影响默认行为。也可以只对某个会话放宽：`open_sftp(client, io_timeout=N)`。
+    """
+    raw = (os.environ.get("PYAISSH_SFTP_IO_TIMEOUT") or "").strip()
+    if not raw:
+        return None
+    try:
+        v = float(raw)
+    except ValueError:
+        log("[WARN] PYAISSH_SFTP_IO_TIMEOUT=%r 不是数字，忽略（用默认 %d 秒）"
+            % (raw, SFTP_IO_TIMEOUT))
+        return None
+    if v <= 0:
+        log("[WARN] PYAISSH_SFTP_IO_TIMEOUT 必须为正数（收到 %r），忽略（用默认 %d 秒）"
+            % (raw, SFTP_IO_TIMEOUT))
+        return None
+    return v
+
+
 def open_sftp(client, io_timeout=None):
     """打开带 I/O 超时兜底的 SFTP 会话。
 
@@ -59,10 +82,12 @@ def open_sftp(client, io_timeout=None):
     会无限阻塞。这里双重兜底：
       1) channel/sock settimeout（对部分读路径有效）；
       2) 看门狗线程（对 put/get 等阻塞读有效，见 _sftp_watchdog）。
-    持续有数据流动的慢传输不受影响（callback 持续刷新活动时间）。
-    io_timeout 可对单会话放宽（分片下载工作线程用更长的窗口）。
+    持续有数据流动的慢传输不受影响（callback / `_sftp_touch_activity` 持续刷新活动时间）。
+
+    超时取值优先级：**显式参数 > `PYAISSH_SFTP_IO_TIMEOUT` > 默认 30 秒**
+    （分片下载工作线程用显式更长的窗口）。
     """
-    io_timeout = io_timeout or SFTP_IO_TIMEOUT
+    io_timeout = io_timeout or _sftp_env_timeout() or SFTP_IO_TIMEOUT
     sftp = client.open_sftp()
     try:
         sftp.get_channel().settimeout(io_timeout)

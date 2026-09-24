@@ -367,6 +367,30 @@ def suite_unit_regression(s):
             m._session_clean_text(dirty) == "RED", repr(m._session_clean_text(dirty)))
     s.check("--keep-ansi 时保留 ANSI 码",
             "\x1b[31m" in m._session_clean_text(dirty, strip_ansi=False))
+
+    # v2.3.0：SFTP 看门狗窗口可配（PYAISSH_SFTP_IO_TIMEOUT）——极慢链路单次大读的逃生阀
+    _oe = os.environ.get("PYAISSH_SFTP_IO_TIMEOUT")
+    try:
+        os.environ.pop("PYAISSH_SFTP_IO_TIMEOUT", None)
+        s.check("SFTP 窗口：未设 env 时无覆盖（用默认 30s）", m._sftp_env_timeout() is None)
+        os.environ["PYAISSH_SFTP_IO_TIMEOUT"] = "90"
+        s.check("SFTP 窗口：env 生效", m._sftp_env_timeout() == 90.0)
+        os.environ["PYAISSH_SFTP_IO_TIMEOUT"] = "90.5"
+        s.check("SFTP 窗口：接受小数", m._sftp_env_timeout() == 90.5)
+        _bad_ok = True
+        for bad in ("abc", "0", "-5", " "):
+            os.environ["PYAISSH_SFTP_IO_TIMEOUT"] = bad
+            if m._sftp_env_timeout() is not None:
+                _bad_ok = False
+                s.check("SFTP 窗口：非法值 %r 应忽略" % bad, False, "未忽略")
+                break
+        if _bad_ok:
+            s.check("SFTP 窗口：非法值（abc/0/-5/空白）一律忽略并回落默认", True)
+    finally:
+        if _oe is None:
+            os.environ.pop("PYAISSH_SFTP_IO_TIMEOUT", None)
+        else:
+            os.environ["PYAISSH_SFTP_IO_TIMEOUT"] = _oe
     # 单引号路径注入防护：路径只做 POSIX 单引号转义后进 run.sh
     odd = m._job_files("/tmp/it's dir", "j2")
     _j2, run2 = m._detach_scripts(odd, "true")
@@ -1089,6 +1113,22 @@ def suite_live_transfer(s):
     for p in (dl, part):
         if os.path.exists(p):
             os.remove(p)
+
+    # v2.3.0：PYAISSH_SFTP_IO_TIMEOUT（看门狗窗口逃生阀）不破坏正常路径
+    os.environ["PYAISSH_SFTP_IO_TIMEOUT"] = "90"
+    try:
+        rc, jw, _ = _live_run(["ls", tgt, "--path", "/tmp"], timeout=60)
+        s.check("设 PYAISSH_SFTP_IO_TIMEOUT=90 后 ls 正常（不走坏路径）",
+                bool(jw) and jw.get("ok") is True, repr(jw)[:140])
+    finally:
+        os.environ.pop("PYAISSH_SFTP_IO_TIMEOUT", None)
+    os.environ["PYAISSH_SFTP_IO_TIMEOUT"] = "abc"      # 非法值只 WARN，不应影响功能
+    try:
+        rc, jb, _ = _live_run(["ls", tgt, "--path", "/tmp"], timeout=60)
+        s.check("非法 PYAISSH_SFTP_IO_TIMEOUT 只回落默认、功能不受影响",
+                bool(jb) and jb.get("ok") is True, repr(jb)[:140])
+    finally:
+        os.environ.pop("PYAISSH_SFTP_IO_TIMEOUT", None)
 
 
 # ============================================================

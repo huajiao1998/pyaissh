@@ -15,6 +15,10 @@
 
 凭据：`--password` / `--key` 参数，或环境变量 `PYAISSH_USER` / `PYAISSH_PORT` / `PYAISSH_KEY` / `PYAISSH_PASSWORD`（也可写同目录 `.env`）；**sudo 提权密码**：`PYAISSH_SUDO_PASSWORD`（exec `--sudo` 用，v1.5.15 起；`--sudo-password` 参数优先，空串视为未设置→sudo -n 免密探测；密码只经 SSH stdin 注入不进命令/日志，样例见 `.env.example`）。**认证优先级**：`--key` / `PYAISSH_KEY` > `--password` / `PYAISSH_PASSWORD` > 默认私钥 `~/.ssh/id_ed25519` > ssh-agent 兜底（仅当以上都没有时）——**注意：显式传 `--password` 也会被 `PYAISSH_KEY`/`--key` 静默压过（key 优先）**；**`--key` 指定的私钥文件不存在时直接报 `auth_failed`，不会回退密码**；**别名专属凭据**：`PYAISSH_HOST_<名称>_KEY` / `PYAISSH_HOST_<名称>_PASSWORD` 优先级介于显式参数与全局 env 之间，且**别名配了任一专属凭据时该主机不再取全局 `PYAISSH_KEY`/`PYAISSH_PASSWORD`**（别名主机凭据完全由别名决定，避免全局 key 抢先导致别名密码永远轮不到）；跳板机凭据同样支持环境变量 `PYAISSH_JUMP_KEY` / `PYAISSH_JUMP_PASSWORD`（**v1.4.9 起：跳板密码在两者都未配置时自动回退使用 `PYAISSH_PASSWORD`，密钥无此回落**）；完全无凭据时报 `auth_failed` 且 message 明确提示缺 `--password`/`PYAISSH_PASSWORD` 或 `--key`/`PYAISSH_KEY`
 
+**其他环境变量**：
+- `PYAISSH_SFTP_IO_TIMEOUT`（v2.3.0，默认 30 秒）：SFTP **看门狗**的"静默即断"判据——多久**没有一次成功的 SFTP 往返**就判定链路已死并强制断开。语义**不变**，只把数字放大有用在：极慢链路（≲33KB/s）上**单次**大读可能超过 30 秒（如会话首轮读 1MB 尾窗）。非法值（非数字/≤0）只打 WARN 并回落默认，不影响功能；也可只对某次会话放宽（分片下载线程内部就是这样用的）
+- `PYAISSH_MCP_*`（MCP 适配层专用，见 `pyaissh-mcp/README.md`）：连接池开关/空闲 TTL/`wait_rc` 上限等
+
 ## 凭据安全
 
 - 命令含疑似凭据（如 `mysql -p'xxx'`、`DB_PASS=...`）时 pyaissh 会在 stderr 打 WARN——照常执行，但注意日志可能泄露敏感信息，**敏感凭据用远程环境变量注入**；**从文件读值豁免**（v2.1）：命令含 `$(cat f)` / `$(<f)` 整条不报 WARN（值来自文件、不进命令行文本、无明文泄漏——`DB_PASS=$(cat /srv/x)` 类不再误报；真凭据字面如 `-psecret` 仍命中）
