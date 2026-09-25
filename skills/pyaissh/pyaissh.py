@@ -129,11 +129,13 @@ except (ValueError, OSError, ImportError):
 
 - 超时/轮询/缓冲上限常量（MAX_TIME_CAP / PARALLEL_MIN_SIZE / SFTP_IO_TIMEOUT ...）
 - _RETRYABLE_ERRORS：错误类型 -> 是否可重试（emit_error 用它给 retryable 字段）
-- 模块级可变容器：_ACTIVE_TRANSPORTS（活动连接）、_PUT_RESIDUE_WARNINGS（.part 残留警告）
+- 模块级可变容器：_ACTIVE_TRANSPORTS（活动连接）、_PUT_RESIDUE_WARNINGS（.part 残留警告）、
+  _CONN_WARNINGS（连接层咨询警告，如 --jump-password 走了命令行；由 emit/emit_error 汇进
+  每个结果的 warnings[]——纯 JSON 消费方丢 stderr 也看得见，见域 04）
 被 00_head（信号区）、各 cmd_*（超时/常量）引用；拼接后与本包其余域同模块共享命名空间。
 """
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -186,6 +188,14 @@ _ACTIVE_TRANSPORTS = []
 # _sftp_put_atomic 中断时远端 .part 清理失败的记录（连接已坏清不掉）：
 # 合并进 upload 结果/失败的 warnings，AI 才知道远端有残留待清理
 _PUT_RESIDUE_WARNINGS = []
+
+
+# 连接层的咨询型警告（v2.5.0）：resolve_jump 等连接阶段发现"能跑但不该这么跑"时记在这里，
+# 由域 04 的 emit/emit_error 汇进**每个**结果的 warnings[]。为什么要单独一个容器：
+# stderr 日志只有看 stderr 的调用方收得到，而纯 --json 消费方（2>/dev/null）恰是主要受众；
+# 走 emit  funnel 一处合并，成功/失败、exec/upload/download/session 全子命令都覆盖，
+# 不必每个命令自己记得 merge（_PUT_RESIDUE_WARNINGS 就是逐个 merge，容易漏）。
+_CONN_WARNINGS = []
 
 
 # =========================================================================
@@ -695,7 +705,16 @@ def emit(result, header=None, sections=None, use_json=False):
 
     - use_json=True：整行打印一个 JSON 对象
     - use_json=False：打印 header + 各 ---MARKER--- 区块 + ---END---
+
+    v2.5.0：先把 _CONN_WARNINGS 汇进 result["warnings"]（没有则建）——连接层的咨询型
+    警告（如 --jump-password 走了命令行）不能只走 stderr：纯 --json 消费方把 stderr 丢掉，
+    而那正是主要受众。只在真有警告时才建键，其余结果字段集逐字节不变。
     """
+    if _CONN_WARNINGS:
+        _w = result.setdefault("warnings", [])
+        for _m in _CONN_WARNINGS:
+            if _m not in _w:
+                _w.append(_m)
     if use_json:
         print(json.dumps(result, ensure_ascii=False), flush=True)
         return
@@ -792,6 +811,11 @@ def emit_error(use_json, error_type, message, extra=None):
            "warnings": []}
     if extra:
         err.update(extra)
+    # _CONN_WARNINGS 汇进错误结果（连接失败路径同样要看见——例如跳板密码写错时，
+    # 提示"密码在命令行里 ps 可见"的警告必须和失败原因一起到，否则没人会知道）
+    for _m in _CONN_WARNINGS:
+        if _m not in err["warnings"]:
+            err["warnings"].append(_m)
     try:
         if use_json:
             print(json.dumps(err, ensure_ascii=False), flush=True)
@@ -1295,6 +1319,17 @@ def resolve_jump(args, target_user=None):
                 or os.environ.get("PYAISSH_JUMP_PASSWORD") or os.environ.get("PYAISSH_JUMP_KEY")):
             log("[WARN] 指定了跳板凭据（--jump-password/--jump-key/PYAISSH_JUMP_*）但未提供 --jump，已忽略")
         return None
+    if args.jump_password:
+        # 密码走命令行参数会进进程参数表（本地 ps 可见、宿主/AI 的调用记录也会带上）。
+        # 只提示不断行动（参数仍是第一优先，显式覆盖 env 是有意的），给不想留痕的场景一条干净路。
+        # 双通道：stderr 日志（人/交互）+ _CONN_WARNINGS（由 emit/emit_error 汇进结果 JSON 的
+        # warnings[]——纯 --json 消费方把 stderr 丢掉也看得见，那才是主要受众）。
+        _msg = ("--jump-password 会出现在命令行参数里（本地 ps 可见，调用记录也会带上）；"
+                "更干净的方式是设 PYAISSH_JUMP_PASSWORD 环境变量或写 .env（样例见 .env.example；"
+                "显式参数仍然优先）")
+        if _msg not in _CONN_WARNINGS:
+            _CONN_WARNINGS.append(_msg)
+        log("[WARN] " + _msg)
     j_user = None
     j_alias = None
     jump_target = args.jump
@@ -2832,6 +2867,65 @@ def _prepare_exec_command(args):
     return cmd, warnings, sudo_pw, orig_cmd
 
 
+def _load_local_script(args, warnings):
+    """--script：读本地脚本文件，返回 (info, err)。
+
+    info = {local, bytes, sha256, crlf_n}；err = (error_type, message)。
+    与 --cmd-file 的本质差别：内容**不当命令文本**走 SSH 命令行，而是整文件经 SFTP
+    落到远端临时文件后 `bash <path>` 执行——引号嵌套、heredoc、超长脚本都不再是问题，
+    且结果 JSON 的 cmd 回显只有一行（整段脚本不进 JSON，不会撑爆调用方上下文）。
+    """
+    local = _fix_msys_local_path(args.script)
+    try:
+        with open(local, "rb") as f:
+            raw = f.read()
+    except Exception as e:
+        return None, ("read_cmd_failed", "读取 --script 文件失败：%s" % e)
+    # utf-8-sig：剥 BOM——记事本/VS Code 写出的脚本首行会被拼进 ﻿ 而 command not found
+    text = raw.decode("utf-8-sig")
+    crlf_n = 0
+    if not getattr(args, "keep_crlf", False):
+        text, crlf_n = _normalize_cmd_newlines(text)
+        if crlf_n:
+            args._crlf_normalized = crlf_n
+            warnings.append(
+                "脚本有 %d 处 CRLF/CR 行尾，已归一为 LF（远端 bash 会把 \\r 当词的一部分："
+                "$'\\r': command not found、关键字行语法错、heredoc 落盘文件带 CR）；"
+                "要原样发送加 --keep-crlf" % crlf_n)
+    data = text.encode("utf-8")
+    if not data.strip():
+        return None, ("bad_args", "--script 文件为空：%s" % local)
+    import hashlib
+    return {"local": local, "bytes": data, "sha256": hashlib.sha256(data).hexdigest(),
+            "crlf_n": crlf_n}, None
+
+
+def _upload_exec_script(client, info):
+    """把脚本字节写到远端临时文件并返回路径（0600，删不删由调用方决定）。
+
+    放 /tmp 而非作业目录：这是**一次性执行体**，不是要留存的产物；路径带随机后缀，
+    同机并发多个任务不互踩。
+    """
+    sftp = open_sftp(client)
+    try:
+        rpath = "/tmp/.pyaissh-script-%s.sh" % base64.b16encode(os.urandom(6)).decode().lower()
+        _sftp_write_bytes(sftp, rpath, info["bytes"])
+        _sftp_chmod(sftp, rpath, 0o600)
+        return rpath
+    finally:
+        try:
+            sftp.close()
+        except Exception:
+            pass
+
+
+def _cleanup_exec_script(client, rpath):
+    """删远端临时脚本（best-effort）：连接已断/权限不足只记 WARN，不影响已有结果。"""
+    try:
+        client.exec_command("rm -f %s" % _sh_quote(rpath), timeout=15)
+    except Exception as e:
+        log("[WARN] 远端临时脚本删除失败（可手动 rm）：%s（%s）" % (rpath, e))
+
 
 def _connect_exec(args):
     """连接目标（含跳板解析）；成功返回 (conn, client, None)；失败已 emit，返回 (None, None, 退出码)。
@@ -3376,6 +3470,10 @@ def _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client):
             "pty_strip_ansi": bool(args.pty_strip_ansi),
             "cmd": cmd_echo,  # 回显命令（含凭据需脱敏；超 CMD_ECHO_LIMIT 截断，见 cmd_truncated）
             "cmd_truncated": cmd_cut,  # cmd 回显是否被截断（--cmd-file 读入的大脚本）
+            # --script（v2.5.0）：本地脚本经 SFTP 落远端临时文件后 bash 执行；这里回传
+            # local（本地路径）/ remote（远端临时路径，执行后已删）/ bytes / sha256。
+            # 恒有键：非 --script 调用为 null（与 cmd_truncated 同风格，字段集只增不减）。
+            "script": getattr(args, "_script_info", None),
             "output_truncated": bool(drain_truncated or stdout_truncated or stderr_truncated),
             "warnings": warnings,
             "duration_ms": duration,
@@ -3464,6 +3562,10 @@ def _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client):
         emit_error(args.json, error_type, msg, extra=timeout_extra)
         return 124 if error_type != "exec_failed" else 255
     finally:
+        # --script 收尾：删远端临时脚本（best-effort；异常/超时路径也一样要删）
+        _si = getattr(args, "_script_info", None)
+        if _si:
+            _cleanup_exec_script(client, _si["remote"])
         # spill 兜底：成功路径已置 _spill_handled；异常/中断路径在此删除，不留垃圾
         if not _spill_handled:
             _close_spill(spill_out_fh, spill_out_path, keep=False)
@@ -3473,21 +3575,80 @@ def _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client):
 
 def cmd_exec(args):
     """exec 编排：--detach 走后台作业；否则前置校验组装 -> 连接 -> 执行会话（三段独立函数）。"""
+    script_info = None
+    if getattr(args, "script", None):
+        # --script（v2.5.0）：本地脚本整文件走 SFTP 落远端 /tmp 再 bash 执行。两个限制：
+        #   ① 与 --cmd/--cmd-file 三选一（三者同时给无法判定用哪个）；
+        #   ② 暂不支持 --detach——后台作业生命周期长于本连接，临时脚本无人清理。
+        #      长脚本后台化请先 upload 到固定路径，再 exec --detach --cmd 'bash /root/x.sh'。
+        if args.cmd or args.cmd_file:
+            emit_error(args.json, "bad_args",
+                       "--script 与 --cmd/--cmd-file 互斥（三选一：--script 传本地脚本文件，"
+                       "--cmd 传命令文本，--cmd-file 传命令文件）")
+            return 2
+        if getattr(args, "detach", False):
+            emit_error(args.json, "bad_args",
+                       "--script 暂不支持与 --detach 组合（后台作业活得比本连接久，"
+                       "远端临时脚本没人删）；长脚本后台化请先 upload 到固定路径后用 "
+                       "exec --detach --cmd 'bash /root/x.sh'，或用 session run --cmd-file")
+            return 2
     if getattr(args, "detach", False):
         return _cmd_exec_detach(args)
     start = time.time()  # 计时含连接耗时：duration_ms 在跳板/慢网络下偏大
 
-    prepared = _prepare_exec_command(args)
-    if prepared[0] is None:
-        _, (etype, emsg, pwarnings) = prepared
-        extra = {"warnings": pwarnings} if pwarnings else None
-        emit_error(args.json, etype, emsg, extra=extra)
-        return 2  # 本地参数/校验问题，与 bad_args 同级
-    cmd, warnings, sudo_pw, orig_cmd = prepared
+    warnings = []
+    if getattr(args, "script", None):
+        script_info, serr = _load_local_script(args, warnings)
+        if serr:
+            emit_error(args.json, serr[0], serr[1],
+                       extra={"warnings": warnings} if warnings else None)
+            return 2
+        # 凭据启发式照查脚本正文（密码写进脚本和写进 --cmd 一样危险）
+        _w = warn_sensitive_cmd(script_info["bytes"].decode("utf-8", "replace"),
+                                enabled=not getattr(args, "no_credential_warn", False))
+        if _w:
+            warnings.append(_w)
+        if args.sudo and args.pty:
+            emit_error(args.json, "bad_args",
+                       "--sudo 与 --pty 互斥（sudo -S 走 stdin 管道而非 pty）",
+                       extra={"warnings": warnings} if warnings else None)
+            return 2
+
+    if script_info is not None:
+        sudo_pw = (args.sudo_password if args.sudo_password
+                   else os.environ.get("PYAISSH_SUDO_PASSWORD")) if args.sudo else None
+    else:
+        prepared = _prepare_exec_command(args)
+        if prepared[0] is None:
+            _, (etype, emsg, pwarnings) = prepared
+            extra = {"warnings": pwarnings} if pwarnings else None
+            emit_error(args.json, etype, emsg, extra=extra)
+            return 2  # 本地参数/校验问题，与 bad_args 同级
+        cmd, warnings, sudo_pw, orig_cmd = prepared
 
     conn, client, conn_ec = _connect_exec(args)
     if conn_ec is not None:
         return conn_ec
+
+    if script_info is not None:
+        # 连接后才上传：本地文件问题已在上面快速失败，这里只剩网络/SFTP 问题
+        try:
+            rpath = _upload_exec_script(client, script_info)
+        except Exception as e:
+            close_all(client)
+            emit_error(args.json, "script_upload_failed",
+                       "上传 --script 到远端失败：%s（%s）" % (script_info["local"], e),
+                       extra={"warnings": warnings} if warnings else None)
+            return 1
+        cmd = "bash %s" % rpath
+        if args.sudo:
+            cmd = (("sudo -S -p '' %s" % cmd) if sudo_pw else ("sudo -n %s" % cmd))
+        orig_cmd = cmd  # 凭据启发式只看这一行（脚本正文已在上面单独查过）
+        args._script_info = {"local": script_info["local"], "remote": rpath,
+                             "bytes": len(script_info["bytes"]),
+                             "sha256": script_info["sha256"]}
+        log("[OK] 脚本已传远端：%s（%d B，sha256 %s…）"
+            % (rpath, len(script_info["bytes"]), script_info["sha256"][:12]))
 
     return _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client)
 
@@ -7415,7 +7576,7 @@ def build_parser():
   要"边跑边看"或超过宿主调用上限                     --detach，再用 pyaissh log 增量读
   静默但想确认还活着（不解决卡死判定）               --progress 30
   输出很大（>64KB）                                  完整输出自动落 spill，读 stdout_spill_file
-  命令里有 $ 等特殊字符（PowerShell 会吃）           写脚本文件后 --cmd-file -（勿内联）
+  命令里有 $ 等特殊字符（PowerShell 会吃）           写脚本文件后 --cmd-file -（勿内联）；本地已有 .sh 更好：--script（SFTP 传远端 → bash 执行 → 自动删，脚本正文不进 JSON）
   Windows 工具写出的脚本/命令（CRLF 行尾）          默认已归一为 LF，无需 sed -i 's/\r$//'
                                                      （结果回传 crlf_normalized；要原样发加 --keep-crlf）
 """)
@@ -7423,6 +7584,11 @@ def build_parser():
     p.add_argument("--cmd", help="要执行的命令")
     p.add_argument("--cmd-file", dest="cmd_file",
                    help="从文件读命令 (- 表示 stdin，适合长脚本/特殊字符)")
+    p.add_argument("--script", dest="script",
+                   help="本地脚本文件（v2.5.0）：整文件经 SFTP 传到远端 /tmp 后 bash 执行、"
+                        "用完自动删。适合长脚本/heredoc/引号嵌套——不必再 base64+printf 管进 "
+                        "--cmd-file；结果 cmd 回显只有一行 bash <path>，整段脚本不进 JSON。"
+                        "与 --cmd/--cmd-file 互斥；不支持 --detach")
     p.add_argument("--keep-crlf", dest="keep_crlf", action="store_true",
                    help="保留命令文本里的 CRLF/CR 行尾（默认归一为 LF，避免远端 bash 把 \\r 当"
                         "词的一部分：$'\\r': command not found、heredoc 落盘文件带 CR）；"
@@ -7885,12 +8051,13 @@ def main():
     # 进程内复用（AI 嵌入/测试 harness 同进程多次调 main()）时，上一次调用的
     # 全局状态会污染本次：SIGTERM 标志不复位会让 responder 线程强关新连接
     # （实测中断后同进程后续调用 0.00s 即 interrupted/130 失败）；活动连接
-    # 清单与上传残留警告不清会串到本次结果。CLI 每命令一进程，重置无副作用。
+    # 清单、上传残留警告与连接层咨询警告不清会串到本次结果。CLI 每命令一进程，重置无副作用。
     _SIGTERM_RECEIVED = False
     _INTERRUPT_SOURCE = "SIGTERM"
     _CURRENT_ACTION = None
     _ACTIVE_TRANSPORTS.clear()
     _PUT_RESIDUE_WARNINGS.clear()
+    _CONN_WARNINGS.clear()
     _setup_signal_handlers()
     # 信号救援线程：解救 KI 在 paramiko C 级 I/O 中展开导致的死锁/长尾。
     # 只启动一次（单例）：每次 main() 都启动会在进程内复用场景泄漏线程

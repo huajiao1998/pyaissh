@@ -160,6 +160,17 @@ def resolve_jump(args, target_user=None):
                 or os.environ.get("PYAISSH_JUMP_PASSWORD") or os.environ.get("PYAISSH_JUMP_KEY")):
             log("[WARN] 指定了跳板凭据（--jump-password/--jump-key/PYAISSH_JUMP_*）但未提供 --jump，已忽略")
         return None
+    if args.jump_password:
+        # 密码走命令行参数会进进程参数表（本地 ps 可见、宿主/AI 的调用记录也会带上）。
+        # 只提示不断行动（参数仍是第一优先，显式覆盖 env 是有意的），给不想留痕的场景一条干净路。
+        # 双通道：stderr 日志（人/交互）+ _CONN_WARNINGS（由 emit/emit_error 汇进结果 JSON 的
+        # warnings[]——纯 --json 消费方把 stderr 丢掉也看得见，那才是主要受众）。
+        _msg = ("--jump-password 会出现在命令行参数里（本地 ps 可见，调用记录也会带上）；"
+                "更干净的方式是设 PYAISSH_JUMP_PASSWORD 环境变量或写 .env（样例见 .env.example；"
+                "显式参数仍然优先）")
+        if _msg not in _CONN_WARNINGS:
+            _CONN_WARNINGS.append(_msg)
+        log("[WARN] " + _msg)
     j_user = None
     j_alias = None
     jump_target = args.jump

@@ -91,7 +91,16 @@ def emit(result, header=None, sections=None, use_json=False):
 
     - use_json=True：整行打印一个 JSON 对象
     - use_json=False：打印 header + 各 ---MARKER--- 区块 + ---END---
+
+    v2.5.0：先把 _CONN_WARNINGS 汇进 result["warnings"]（没有则建）——连接层的咨询型
+    警告（如 --jump-password 走了命令行）不能只走 stderr：纯 --json 消费方把 stderr 丢掉，
+    而那正是主要受众。只在真有警告时才建键，其余结果字段集逐字节不变。
     """
+    if _CONN_WARNINGS:
+        _w = result.setdefault("warnings", [])
+        for _m in _CONN_WARNINGS:
+            if _m not in _w:
+                _w.append(_m)
     if use_json:
         print(json.dumps(result, ensure_ascii=False), flush=True)
         return
@@ -188,6 +197,11 @@ def emit_error(use_json, error_type, message, extra=None):
            "warnings": []}
     if extra:
         err.update(extra)
+    # _CONN_WARNINGS 汇进错误结果（连接失败路径同样要看见——例如跳板密码写错时，
+    # 提示"密码在命令行里 ps 可见"的警告必须和失败原因一起到，否则没人会知道）
+    for _m in _CONN_WARNINGS:
+        if _m not in err["warnings"]:
+            err["warnings"].append(_m)
     try:
         if use_json:
             print(json.dumps(err, ensure_ascii=False), flush=True)

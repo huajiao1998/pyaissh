@@ -31,7 +31,7 @@ pyaissh 是基于 paramiko 的命令行 SSH 工具，专为非交互的 AI/脚�
 5. 退出码仅粗筛，**决策一律以 `error` 字段为准**（超时退出码为 124，与连接失败 255 区分）
 6. 多主机/跳板场景：**无论失败发生在跳板机还是目标机，JSON 的 `host`/`user`/`port` 恒指向目标机**；若 message 带 `[跳板机 user@host]` 前缀，说明失败发生在**跳板机侧**；连接期 `bad_args` 无 `host`/`user` 字段（目标尚未解析出来）；**连接成功后的路径类 `bad_args` 带 `host`/`user`/`port`**
 7. **大文件慢/超时：加 `--parallel 8`**（**下载 ≥8MB 默认自动 4 连接**；显式 `--parallel N` ≥64KB 即分片，上传同参数，与 `--resume` 互斥；**实际档位看结果 `parallel_used`**；8 不行反试 4/2）。**所有传输路径都写 `.part.<pid>` 成功后原子改名**（下载的在本地、上传的在远端）——失败/中断不留半截最终文件（上传中断可能残留 `.part`，warnings 会给清理命令）。细节见 `docs/transfer.md`
-8. **`--cmd` vs `--cmd-file -` 按调用环境选**：bash/常规 shell 用 `--cmd '...'`（标准引号规则，单引号包住即原样传远端）；**调用环境是 Windows PowerShell 时**，`--cmd` 会先被 PowerShell 解析（`$` 插值、`\` 非转义）→ 含 `$()`/反引号/多行/引号组合的复杂命令**一律用 `--cmd-file -`**；拿不准就用它
+8. **`--cmd` vs `--cmd-file -` vs `--script` 按调用环境选**：bash/常规 shell 用 `--cmd '...'`（标准引号规则，单引号包住即原样传远端）；**调用环境是 Windows PowerShell 时**，`--cmd` 会先被 PowerShell 解析（`$` 插值、`\` 非转义）→ 含 `$()`/反引号/多行/引号组合的复杂命令**一律用 `--cmd-file -`**；**本地已经有 `.sh` 文件时首选 `--script`**（v2.5.0：整文件 SFTP 传远端 `/tmp` 后 `bash` 执行、用完自动删，零转义，且脚本正文不回显进 JSON 的 `cmd`）；拿不准就用 `--script`/`--cmd-file -`。**PowerShell 下看到中文乱码先看上一条**（`[Console]::OutputEncoding`，与选哪个参数无关）
 9. **`file_list.path` 语义两侧不同，勿混用**：upload 的 `path` 是**本地**路径/相对路径（重试本地定位用），download 的 `path` 是**远端**相对路径（重试远端定位用）——写重试逻辑时按方向取对侧的路径
 10. **普通用户登录要提权：加 `--sudo`**（`sudo -S` 提权，复合命令自动 `bash -c` 整链提权）；密码走 `--sudo-password`/`PYAISSH_SUDO_PASSWORD`，**只经 SSH stdin 注入**（命令/日志无密码）；无密码时自动 `sudo -n` 免密探测（需密码则立即失败不挂）；`--sudo` 与 `--pty` 互斥
 
@@ -43,6 +43,7 @@ pyaissh 是基于 paramiko 的命令行 SSH 工具，专为非交互的 AI/脚�
 
 ## 输出约定（核心，完整版见 docs/contract.md）
 
+- ⚠️ **Windows + PowerShell 捕获/管道下中文乱码 = 调用方的锅，不是工具的**：产品侧 stdout/stderr/stdin **恒为 UTF-8**（无条件重配，`> file` 字节直通同样是 UTF-8）；乱码只发生在 PowerShell **解码**的那两条路——`$x = pyaissh ...` 收变量、`pyaissh ... | findstr/Select-String` 过管道，因为它用 `[Console]::OutputEncoding`（中文 Windows 默认 **gb2312**）解 UTF-8 字节。**修法**：`$PROFILE` 里贴 `function pyaissh {...}`（设 `[Console]::OutputEncoding` + `$OutputEncoding` 为 UTF-8 再调 python）——**完整可复制片段、A/B 实测与"只想单次顶一下"的写法见 docs/setup.md「Windows + PowerShell」节**。临时顶一下：命令前 `[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false);`
 - **stdout 才是可解析结果**（进度日志全在 stderr）；**默认即 JSON**，直接 `json.loads`；`--text` 仅供人类速览（AI 一律用默认 JSON）
 - **`--field` 消费端免样板**（v1.5.16）：**标准示例 `--field stdout,-stderr`**——**要某字段的裸值时用它代替手写 `json.loads`**；stdout/stderr 各走对应通道（**stderr 报错不被吞**：只读 stdout 曾丢过认证失败的真实原因）；`-` 前缀=打 stderr，多字段逗号分隔每行一个；与 `--text` 互斥；错误路径仍输出完整 JSON；该模式 stderr 无进度日志（仅 WARN/提示）——**不要 `2>/dev/null`**
 - **`ok` 与 `exit_success` 区分**：`ok=true` 只表示工具操作成功（连接+执行完成）；**远程命令成败看 `exit_success`**（例：`exit 3` → `ok=true, exit_code=3, exit_success=false`）
@@ -71,8 +72,9 @@ python3 pyaissh.py exec root@1.2.3.4 --cmd 'df -h'
 python3 pyaissh.py exec root@1.2.3.4 --cmd-file - <<'EOF'   # 长脚本走 stdin（PowerShell 调用时复杂命令务必如此）
 ls -la /var/log
 EOF
+python3 pyaissh.py exec root@1.2.3.4 --script ./deploy.sh     # 本地脚本直达远端（v2.5.0：SFTP→bash→自动删，零转义）
 ```
-超时双参数（`--idle-timeout`/`--max-time`，均退出码 124）、输出截断（`--max-output` 默认 64KB，超出自动落 spill 文件并把路径写进 `stdout_spill_file`/`next_action`）、`--pty`/`--pty-strip-ansi`、`--encoding`（GBK 系统日志乱码时指定编码）、`--sudo`（见速查第 10 条）、`--progress [SECS]`（v2.1 长任务心跳：静默每 N 秒打 `[PROGRESS] 仍在运行`，不重置静默计时）完整语义见 **docs/exec.md**；**调参照 `pyaissh exec --help` 末尾的"场景 → 参数"表**（systemctl/apt/编译各该给多少 idle/max）
+超时双参数（`--idle-timeout`/`--max-time`，均退出码 124）、输出截断（`--max-output` 默认 64KB，超出自动落 spill 文件并把路径写进 `stdout_spill_file`/`next_action`）、`--pty`/`--pty-strip-ansi`、`--encoding`（GBK 系统日志乱码时指定编码）、`--sudo`（见速查第 10 条）、`--progress [SECS]`（v2.1 长任务心跳：静默每 N 秒打 `[PROGRESS] 仍在运行`，不重置静默计时）、**`--script <本地.sh>`（v2.5.0：整文件 SFTP 传远端 `/tmp` 后 `bash` 执行、用完自动删；与 `--cmd`/`--cmd-file` 互斥、暂不支持 `--detach`；`cmd` 回显只有一行，脚本正文不进 JSON）**完整语义见 **docs/exec.md**；**调参照 `pyaissh exec --help` 末尾的"场景 → 参数"表**（systemctl/apt/编译各该给多少 idle/max）
 
 ### exec --detach + log — 后台作业（v2.2，长任务"边跑边看"）
 ```bash

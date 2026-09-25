@@ -237,7 +237,7 @@ def build_parser():
   要"边跑边看"或超过宿主调用上限                     --detach，再用 pyaissh log 增量读
   静默但想确认还活着（不解决卡死判定）               --progress 30
   输出很大（>64KB）                                  完整输出自动落 spill，读 stdout_spill_file
-  命令里有 $ 等特殊字符（PowerShell 会吃）           写脚本文件后 --cmd-file -（勿内联）
+  命令里有 $ 等特殊字符（PowerShell 会吃）           写脚本文件后 --cmd-file -（勿内联）；本地已有 .sh 更好：--script（SFTP 传远端 → bash 执行 → 自动删，脚本正文不进 JSON）
   Windows 工具写出的脚本/命令（CRLF 行尾）          默认已归一为 LF，无需 sed -i 's/\r$//'
                                                      （结果回传 crlf_normalized；要原样发加 --keep-crlf）
 """)
@@ -245,6 +245,11 @@ def build_parser():
     p.add_argument("--cmd", help="要执行的命令")
     p.add_argument("--cmd-file", dest="cmd_file",
                    help="从文件读命令 (- 表示 stdin，适合长脚本/特殊字符)")
+    p.add_argument("--script", dest="script",
+                   help="本地脚本文件（v2.5.0）：整文件经 SFTP 传到远端 /tmp 后 bash 执行、"
+                        "用完自动删。适合长脚本/heredoc/引号嵌套——不必再 base64+printf 管进 "
+                        "--cmd-file；结果 cmd 回显只有一行 bash <path>，整段脚本不进 JSON。"
+                        "与 --cmd/--cmd-file 互斥；不支持 --detach")
     p.add_argument("--keep-crlf", dest="keep_crlf", action="store_true",
                    help="保留命令文本里的 CRLF/CR 行尾（默认归一为 LF，避免远端 bash 把 \\r 当"
                         "词的一部分：$'\\r': command not found、heredoc 落盘文件带 CR）；"
@@ -707,12 +712,13 @@ def main():
     # 进程内复用（AI 嵌入/测试 harness 同进程多次调 main()）时，上一次调用的
     # 全局状态会污染本次：SIGTERM 标志不复位会让 responder 线程强关新连接
     # （实测中断后同进程后续调用 0.00s 即 interrupted/130 失败）；活动连接
-    # 清单与上传残留警告不清会串到本次结果。CLI 每命令一进程，重置无副作用。
+    # 清单、上传残留警告与连接层咨询警告不清会串到本次结果。CLI 每命令一进程，重置无副作用。
     _SIGTERM_RECEIVED = False
     _INTERRUPT_SOURCE = "SIGTERM"
     _CURRENT_ACTION = None
     _ACTIVE_TRANSPORTS.clear()
     _PUT_RESIDUE_WARNINGS.clear()
+    _CONN_WARNINGS.clear()
     _setup_signal_handlers()
     # 信号救援线程：解救 KI 在 paramiko C 级 I/O 中展开导致的死锁/长尾。
     # 只启动一次（单例）：每次 main() 都启动会在进程内复用场景泄漏线程

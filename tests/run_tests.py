@@ -788,6 +788,92 @@ def suite_unit_artifacts(s):
             _items.get("LANG") == m.SESSION_DEFAULT_LANG and _items2.get("LANG") == "zh_CN.UTF-8",
             "无=%r 有=%r" % (_items.get("LANG"), _items2.get("LANG")))
 
+    # ---- 负面参数面（离线：argparse 在连接前就拒，不必占真机往返）----
+    # B2（v2.4.0 收口，从 live_session_bugs 挪来）：`--no-pty` 参数已删除，传了必须被当场拒绝。
+    # 通道注意：判据看 **stdout 的结构化 JSON**（error=bad_args + message 点明参数名），
+    # stderr 只有 argparse 的 usage 行——不能拿 stderr 当判据（这正是当年挂过的坑）。
+    _p = subprocess.run([sys.executable, "-B", _bin(),
+                         "session", "start", "root@127.0.0.1:1", "--name", "nopty_offline",
+                         "--no-pty"], capture_output=True, text=True, encoding="utf-8",
+                        errors="replace", timeout=60, cwd=_REPO)
+    _jn = _last_json(_p)
+    s.check("B2 --no-pty 已删除：rc=2 + stdout JSON 点明参数名（离线，不需真机）",
+            _p.returncode == 2 and (_jn or {}).get("error") == "bad_args"
+            and "no-pty" in ((_jn or {}).get("message") or ""),
+            "rc=%s json=%r" % (_p.returncode, _jn))
+    # exec --script（v2.5.0）：与 --cmd/--cmd-file 三选一；暂不支持 --detach。同样离线可验。
+    _pm = subprocess.run([sys.executable, "-B", _bin(), "exec", "root@127.0.0.1:1",
+                          "--cmd", "echo x", "--script", "no_such_local.sh"],
+                         capture_output=True, text=True, encoding="utf-8",
+                         errors="replace", timeout=60, cwd=_REPO)
+    _jm = _last_json(_pm)
+    s.check("--script 与 --cmd/--cmd-file 互斥（bad_args，离线）",
+            _pm.returncode == 2 and (_jm or {}).get("error") == "bad_args"
+            and "互斥" in ((_jm or {}).get("message") or ""),
+            "rc=%s json=%r" % (_pm.returncode, _jm))
+    _pd = subprocess.run([sys.executable, "-B", _bin(), "exec", "root@127.0.0.1:1",
+                          "--script", "no_such_local.sh", "--detach"],
+                         capture_output=True, text=True, encoding="utf-8",
+                         errors="replace", timeout=60, cwd=_REPO)
+    _jd = _last_json(_pd)
+    s.check("--script 暂不支持 --detach（bad_args 且给出替代做法，离线）",
+            _pd.returncode == 2 and (_jd or {}).get("error") == "bad_args"
+            and "--detach" in ((_jd or {}).get("message") or ""),
+            "rc=%s json=%r" % (_pd.returncode, _jd))
+    # 跳板密码走命令行参数时的提醒（v2.5.0）：**必须同时进 stderr 与结果 JSON 的 warnings[]**——
+    # 纯 --json 消费方把 stderr 丢掉也能看见（那正是主要受众）。断言以 JSON 为准（stderr 顺带查）。
+    # 目标写 127.0.0.1:1 只为让连接立刻失败，警告在连接前就产生，不依赖真机。
+    _pj = subprocess.run([sys.executable, "-B", _bin(), "exec", "root@127.0.0.1:1",
+                          "--jump", "root@127.0.0.1:1", "--jump-password", "x",
+                          "--cmd", "echo hi"],
+                         capture_output=True, text=True, encoding="utf-8",
+                         errors="replace", timeout=60, cwd=_REPO,
+                         env=dict(os.environ, PYAISSH_PASSWORD=""))
+    _jw = _last_json(_pj) or {}
+    _jw_txt = _jw.get("warnings") or []
+    s.check("--jump-password 命令行提醒进 JSON warnings[]（纯 --json 消费方也看得见）",
+            any("ps 可见" in w and "PYAISSH_JUMP_PASSWORD" in w for w in _jw_txt),
+            "warnings=%r" % _jw_txt)
+    s.check("--jump-password 命令行提醒同时打 stderr（交互/人看得见）",
+            "ps 可见" in _pj.stderr and "PYAISSH_JUMP_PASSWORD" in _pj.stderr,
+            "stderr 尾=%r" % (_pj.stderr or "")[-120:])
+    # 不传 --jump-password 时结果字段集不变（warnings 恒空，不因新机制多出内容）
+    _pk = subprocess.run([sys.executable, "-B", _bin(), "exec", "root@127.0.0.1:1",
+                          "--cmd", "echo hi"],
+                         capture_output=True, text=True, encoding="utf-8",
+                         errors="replace", timeout=60, cwd=_REPO,
+                         env=dict(os.environ, PYAISSH_PASSWORD=""))
+    s.check("不带 --jump-password 时 warnings 恒空（新机制不污染普通结果）",
+            ((_last_json(_pk) or {}).get("warnings") or []) == [],
+            repr(_last_json(_pk))[:160])
+    # 成功路径的 funnel（emit）离线单测：_CONN_WARNINGS 非空时汇进 result["warnings"]，
+    # 结果原本没有该键就建一个；缓冲为空则**一个字节都不动**（字段集不变性的关键）。
+    import io as _io
+    import contextlib as _ctx
+    _m = _module()
+    _buf = _io.StringIO()
+    with _ctx.redirect_stdout(_buf):
+        _m.emit({"ok": True, "action": "probe"}, use_json=True)
+    _probe = json.loads(_buf.getvalue())
+    s.check("emit：无连接层警告时不给结果加 warnings 键（字段集不变）",
+            "warnings" not in _probe, repr(_probe))
+    _m._CONN_WARNINGS.append("probe-warning")
+    _buf2 = _io.StringIO()
+    with _ctx.redirect_stdout(_buf2):
+        _m.emit({"ok": True, "action": "probe"}, use_json=True)
+    _probe2 = json.loads(_buf2.getvalue())
+    _m._CONN_WARNINGS.clear()
+    s.check("emit：有连接层警告时汇进 warnings[]（原本没有该键也建）",
+            _probe2.get("warnings") == ["probe-warning"], repr(_probe2))
+    _buf3 = _io.StringIO()
+    _m._CONN_WARNINGS.append("probe-warning")
+    with _ctx.redirect_stdout(_buf3):
+        _m.emit({"ok": True, "action": "probe", "warnings": ["别的"]}, use_json=True)
+    _w3 = json.loads(_buf3.getvalue()).get("warnings")
+    _m._CONN_WARNINGS.clear()
+    s.check("emit：已有 warnings 时追加不覆盖、不重复（连接警告排在后面）",
+            _w3 == ["别的", "probe-warning"], repr(_w3))
+
 
 # ============================================================
 # 测试集 4：unit host add/remove/list 闭环（v2.1.4 自动化）
@@ -950,9 +1036,95 @@ def suite_live_sudo(s):
 
 
 # ============================================================
-# 测试集 4：live exec 行为 + --field（19 例）
+# 测试集 3.5：exec --script（v2.5.0；SFTP 传远端 → bash 执行 → 清理）
+# 覆盖：成功（含引号嵌套/heredoc）、执行后远端无残留、失败路径也清理、
+#       CRLF 归一、脚本正文不进 JSON、--script 元数据字段。
 # ============================================================
 
+def suite_live_exec_script(s):
+    if _missing_env(_REQ_EXEC):
+        print("SKIP: 需配置 %s" % " / ".join(_REQ_EXEC))
+        return None
+    tgt = os.environ["PYAISSH_TEST_HOST"]
+    import hashlib
+    import shutil
+    import tempfile
+    cdir = tempfile.mkdtemp(prefix="pyaissh_script_")
+    try:
+        # 引号嵌套 + heredoc + $ 变量：这正是当年 base64+printf 舞蹈要解决的那类脚本
+        body = (
+            "set -e\n"
+            "NAME='he said \"hi\"'\n"
+            "cat <<'EOF'\n"
+            "nested 'quote' and \"dquote\"\n"
+            "EOF\n"
+            "printf '%s\\n' \"$NAME\"\n"
+            "printf 'SUM=%d\\n' $((1+2))\n"
+            "echo SCRIPT_OK\n"
+        )
+        f = os.path.join(cdir, "s.sh")
+        with open(f, "w", encoding="utf-8", newline="") as fh:
+            fh.write(body)
+        want_sha = hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+        rc, j, _ = _live_run(["exec", tgt, "--script", f], timeout=120)
+        si = (j or {}).get("script") or {}
+        ok = (rc == 0 and (j or {}).get("exit_success") is True
+              and "SCRIPT_OK" in ((j or {}).get("stdout") or "")
+              and "SUM=3" in ((j or {}).get("stdout") or ""))
+        s.check("--script：引号嵌套/heredoc 脚本成功执行", ok, "rc=%s %r" % (rc, repr(j)[:200]))
+        s.check("--script：cmd 回显只有一行 bash <path>（脚本正文不进 JSON）",
+                (j or {}).get("cmd") == "bash %s" % si.get("remote")
+                and body not in json.dumps(j, ensure_ascii=False), repr((j or {}).get("cmd")))
+        s.check("--script：script 元数据（local/remote/bytes/sha256）齐全且对得上",
+                si.get("local") == f
+                and str(si.get("remote", "")).startswith("/tmp/.pyaissh-script-")
+                and si.get("remote", "").endswith(".sh")
+                and si.get("bytes") == len(body.encode("utf-8"))
+                and si.get("sha256") == want_sha, repr(si))
+
+        # 清理：成功路径执行完，远端临时文件必须已经不在。
+        # 用 if [ -e ] 判定而不是 ls/test 的退出码——文件不存在时它们返回 1，
+        # 会把"清理成功"误判成失败（本次实测踩过：断言写成 rc==0，其实文件已经没了）。
+        rpath = si.get("remote") or "/tmp/__pyaissh_no_such__"
+        rc2, j2, _ = _live_run(["exec", tgt, "--cmd",
+                                "if [ -e %s ]; then echo STILL_THERE; else echo CLEANED; fi" % rpath],
+                               timeout=60)
+        s.check("--script：执行后远端临时脚本已删除",
+                rc2 == 0 and "CLEANED" in ((j2 or {}).get("stdout") or "")
+                and "STILL_THERE" not in ((j2 or {}).get("stdout") or ""), repr(j2)[:160])
+
+        # 失败路径也清理（exit 3）
+        bad = os.path.join(cdir, "bad.sh")
+        with open(bad, "w", encoding="utf-8", newline="") as fh:
+            fh.write("echo BEFORE_FAIL\nexit 3\n")
+        rc3, j3, _ = _live_run(["exec", tgt, "--script", bad], timeout=60)
+        si3 = (j3 or {}).get("script") or {}
+        rb = si3.get("remote") or "/tmp/__pyaissh_no_such__"
+        rc4, j4, _ = _live_run(["exec", tgt, "--cmd",
+                                "if [ -e %s ]; then echo STILL_THERE; else echo CLEANED; fi" % rb],
+                               timeout=60)
+        s.check("--script：脚本失败（exit 3）也清理远端临时文件",
+                rc3 == 3 and (j3 or {}).get("exit_code") == 3
+                and "BEFORE_FAIL" in ((j3 or {}).get("stdout") or "")
+                and rc4 == 0 and "CLEANED" in ((j4 or {}).get("stdout") or ""),
+                "rc3=%s j4=%r" % (rc3, repr(j4)[:140]))
+
+        # CRLF 脚本：归一 + 计数回传（与 --cmd-file 同语义）
+        crlf_f = os.path.join(cdir, "crlf.sh")
+        with open(crlf_f, "w", encoding="utf-8", newline="") as fh:
+            fh.write("echo CRLF_SCRIPT_OK\r\n")
+        rc5, j5, _ = _live_run(["exec", tgt, "--script", crlf_f], timeout=60)
+        s.check("--script：CRLF 脚本归一后正常跑（crlf_normalized=1）",
+                rc5 == 0 and (j5 or {}).get("crlf_normalized") == 1
+                and "CRLF_SCRIPT_OK" in ((j5 or {}).get("stdout") or ""), repr(j5)[:160])
+    finally:
+        shutil.rmtree(cdir, ignore_errors=True)
+
+
+# ============================================================
+# 测试集 4：live exec 行为 + --field（19 例）
+# ============================================================
 _REQ_EXEC = ["PYAISSH_TEST_HOST", "PYAISSH_TEST_PASSWORD"]
 
 
@@ -2177,16 +2349,9 @@ def suite_live_session_bugs(s):
             "%.1fs status=%s" % (_dt1, (jb1 or {}).get("status")))
     _live_run(["session", "kill", tgt, "--name", name + "b1"], timeout=60)
 
-    # B2（v2.4.0 收口）：`--no-pty` 参数已彻底删除（旧引擎的非 PTY 降级路径随之消失）——
-    #     传它必须被 argparse 当场拒绝（rc=2），不能静默忽略。
-    #     注意断言通道：具体错误走 **stdout 的结构化 JSON**（`error=bad_args` + `message` 里点明参数名），
-    #     stderr 只有 argparse 的 usage 行——所以判据看 JSON，不看 stderr。
-    rc, jbnp, errnp = _live_run(["session", "start", tgt, "--name", name + "np", "--no-pty"],
-                                timeout=90)
-    s.check("B2 --no-pty 已被删除：rc=2 + stdout JSON 里点明参数名（不静默接受）",
-            rc == 2 and (jbnp or {}).get("error") == "bad_args"
-            and "no-pty" in ((jbnp or {}).get("message") or ""),
-            "rc=%s json=%r stderr=%r" % (rc, jbnp, (errnp or "")[-80:]))
+    # B2（v2.4.0 收口）：`--no-pty` 参数已彻底删除（旧引擎的非 PTY 降级路径随之消失）。
+    #     负面断言（传了必须被 argparse 拒绝）已挪到 **unit_artifacts**——它不需要连接，
+    #     任何会话都能秒级复验；这里只留真机正面断言（普通会话照常起）。
     rc, jbnp2, _ = _live_run(["session", "start", tgt, "--name", name + "np"], timeout=90)
     s.check("B2 不带 --no-pty 的普通会话仍正常（pty=True + ready）",
             bool(jbnp2) and jbnp2.get("pty") is True and jbnp2.get("ready") is True,
@@ -2216,6 +2381,7 @@ SUITES = [
     ("unit_host", "host add/remove/list 闭环（副本 .env，v2.1.4 自动化）", suite_unit_host),
     ("live_sudo", "--sudo 提权（真机）", suite_live_sudo),
     ("live_exec_field", "exec+field（真机）", suite_live_exec_field),
+    ("live_exec_script", "exec --script：SFTP 传脚本→bash 执行→清理（真机，v2.5.0）", suite_live_exec_script),
     ("live_transfer", "传输往返（真机：默认/并行/续传/排除）", suite_live_transfer),
     ("live_session", "会话 core（真机：PTY/状态保留/退出码/ctrl-c/keys/kill）", suite_live_session),
     # v2.4.0：live_session 按"改动路径"拆块——开发时只跑动过的那块（`--suite live_session_engine`），

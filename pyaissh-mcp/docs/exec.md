@@ -10,6 +10,7 @@ python3 pyaissh.py exec root@1.2.3.4 --cmd 'df -h'
 python3 pyaissh.py exec root@1.2.3.4 --cmd-file - <<'EOF'   # 长脚本/复杂命令走 stdin（Windows PowerShell 调用时复杂命令务必如此）
 ls -la /var/log
 EOF
+python3 pyaissh.py exec root@1.2.3.4 --script ./deploy.sh     # 本地脚本文件直达远端执行（v2.5.0：SFTP→bash→自动删，脚本正文不进 JSON）
 python3 pyaissh.py exec root@1.2.3.4 --idle-timeout 120 --cmd 'tail -f /var/log/x.log'
 python3 pyaissh.py exec root@1.2.3.4 --max-time 1200 --cmd 'apt upgrade'  # 长任务调大总时长上限
 python3 pyaissh.py exec root@1.2.3.4 --pty --cmd 'top -b -n 1'           # 需要 TTY 的非交互命令
@@ -40,6 +41,23 @@ EOF
 ```
   （外层 heredoc 喂给 pyaissh 的命令脚本本身也用引住的定界符；命令含 `$`/反引号时 `--cmd-file -` 在 bash/Git Bash 下同样是首选，不只 PowerShell）
 - **Git Bash 路径**：`--cmd-file` / `--spill-dir` 与 `--local` 同款 MSYS 转换——经 `./pyaissh` 包装器（禁路径转换）时，Unix 风格路径（`/tmp/x.sh`）自动转 Windows 真实路径，不会落错位置或报 Errno 2；Linux 直接运行时原样透传
+
+### `--script <本地脚本>`：本地脚本直达远端执行（v2.5.0）
+
+**解决什么**：本地已经写好一个 `.sh`（长脚本、heredoc、引号嵌套），此前只有两条路——`--cmd '...'` 内联（PowerShell 吃 `$`、引号定界走钢丝）或 `--cmd-file -`（还得 base64/printf 搬过来、且整段脚本会回显进 JSON 的 `cmd` 字段）。`--script` 把整文件经 **SFTP** 落到远端 `/tmp/.pyaissh-script-<随机>.sh`（0600）再 `bash <path>` 执行，**用完自动删**。
+
+```bash
+python3 pyaissh.py exec root@1.2.3.4 --script ./deploy.sh        # 本地脚本 → 远端执行
+python3 pyaissh.py exec root@1.2.3.4 --script ./deploy.sh --sudo # 提权执行（sudo bash <path>）
+python3 pyaissh.py exec root@1.2.3.4 --script ./deploy.sh --pty  # 需要 TTY 时
+```
+
+- **互斥**：与 `--cmd`/`--cmd-file` 三选一（同时给报 `bad_args`）；**暂不支持 `--detach`**——后台作业活得比本连接久，临时脚本没人删。长脚本后台化：先 `upload` 到固定路径，再 `exec --detach --cmd 'bash /root/x.sh'`，或用 `session run --cmd-file`
+- **`cmd` 回显只有一行** `bash /tmp/.pyaissh-script-xxxx.sh`——**整段脚本不进 JSON**（不会再撑爆调用方上下文；凭据脱敏的责任随之缩小，但脚本里的密码仍会被同一个启发式扫到并 WARN）
+- **新字段 `script`（恒有键，非 `--script` 时为 `null`）**：`local`（本地路径）/ `remote`（远端临时路径，执行后已删）/ `bytes`（字节数）/ `sha256`（上传内容的 sha256，可对账）
+- **CRLF 归一同 `--cmd-file`**：Windows 工具写出的脚本默认归一为 LF 并回传 `crlf_normalized`；`--keep-crlf` 可关。BOM 自动剥（记事本/VS Code 产物首行不会被拼进 `﻿`）
+- **清理**：成功/失败/超时/异常路径都在 `finally` 里删远端临时文件（best-effort：连接已断时只 WARN，可照 `script.remote` 手动 `rm`）
+- **执行体是 `bash`**：脚本不需要可执行位，也不依赖 shebang（要 `python3 x.py` 就在脚本里自己调，或 `--cmd "python3 ..."`）
 
 ### 长任务配方（apt 安装 / 大传输 / 镜像拉取 / 编译等 2-10 分钟零输出操作）
 

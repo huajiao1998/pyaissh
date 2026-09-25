@@ -969,3 +969,58 @@
   字段集不变）；契约基线 `tests/contract/session_contract_v2.json` 的 `start_created`/`start_attach`
   两个用例同步去掉该键，`docs/contract.md`/`docs/session.md` 的说明一并删除。迁移期的"字段集一字不变"
   已由 SPEC V1 的 21/21 证据完成使命，不再保留恒空字段。
+
+## [2.5.0] - 2026-09-25
+
+### 新增
+- exec 新参数 **`--script <本地脚本>`**：本地 `.sh` 整文件经 **SFTP** 落到远端
+  `/tmp/.pyaissh-script-<随机>.sh`（0600）后 `bash <path>` 执行，**用完自动删**。
+  解决"本地脚本 → base64 → printf 管进 `--cmd-file -`"的搬运舞：引号嵌套、heredoc、
+  超长脚本都不再需要转义；且结果 JSON 的 `cmd` 回显**只有一行** `bash <path>`，
+  整段脚本不再进 JSON（不会再撑爆调用方上下文）。
+  - 结果新增恒有键 **`script`**（非 `--script` 调用为 `null`）：
+    `local`（本地路径）/ `remote`（远端临时路径，执行后已删）/ `bytes` / `sha256`（可对账）。
+  - 互斥：与 `--cmd`/`--cmd-file` 三选一（`bad_args`）；**暂不支持 `--detach`**——
+    后台作业活得比本连接久，临时脚本没人删；长脚本后台化请先 `upload` 到固定路径再
+    `exec --detach --cmd 'bash /root/x.sh'`，或用 `session run --cmd-file`。
+  - CRLF 归一 / BOM 剥离 / `crlf_normalized` 回传 / 凭据启发式（扫脚本正文）与
+    `--cmd-file` 完全同语义；清理在 `finally` 里做（成功/失败/超时/异常都删，
+    连接已断时只 WARN 并给出 `script.remote` 供手动 `rm`）。
+  - 测试：新增 `live_exec_script` 块（引号嵌套+heredoc 成功、`cmd` 只有一行、元数据对账、
+    执行后远端无残留、失败路径也清理、CRLF 归一）。
+
+- **文档：PowerShell 中文乱码的责任边界 + 一次性修法**（`docs/setup.md` 新增「Windows + PowerShell」节）：
+  **症状边界已实测厘清**——乱码只发生在 PowerShell **解码**原生命令输出的两条路：`$x = pyaissh ...`
+  收变量、`pyaissh ... | findstr/Select-String` 过管道（PowerShell 用 `[Console]::OutputEncoding`
+  解码，中文 Windows 默认 gb2312）；**`> file` 重定向是字节直通**，写出去本来就是 UTF-8，不受影响。
+  修法：`$PROFILE` 贴 `function pyaissh {...}`（设 `[Console]::OutputEncoding` + `$OutputEncoding` 为
+  UTF-8 再调 python，`finally` 还原），附"只想单次顶一下"与非交互 `pwsh -Command` 不加载 profile 两个边界。
+  **同机 A/B 实测（全新 console、捕获路径）**：不修 ⇒ `目标端口没�?`（GB2312 解 UTF-8），
+  加上档函数 ⇒ `目标端口没有`。
+  `SKILL.md` 输出约定**首条**改为该乱码提示（原来埋在文档中部，实测被忘过两次），速查第 8 条加一句
+  "PowerShell 下中文乱码先看 `[Console]::OutputEncoding`，与选哪个参数无关"。
+  **产品侧一行未改**：`_setup_console_utf8()` 本就是无条件重配 stdout/stderr/stdin（测试已钉住），
+  这条乱码的根因在调用方解码器、工具改不了——所以修法只落在文档与上档函数，
+  **没有新增分发文件、没有动 zip 条目（仍 16 个）**。
+
+### 修改
+- **`--jump-password` 走命令行时给出双通道提醒**（不阻断）：密码出现在进程参数表里，
+  本地 `ps` 可见、宿主/AI 的调用记录也会带上。提醒经**两条路**送达：stderr 日志（给人/交互）
+  + 结果 JSON 的 **`warnings[]`**（给纯 `--json` 消费方——`2>/dev/null` 丢 stderr 的正是主要受众）。
+  实现上不是每个子命令各自 merge（`_PUT_RESIDUE_WARNINGS` 那种逐个合并容易漏），而是新增
+  连接层警告容器 `_CONN_WARNINGS`，由**输出 funnel** `emit()` / `emit_error()` 统一汇入：
+  成功/失败、exec/upload/download/session 全子命令一处覆盖；缓冲为空时**一个字节都不动**，
+  普通结果的字段集不变。
+  `PYAISSH_JUMP_PASSWORD` 本身 v1.4.9 就支持（`--jump-password > 别名专属 >
+  PYAISSH_JUMP_PASSWORD > PYAISSH_PASSWORD` 回落，`.env.example` 已列），本次补的是
+  "运行时知道"这一格；`docs/jump.md` 用法示例改为推荐 env 形式并说明双通道。
+  断言 6 条全在 `unit_artifacts`（离线可跑：提醒在连接前产生，目标写 127.0.0.1:1；
+  其中 3 条对 `emit` 做直测——无警告不加键、有警告建键、已有时追加不重复）。
+- `tests/run_tests.py`：`live_session_bugs` 的 **B2 负面断言**（`--no-pty` 传了必须被
+  argparse 拒绝）挪到 **`unit_artifacts`**——它在连接前就拒，不需要真机，任何会话都能
+  秒级复验；真机块只留正面断言。同时把 `--script` 的两条互斥断言也放进离线块。
+- `docs/exec.md` 新增「`--script <本地脚本>`」整节；`docs/contract.md` 补 `script` 字段；
+  `SKILL.md` 速查第 8 条与 exec 段同步（本地已有 `.sh` 时首选 `--script`）。
+- **文档漂移修复**：`pyaissh-dev/SPEC_session_tmux.md` 的 INV-02 行与
+  `docs/session.md` 参数表还写着 `--no-pty` "保留为 no-op / 已废弃"——与 ENG-10/C1
+  （已删除、传了 rc=2）矛盾，改为一致表述（照旧文档实现的 AI 会以为参数还在）。

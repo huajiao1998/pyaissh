@@ -38,3 +38,26 @@
   - Linux/macOS：`python3 <pyaissh_dir>/pyaissh.py <子命令> ...`
   - Windows cmd：`<pyaissh_dir>\pyaissh.cmd <子命令> ...`；Git Bash：`<pyaissh_dir>/pyaissh <子命令> ...`
 - 若把 pyaissh 复制到了项目根目录，则按上述同目录规则调用
+
+### Windows + PowerShell：管道/重定向下的中文乱码（一次性修掉）
+
+**症状**：PowerShell 里把结果**收进变量**（`$x = pyaissh ...`）或**过管道**（`pyaissh ... | findstr/Select-String`）时，中文变 `????`/麻子；直接打到终端（不进管道）反而正常。**`> file` 重定向不在此列**——那是字节直通，写出去的本来就是 UTF-8（读它用 `Get-Content -Encoding utf8`）。
+
+**根因（分清责任）**：**产品侧已经是全场景 UTF-8**——`_setup_console_utf8()` 无条件把 stdout/stderr/stdin 重配为 UTF-8（管道/重定向同样生效，已有测试断言钉住）。乱码来自**调用方**：PowerShell 用 `[Console]::OutputEncoding` 解码原生命令的 stdout，而它在中文 Windows 上默认是 **gb2312**（实测新起 `pwsh` 即 `[Console]::OutputEncoding.WebName -eq 'gb2312'`）——UTF-8 字节被按 GB2312 解，就成了麻子。子进程改不了调用方的解码器，所以这一格只能在 PowerShell 侧设。
+
+**一次性修复**：把下面的函数贴进 `$PROFILE`（`notepad $PROFILE`；没有就先 `New-Item -Type File -Path $PROFILE`），**之后任意参数形式都修**（含管道/重定向/收变量），`finally` 里还原、不污染后续 console：
+
+```powershell
+function pyaissh {
+    $prev = [Console]::OutputEncoding
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)   # 反向：往 pyaissh stdin 写时也走 UTF-8
+    try { & python $env:PYAISSH_DIR\pyaissh.py @args }
+    finally { [Console]::OutputEncoding = $prev }
+}
+```
+
+- 先设一次目录：`$env:PYAISSH_DIR = '<pyaissh_dir>'`（或把函数里的路径写死成你的技能目录）。
+- **每组新开 PowerShell 只生效一次**：`$PROFILE` 是 per-host/per-user 的，非交互 `pwsh -Command` 默认不加载 profile——那种场景要么显式 `. $PROFILE`，要么在命令前自己设 `[Console]::OutputEncoding`（就是上面那三行）。
+- **只想单次顶一下**（不改 profile）：命令前加 `[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false);`，或先 `chcp 65001`。
+- **实测证据（同机 A/B，全新 console）**：`$x = pyaissh exec ...` 捕获路径下，不修为 `目标端口没�?`（GB2312 解 UTF-8），加上档函数为 `目标端口没有`。文件重定向两条路都一样（字节直通，不经过解码器）。

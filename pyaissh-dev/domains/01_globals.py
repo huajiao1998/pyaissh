@@ -2,11 +2,13 @@
 
 - 超时/轮询/缓冲上限常量（MAX_TIME_CAP / PARALLEL_MIN_SIZE / SFTP_IO_TIMEOUT ...）
 - _RETRYABLE_ERRORS：错误类型 -> 是否可重试（emit_error 用它给 retryable 字段）
-- 模块级可变容器：_ACTIVE_TRANSPORTS（活动连接）、_PUT_RESIDUE_WARNINGS（.part 残留警告）
+- 模块级可变容器：_ACTIVE_TRANSPORTS（活动连接）、_PUT_RESIDUE_WARNINGS（.part 残留警告）、
+  _CONN_WARNINGS（连接层咨询警告，如 --jump-password 走了命令行；由 emit/emit_error 汇进
+  每个结果的 warnings[]——纯 JSON 消费方丢 stderr 也看得见，见域 04）
 被 00_head（信号区）、各 cmd_*（超时/常量）引用；拼接后与本包其余域同模块共享命名空间。
 """
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -59,6 +61,14 @@ _ACTIVE_TRANSPORTS = []
 # _sftp_put_atomic 中断时远端 .part 清理失败的记录（连接已坏清不掉）：
 # 合并进 upload 结果/失败的 warnings，AI 才知道远端有残留待清理
 _PUT_RESIDUE_WARNINGS = []
+
+
+# 连接层的咨询型警告（v2.5.0）：resolve_jump 等连接阶段发现"能跑但不该这么跑"时记在这里，
+# 由域 04 的 emit/emit_error 汇进**每个**结果的 warnings[]。为什么要单独一个容器：
+# stderr 日志只有看 stderr 的调用方收得到，而纯 --json 消费方（2>/dev/null）恰是主要受众；
+# 走 emit  funnel 一处合并，成功/失败、exec/upload/download/session 全子命令都覆盖，
+# 不必每个命令自己记得 merge（_PUT_RESIDUE_WARNINGS 就是逐个 merge，容易漏）。
+_CONN_WARNINGS = []
 
 
 # =========================================================================

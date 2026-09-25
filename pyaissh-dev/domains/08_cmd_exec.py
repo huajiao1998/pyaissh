@@ -97,6 +97,65 @@ def _prepare_exec_command(args):
     return cmd, warnings, sudo_pw, orig_cmd
 
 
+def _load_local_script(args, warnings):
+    """--script：读本地脚本文件，返回 (info, err)。
+
+    info = {local, bytes, sha256, crlf_n}；err = (error_type, message)。
+    与 --cmd-file 的本质差别：内容**不当命令文本**走 SSH 命令行，而是整文件经 SFTP
+    落到远端临时文件后 `bash <path>` 执行——引号嵌套、heredoc、超长脚本都不再是问题，
+    且结果 JSON 的 cmd 回显只有一行（整段脚本不进 JSON，不会撑爆调用方上下文）。
+    """
+    local = _fix_msys_local_path(args.script)
+    try:
+        with open(local, "rb") as f:
+            raw = f.read()
+    except Exception as e:
+        return None, ("read_cmd_failed", "读取 --script 文件失败：%s" % e)
+    # utf-8-sig：剥 BOM——记事本/VS Code 写出的脚本首行会被拼进 ﻿ 而 command not found
+    text = raw.decode("utf-8-sig")
+    crlf_n = 0
+    if not getattr(args, "keep_crlf", False):
+        text, crlf_n = _normalize_cmd_newlines(text)
+        if crlf_n:
+            args._crlf_normalized = crlf_n
+            warnings.append(
+                "脚本有 %d 处 CRLF/CR 行尾，已归一为 LF（远端 bash 会把 \\r 当词的一部分："
+                "$'\\r': command not found、关键字行语法错、heredoc 落盘文件带 CR）；"
+                "要原样发送加 --keep-crlf" % crlf_n)
+    data = text.encode("utf-8")
+    if not data.strip():
+        return None, ("bad_args", "--script 文件为空：%s" % local)
+    import hashlib
+    return {"local": local, "bytes": data, "sha256": hashlib.sha256(data).hexdigest(),
+            "crlf_n": crlf_n}, None
+
+
+def _upload_exec_script(client, info):
+    """把脚本字节写到远端临时文件并返回路径（0600，删不删由调用方决定）。
+
+    放 /tmp 而非作业目录：这是**一次性执行体**，不是要留存的产物；路径带随机后缀，
+    同机并发多个任务不互踩。
+    """
+    sftp = open_sftp(client)
+    try:
+        rpath = "/tmp/.pyaissh-script-%s.sh" % base64.b16encode(os.urandom(6)).decode().lower()
+        _sftp_write_bytes(sftp, rpath, info["bytes"])
+        _sftp_chmod(sftp, rpath, 0o600)
+        return rpath
+    finally:
+        try:
+            sftp.close()
+        except Exception:
+            pass
+
+
+def _cleanup_exec_script(client, rpath):
+    """删远端临时脚本（best-effort）：连接已断/权限不足只记 WARN，不影响已有结果。"""
+    try:
+        client.exec_command("rm -f %s" % _sh_quote(rpath), timeout=15)
+    except Exception as e:
+        log("[WARN] 远端临时脚本删除失败（可手动 rm）：%s（%s）" % (rpath, e))
+
 
 def _connect_exec(args):
     """连接目标（含跳板解析）；成功返回 (conn, client, None)；失败已 emit，返回 (None, None, 退出码)。
@@ -641,6 +700,10 @@ def _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client):
             "pty_strip_ansi": bool(args.pty_strip_ansi),
             "cmd": cmd_echo,  # 回显命令（含凭据需脱敏；超 CMD_ECHO_LIMIT 截断，见 cmd_truncated）
             "cmd_truncated": cmd_cut,  # cmd 回显是否被截断（--cmd-file 读入的大脚本）
+            # --script（v2.5.0）：本地脚本经 SFTP 落远端临时文件后 bash 执行；这里回传
+            # local（本地路径）/ remote（远端临时路径，执行后已删）/ bytes / sha256。
+            # 恒有键：非 --script 调用为 null（与 cmd_truncated 同风格，字段集只增不减）。
+            "script": getattr(args, "_script_info", None),
             "output_truncated": bool(drain_truncated or stdout_truncated or stderr_truncated),
             "warnings": warnings,
             "duration_ms": duration,
@@ -729,6 +792,10 @@ def _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client):
         emit_error(args.json, error_type, msg, extra=timeout_extra)
         return 124 if error_type != "exec_failed" else 255
     finally:
+        # --script 收尾：删远端临时脚本（best-effort；异常/超时路径也一样要删）
+        _si = getattr(args, "_script_info", None)
+        if _si:
+            _cleanup_exec_script(client, _si["remote"])
         # spill 兜底：成功路径已置 _spill_handled；异常/中断路径在此删除，不留垃圾
         if not _spill_handled:
             _close_spill(spill_out_fh, spill_out_path, keep=False)
@@ -738,21 +805,80 @@ def _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client):
 
 def cmd_exec(args):
     """exec 编排：--detach 走后台作业；否则前置校验组装 -> 连接 -> 执行会话（三段独立函数）。"""
+    script_info = None
+    if getattr(args, "script", None):
+        # --script（v2.5.0）：本地脚本整文件走 SFTP 落远端 /tmp 再 bash 执行。两个限制：
+        #   ① 与 --cmd/--cmd-file 三选一（三者同时给无法判定用哪个）；
+        #   ② 暂不支持 --detach——后台作业生命周期长于本连接，临时脚本无人清理。
+        #      长脚本后台化请先 upload 到固定路径，再 exec --detach --cmd 'bash /root/x.sh'。
+        if args.cmd or args.cmd_file:
+            emit_error(args.json, "bad_args",
+                       "--script 与 --cmd/--cmd-file 互斥（三选一：--script 传本地脚本文件，"
+                       "--cmd 传命令文本，--cmd-file 传命令文件）")
+            return 2
+        if getattr(args, "detach", False):
+            emit_error(args.json, "bad_args",
+                       "--script 暂不支持与 --detach 组合（后台作业活得比本连接久，"
+                       "远端临时脚本没人删）；长脚本后台化请先 upload 到固定路径后用 "
+                       "exec --detach --cmd 'bash /root/x.sh'，或用 session run --cmd-file")
+            return 2
     if getattr(args, "detach", False):
         return _cmd_exec_detach(args)
     start = time.time()  # 计时含连接耗时：duration_ms 在跳板/慢网络下偏大
 
-    prepared = _prepare_exec_command(args)
-    if prepared[0] is None:
-        _, (etype, emsg, pwarnings) = prepared
-        extra = {"warnings": pwarnings} if pwarnings else None
-        emit_error(args.json, etype, emsg, extra=extra)
-        return 2  # 本地参数/校验问题，与 bad_args 同级
-    cmd, warnings, sudo_pw, orig_cmd = prepared
+    warnings = []
+    if getattr(args, "script", None):
+        script_info, serr = _load_local_script(args, warnings)
+        if serr:
+            emit_error(args.json, serr[0], serr[1],
+                       extra={"warnings": warnings} if warnings else None)
+            return 2
+        # 凭据启发式照查脚本正文（密码写进脚本和写进 --cmd 一样危险）
+        _w = warn_sensitive_cmd(script_info["bytes"].decode("utf-8", "replace"),
+                                enabled=not getattr(args, "no_credential_warn", False))
+        if _w:
+            warnings.append(_w)
+        if args.sudo and args.pty:
+            emit_error(args.json, "bad_args",
+                       "--sudo 与 --pty 互斥（sudo -S 走 stdin 管道而非 pty）",
+                       extra={"warnings": warnings} if warnings else None)
+            return 2
+
+    if script_info is not None:
+        sudo_pw = (args.sudo_password if args.sudo_password
+                   else os.environ.get("PYAISSH_SUDO_PASSWORD")) if args.sudo else None
+    else:
+        prepared = _prepare_exec_command(args)
+        if prepared[0] is None:
+            _, (etype, emsg, pwarnings) = prepared
+            extra = {"warnings": pwarnings} if pwarnings else None
+            emit_error(args.json, etype, emsg, extra=extra)
+            return 2  # 本地参数/校验问题，与 bad_args 同级
+        cmd, warnings, sudo_pw, orig_cmd = prepared
 
     conn, client, conn_ec = _connect_exec(args)
     if conn_ec is not None:
         return conn_ec
+
+    if script_info is not None:
+        # 连接后才上传：本地文件问题已在上面快速失败，这里只剩网络/SFTP 问题
+        try:
+            rpath = _upload_exec_script(client, script_info)
+        except Exception as e:
+            close_all(client)
+            emit_error(args.json, "script_upload_failed",
+                       "上传 --script 到远端失败：%s（%s）" % (script_info["local"], e),
+                       extra={"warnings": warnings} if warnings else None)
+            return 1
+        cmd = "bash %s" % rpath
+        if args.sudo:
+            cmd = (("sudo -S -p '' %s" % cmd) if sudo_pw else ("sudo -n %s" % cmd))
+        orig_cmd = cmd  # 凭据启发式只看这一行（脚本正文已在上面单独查过）
+        args._script_info = {"local": script_info["local"], "remote": rpath,
+                             "bytes": len(script_info["bytes"]),
+                             "sha256": script_info["sha256"]}
+        log("[OK] 脚本已传远端：%s（%d B，sha256 %s…）"
+            % (rpath, len(script_info["bytes"]), script_info["sha256"][:12]))
 
     return _exec_session(args, start, cmd, orig_cmd, sudo_pw, warnings, conn, client)
 

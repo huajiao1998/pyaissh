@@ -6,12 +6,14 @@
 ## 用法
 
 ```bash
-python3 pyaissh.py exec root@10.0.0.5 --jump root@1.2.3.4:2222 --jump-password 'xxx' --cmd 'hostname'
+python3 pyaissh.py exec root@10.0.0.5 --jump root@1.2.3.4:2222 --cmd 'hostname'          # 推荐：密码走 PYAISSH_JUMP_PASSWORD / .env，不进程留痕
+python3 pyaissh.py exec root@10.0.0.5 --jump root@1.2.3.4:2222 --jump-password 'xxx' --cmd 'hostname'   # 能跑，但会打 WARN
 python3 pyaissh.py exec root@10.0.0.5 --jump root@1.2.3.4:2222 --jump-key ~/.ssh/id_rsa --cmd 'hostname'  # 跳板用密钥
 python3 pyaissh.py exec root@10.0.0.5 --jump @bastion --cmd 'hostname'   # 跳板也支持 @别名（PYAISSH_HOST_BASTION）
 ```
 
 - 跳板机凭据优先级：`--jump-key` / `PYAISSH_JUMP_KEY` > `--jump-password` / `PYAISSH_JUMP_PASSWORD` > **`PYAISSH_PASSWORD` 回落（v1.4.9 起，仅密码；密钥不回落——错误的 `PYAISSH_KEY` 会短路原本可用的默认密钥路径）** > 默认私钥 > agent；回退生效时 stderr 打 `[JUMP] ... 密码回退使用 PYAISSH_PASSWORD`；`--jump @别名` 复用 `PYAISSH_HOST_<名称>` 配置及其专属凭据（配了别名凭据时抑制 `PYAISSH_JUMP_*` 与 `PYAISSH_PASSWORD` 回落）
+- **`--jump-password` 会多一条提醒**（不阻断）：密码出现在命令行参数里，本地 `ps` 可见、宿主/AI 的调用记录也会带上。**双通道送达**——stderr 日志给交互的人，结果 JSON 的 `warnings[]` 给纯 `--json` 消费方（`2>/dev/null` 丢 stderr 也看得见，那才是主要受众）；更干净的等价写法是 `PYAISSH_JUMP_PASSWORD` 环境变量或 `.env`（样例见 `.env.example`，显式参数仍优先）
 - `--jump` 里不写用户名（如 `--jump 1.2.3.4:2222`）时回退用**目标机用户名**（与 `-u`/`PYAISSH_USER` 同源）
 - 跳板机自身认证/连接失败的错误 message 带 `[跳板机 user@host]` 前缀（注意：错误 JSON 的定位字段 `host`/`user`/`port` 仍是目标机，需靠 message 前缀区分失败对象）
 - 跳板 + 大文件并行分片下载：只建 **1 条**跳板 SSH，k 个分片各开一条 direct-tcpip 隧道共享它
