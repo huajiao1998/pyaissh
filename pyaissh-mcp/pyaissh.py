@@ -135,7 +135,7 @@ except (ValueError, OSError, ImportError):
 被 00_head（信号区）、各 cmd_*（超时/常量）引用；拼接后与本包其余域同模块共享命名空间。
 """
 
-VERSION = "2.5.0"
+VERSION = "2.5.1"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -237,6 +237,18 @@ JOB_WAIT_MAX = 600           # --wait-rc 上限秒数（宿主单次调用上限
 JOB_RC_GRACE = 0.6           # 判 dead 前给 job.rc 落盘的宽限（防"刚结束被误判 dead"，v2.3.0）
 BUF_ALIGN_WINDOW = 4096      # 截断行对齐时回退搜索窗口（字节）
 MIN_BUF_FLOOR = 4096         # 内存缓冲下限：max(args.max_output, 4096) 保证小档位也有可用缓冲
+
+# exec 的"从 stdin 读输入"命令识别（v2.5.1）：exec 启动即关闭远端 stdin（否则 cat 类
+# 命令会挂到静默超时、被误判成挂死），于是 `--cmd 'python3 -'` + 本地 pipe 脚本这种
+# 直觉写法会**静默空跑**（python3 - 解析空程序 → exit 0、无任何输出；真机实测）。
+# 命中的话在 warnings[] 里点明，把静默失败变响。故意做得很保守：整条命令里出现 `<`
+# （heredoc `<<` / here-string `<<<` / 输入重定向 `< file`）就一律不报——那种情况
+# 命令自己供给了 stdin。也放过 sudo 包装后的形态（前缀是 sudo，不匹配本正则）。
+STDIN_READER_RE = re.compile(
+    r"^\s*(?:[\w.@+-]*/)?(?:python3?|perl|ruby|node|php|bash|sh|dash|zsh)"
+    r"\s+-(?:s)?(?=\s|$)"
+    r"|^\s*(?:[\w.@+-]*/)?cat\s*-?\s*$",
+    re.IGNORECASE)
 
 # --- 常驻会话（v2.3：session 子命令 —— 真 PTY + 逐条喂命令 + 状态保留）------
 DEFAULT_SESSION_DIR = "/tmp/pyaissh-sessions"  # 远端会话根目录（每会话一个子目录）
@@ -2781,7 +2793,7 @@ def _win_safe_rel_path(rel, used, warnings):
 def _prepare_exec_command(args):
     """exec 前置（无连接副作用）：加载/校验命令 + --sudo 组装。
 
-    返回 (cmd, warnings, sudo_pw) 成功；
+    返回 (cmd, warnings, sudo_pw, orig_cmd) 成功；
     失败返回 (None, (error_type, message, warnings))——错误输出由 cmd_exec 处理。
     等价搬移自 cmd_exec 原头部（校验快速失败 + sudo 组装），行为零变化。
     """
@@ -2835,6 +2847,17 @@ def _prepare_exec_command(args):
                 "要原样发送加 --keep-crlf" % crlf_n)
     if not cmd or not cmd.strip():
         return None, ("bad_args", "未指定命令（--cmd 或 --cmd-file）", warnings)
+    # v2.5.1：命令形态像"从 stdin 读输入"时给警告。exec 的远端 stdin 恒为 EOF
+    # （_exec_session 立即 close，防 cat 类挂到超时），所以 `--cmd 'python3 -'` 配本地
+    # pipe/heredoc 的直觉写法**不会**把脚本送进去——python3 - 解析空程序后 exit 0、
+    # 无任何输出，看起来像成功（真机实测 rc=0 + stdout 空）。这条警告就是要把这种
+    # 静默空跑变响；带 `<`（heredoc/here-string/输入重定向）说明命令自己供 stdin，不报。
+    if "<" not in cmd and STDIN_READER_RE.match(cmd):
+        warnings.append(
+            "命令看起来要从 stdin 读输入，但 exec 的远端 stdin 恒为 EOF（pyaissh 启动即关闭，"
+            "防 cat 类命令挂到静默超时）——本次没有输入送进去，exit 0 也可能是空跑。"
+            "解决办法：把脚本写进命令文本（--cmd-file，heredoc 照常生效）或用 "
+            "--script <本地.sh>（整文件 SFTP 传过去再执行）")
     if args.max_time is not None and args.max_time < args.exec_timeout:
         return None, ("bad_args",
                       "--max-time (%d) 不能小于 --idle-timeout (%d)（总时长上限必须覆盖静默窗口）"

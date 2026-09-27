@@ -873,6 +873,43 @@ def suite_unit_artifacts(s):
     _m._CONN_WARNINGS.clear()
     s.check("emit：已有 warnings 时追加不覆盖、不重复（连接警告排在后面）",
             _w3 == ["别的", "probe-warning"], repr(_w3))
+    # exec 的 stdin 语义（v2.5.1，外部 AI 报的"静默空跑"）：远端 stdin 恒为 EOF，
+    # `--cmd 'python3 -'` 配本地 pipe/heredoc 不会把脚本送进去（python3 - 解析空程序 →
+    # exit 0、无输出，看起来像成功）。命令形态命中"读 stdin"时必须给 warnings[]。
+    import argparse as _ap
+
+    def _nsx(cmd, **kw):
+        _d = dict(cmd=cmd, cmd_file=None, keep_crlf=False, max_time=None,
+                  exec_timeout=60, sudo=False, pty=False, sudo_password=None)
+        _d.update(kw)
+        return _ap.Namespace(**_d)
+
+    _pp = _module()._prepare_exec_command
+    _r1 = _pp(_nsx(cmd="python3 -"))
+    s.check("stdin：`--cmd 'python3 -'` 命中读 stdin 形态 → warnings 提示（不再静默空跑）",
+            _r1[0] is not None and any("stdin 恒为 EOF" in w for w in _r1[1]), repr(_r1[1])[:200])
+    _r2 = _pp(_nsx(cmd="python3 - << 'PYEOF'\nprint(1)\nPYEOF"))
+    s.check("stdin：heredoc 写在命令文本里不误报（命令自己供 stdin，真机实测正常）",
+            _r2[0] is not None and not any("stdin 恒为 EOF" in w for w in _r2[1]), repr(_r2[1])[:160])
+    _r3 = _pp(_nsx(cmd="python3 - < /tmp/x.py"))
+    s.check("stdin：输入重定向 `< file` 不误报", _r3[0] is not None
+            and not any("stdin 恒为 EOF" in w for w in _r3[1]), repr(_r3[1])[:160])
+    _r4 = _pp(_nsx(cmd="cat"))
+    s.check("stdin：裸 cat 命中（同样会读到 EOF 空跑）", _r4[0] is not None
+            and any("stdin 恒为 EOF" in w for w in _r4[1]), repr(_r4[1])[:160])
+    _r5 = _pp(_nsx(cmd="echo hello"))
+    s.check("stdin：普通命令零告警（不制造噪音）", _r5[0] is not None
+            and not any("stdin 恒为 EOF" in w for w in _r5[1]), repr(_r5[1])[:120])
+    _r6 = _pp(_nsx(cmd="python3 -c 'print(1)'"))
+    s.check("stdin：`python3 -c '...'` 不误报（程序在参数里，不从 stdin 读）",
+            _r6[0] is not None and not any("stdin 恒为 EOF" in w for w in _r6[1]),
+            repr(_r6[1])[:120])
+    _r7 = _pp(_nsx(cmd="bash -s -- --flag"))
+    s.check("stdin：`bash -s -- args` 命中", _r7[0] is not None
+            and any("stdin 恒为 EOF" in w for w in _r7[1]), repr(_r7[1])[:160])
+    _r8 = _pp(_nsx(cmd="cat /var/log/syslog"))
+    s.check("stdin：`cat <文件>` 不误报（有参数就不是读 stdin）", _r8[0] is not None
+            and not any("stdin 恒为 EOF" in w for w in _r8[1]), repr(_r8[1])[:120])
 
 
 # ============================================================

@@ -8,7 +8,7 @@
 被 00_head（信号区）、各 cmd_*（超时/常量）引用；拼接后与本包其余域同模块共享命名空间。
 """
 
-VERSION = "2.5.0"
+VERSION = "2.5.1"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -110,6 +110,18 @@ JOB_WAIT_MAX = 600           # --wait-rc 上限秒数（宿主单次调用上限
 JOB_RC_GRACE = 0.6           # 判 dead 前给 job.rc 落盘的宽限（防"刚结束被误判 dead"，v2.3.0）
 BUF_ALIGN_WINDOW = 4096      # 截断行对齐时回退搜索窗口（字节）
 MIN_BUF_FLOOR = 4096         # 内存缓冲下限：max(args.max_output, 4096) 保证小档位也有可用缓冲
+
+# exec 的"从 stdin 读输入"命令识别（v2.5.1）：exec 启动即关闭远端 stdin（否则 cat 类
+# 命令会挂到静默超时、被误判成挂死），于是 `--cmd 'python3 -'` + 本地 pipe 脚本这种
+# 直觉写法会**静默空跑**（python3 - 解析空程序 → exit 0、无任何输出；真机实测）。
+# 命中的话在 warnings[] 里点明，把静默失败变响。故意做得很保守：整条命令里出现 `<`
+# （heredoc `<<` / here-string `<<<` / 输入重定向 `< file`）就一律不报——那种情况
+# 命令自己供给了 stdin。也放过 sudo 包装后的形态（前缀是 sudo，不匹配本正则）。
+STDIN_READER_RE = re.compile(
+    r"^\s*(?:[\w.@+-]*/)?(?:python3?|perl|ruby|node|php|bash|sh|dash|zsh)"
+    r"\s+-(?:s)?(?=\s|$)"
+    r"|^\s*(?:[\w.@+-]*/)?cat\s*-?\s*$",
+    re.IGNORECASE)
 
 # --- 常驻会话（v2.3：session 子命令 —— 真 PTY + 逐条喂命令 + 状态保留）------
 DEFAULT_SESSION_DIR = "/tmp/pyaissh-sessions"  # 远端会话根目录（每会话一个子目录）

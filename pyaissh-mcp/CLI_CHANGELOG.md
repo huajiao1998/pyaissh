@@ -1024,3 +1024,23 @@
 - **文档漂移修复**：`pyaissh-dev/SPEC_session_tmux.md` 的 INV-02 行与
   `docs/session.md` 参数表还写着 `--no-pty` "保留为 no-op / 已废弃"——与 ENG-10/C1
   （已删除、传了 rc=2）矛盾，改为一致表述（照旧文档实现的 AI 会以为参数还在）。
+
+## [2.5.1] - 2026-09-28
+
+### 修复
+- **`exec` 的"静默空跑"坑：命令从 stdin 读输入时给出 warnings[] 提示**（外部 AI 实踩并上报）。
+  `exec` 启动即关闭远端 stdin（`_exec_session` 立即 `stdin.close()`——否则 `cat` 类命令会挂到
+  静默超时、被误判成挂死），所以 `echo 'print(1)' | pyaissh exec h --cmd "python3 -"`、
+  `cat x.py | ... --cmd "bash -s"`、以及把 heredoc 挂在 pyaissh 命令行本地这三种写法，
+  脚本根本到不了远端：`python3 -` 解析空程序后 **exit 0、无任何输出**，看起来像成功。
+  **真机实测三条探针**：heredoc 写在命令文本里（`--cmd-file`）正常（`HELLO_FROM_HEREDOC 2`）；
+  脚本 pipe 进 pyaissh stdin 与 `bash -s` 两种都是 rc=0 + stdout/stderr 全空。
+  现在命令形态命中"读 stdin"（`python3 -` / `bash -s` / 裸 `cat` 等）且整条命令里没有 `<`
+  （heredoc `<<` / here-string `<<<` / 输入重定向 `< file`，那说明命令自己供 stdin）时，
+  在 `warnings[]` 里点明"远端 stdin 恒为 EOF……exit 0 也可能是空跑"并给出三种正确写法。
+  告警经 `_prepare_exec_command` 的既有 warnings 通路输出，天然双通道（stderr + JSON）。
+  判据刻意保守：`python3 -c '...'`（程序在参数里）、`cat <文件>`、`--sudo` 的 `sudo -S`
+  （读的是注入的密码）都不报；8 条断言（4 命中 / 4 不误报）落在 `unit_artifacts`，离线可跑。
+- `docs/exec.md` 新增整节讲这个坑（含正误写法对照与三种可用写法）；`SKILL.md` 速查第 8 条补
+  "exec 的远端 stdin 恒为 EOF"；`_prepare_exec_command` 的 docstring 返回值订正为 4 个
+  （原写 3 个，与实际 `return cmd, warnings, sudo_pw, orig_cmd` 不符）。

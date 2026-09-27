@@ -42,6 +42,51 @@ EOF
   （外层 heredoc 喂给 pyaissh 的命令脚本本身也用引住的定界符；命令含 `$`/反引号时 `--cmd-file -` 在 bash/Git Bash 下同样是首选，不只 PowerShell）
 - **Git Bash 路径**：`--cmd-file` / `--spill-dir` 与 `--local` 同款 MSYS 转换——经 `./pyaissh` 包装器（禁路径转换）时，Unix 风格路径（`/tmp/x.sh`）自动转 Windows 真实路径，不会落错位置或报 Errno 2；Linux 直接运行时原样透传
 
+### ⚠️ 远端 stdin 恒为 EOF：`--cmd 'python3 -'` 配本地 pipe 不会把脚本送进去（v2.5.1）
+
+**本工具最隐蔽的坑，外部 AI 实踩过**。`exec` 启动后**立即关闭远端 stdin**（否则 `cat` 这类命令会
+一直等到静默超时、被误判成挂死）。于是 shell 里"靠 stdin 喂脚本"的写法全部失效：
+
+```bash
+# ❌ 静默空跑：rc=0、stdout/stderr 全空，看起来像成功
+echo 'print(1)' | python3 pyaissh.py exec root@1.2.3.4 --cmd "python3 -"
+cat x.py | python3 pyaissh.py exec root@1.2.3.4 --cmd "bash -s"
+
+# ❌ 把 heredoc 挂在 pyaissh 命令行本地（本地 shell 吃掉；pyaissh 的 stdin 不会转发到远端）
+python3 pyaissh.py exec root@1.2.3.4 --cmd "python3 -" << 'EOF'
+print(1)
+EOF
+```
+
+`python3 -` 读到空输入 → 解析空程序 → **exit 0、无任何输出**。v2.5.1 起这种命令形态会在
+`warnings[]` 里点明（"远端 stdin 恒为 EOF……exit 0 也可能是空跑"），不再静默。
+
+**能用的三种写法**：
+
+```bash
+# ✅ 1. heredoc 写进命令文本（远端 shell 自己供 stdin，实测正常）
+python3 pyaissh.py exec root@1.2.3.4 --cmd-file - <<'EOF'
+python3 - <<'PY'
+print("HELLO_FROM_HEREDOC")
+PY
+EOF
+
+# ✅ 2. 本地已有脚本文件：--script（v2.5.0，整文件 SFTP 传过去再执行，零转义）
+python3 pyaissh.py exec root@1.2.3.4 --script ./deploy.sh
+
+# ✅ 3. 先 cat 写文件再执行（heredoc 里 $/反引号安全）
+python3 pyaissh.py exec root@1.2.3.4 --cmd-file - <<'EOF'
+cat > /tmp/x.sh <<'REMOTE'
+echo "$HOME"
+REMOTE
+bash /tmp/x.sh
+EOF
+```
+
+判据故意做得很保守：命令形如 `python3 -` / `bash -s` / 裸 `cat` 且整条命令里**没有 `<`** 才告警——
+heredoc（`<<`）、here-string（`<<<`）、输入重定向（`< file`）都算"命令自己供 stdin"，不报；
+`python3 -c '...'`（程序在参数里）也不报。`--sudo` 的 `sudo -S` 读的是 pyaissh 注入的密码，不受影响。
+
 ### `--script <本地脚本>`：本地脚本直达远端执行（v2.5.0）
 
 **解决什么**：本地已经写好一个 `.sh`（长脚本、heredoc、引号嵌套），此前只有两条路——`--cmd '...'` 内联（PowerShell 吃 `$`、引号定界走钢丝）或 `--cmd-file -`（还得 base64/printf 搬过来、且整段脚本会回显进 JSON 的 `cmd` 字段）。`--script` 把整文件经 **SFTP** 落到远端 `/tmp/.pyaissh-script-<随机>.sh`（0600）再 `bash <path>` 执行，**用完自动删**。

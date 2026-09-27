@@ -11,7 +11,7 @@
 def _prepare_exec_command(args):
     """exec 前置（无连接副作用）：加载/校验命令 + --sudo 组装。
 
-    返回 (cmd, warnings, sudo_pw) 成功；
+    返回 (cmd, warnings, sudo_pw, orig_cmd) 成功；
     失败返回 (None, (error_type, message, warnings))——错误输出由 cmd_exec 处理。
     等价搬移自 cmd_exec 原头部（校验快速失败 + sudo 组装），行为零变化。
     """
@@ -65,6 +65,17 @@ def _prepare_exec_command(args):
                 "要原样发送加 --keep-crlf" % crlf_n)
     if not cmd or not cmd.strip():
         return None, ("bad_args", "未指定命令（--cmd 或 --cmd-file）", warnings)
+    # v2.5.1：命令形态像"从 stdin 读输入"时给警告。exec 的远端 stdin 恒为 EOF
+    # （_exec_session 立即 close，防 cat 类挂到超时），所以 `--cmd 'python3 -'` 配本地
+    # pipe/heredoc 的直觉写法**不会**把脚本送进去——python3 - 解析空程序后 exit 0、
+    # 无任何输出，看起来像成功（真机实测 rc=0 + stdout 空）。这条警告就是要把这种
+    # 静默空跑变响；带 `<`（heredoc/here-string/输入重定向）说明命令自己供 stdin，不报。
+    if "<" not in cmd and STDIN_READER_RE.match(cmd):
+        warnings.append(
+            "命令看起来要从 stdin 读输入，但 exec 的远端 stdin 恒为 EOF（pyaissh 启动即关闭，"
+            "防 cat 类命令挂到静默超时）——本次没有输入送进去，exit 0 也可能是空跑。"
+            "解决办法：把脚本写进命令文本（--cmd-file，heredoc 照常生效）或用 "
+            "--script <本地.sh>（整文件 SFTP 传过去再执行）")
     if args.max_time is not None and args.max_time < args.exec_timeout:
         return None, ("bad_args",
                       "--max-time (%d) 不能小于 --idle-timeout (%d)（总时长上限必须覆盖静默窗口）"
