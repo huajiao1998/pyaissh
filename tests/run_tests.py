@@ -1332,6 +1332,20 @@ def suite_live_exec_field(s):
                 bool(j2) and j2.get("status") == "finished" and j2.get("exit_code") == 5
                 and "detach_hi" in j2.get("stdout", "") and j2.get("stream") == "stdout+stderr"
                 and "content" not in j2, repr(j2)[:200])
+        # v2.5.2 --require-success：本地退出码承载远端作业结果（外部使用者反馈：
+        # 自动化只看 $LASTEXITCODE，而 log 默认"日志读到了"就恒 0，失败作业被当成功）
+        rc, j2b, _ = _live_run(["log", tgt, "--job-id", jid, "--require-success"], timeout=60)
+        s.check("--require-success：作业失败（exit 5）→ 本地退出码=5（不带则恒 0）",
+                rc == 5 and (j2b or {}).get("ok") is True
+                and (j2b or {}).get("exit_success") is False
+                and (j2b or {}).get("status") == "finished", "rc=%s %r" % (rc, repr(j2b)[:160]))
+        rc, j2c, _ = _live_run(["log", tgt, "--job-id", jid], timeout=60)
+        s.check("不带 --require-success 时本地退出码恒 0（兼容：老调用方零感知）",
+                rc == 0 and (j2c or {}).get("ok") is True, "rc=%s" % rc)
+        s.check("② 尾部读给出重复告警 + 增量读路子（next_action）",
+                "--offset" in ((j2c or {}).get("next_action") or "")
+                and "重复" in ((j2c or {}).get("next_action") or ""),
+                repr((j2c or {}).get("next_action"))[:200])
         # v2.2.1 权限从严：目录 0700、job.sh 0600、job.log/job.rc 0600、run.sh 0700
         # （作业已结束，job.rc 一定存在；用 _live_sub 取 --field 的裸 stdout）
         p = _live_sub(["exec", tgt, "--cmd",
@@ -1400,6 +1414,13 @@ def suite_live_exec_field(s):
         rc, still, _ = _live_run(["log", tgt, "--job-id", kjob], timeout=60)
         s.check("拒绝后目录仍在（可继续追踪）", bool(still) and still.get("status") == "running"
                 and bool(still.get("pid")), repr(still)[:160])
+        # v2.5.2 --require-success：仍在运行 → 本地 1 + JSON 明确"未完成"（不误报失败）
+        rc, jr, _ = _live_run(["log", tgt, "--job-id", kjob, "--require-success"], timeout=60)
+        s.check("--require-success：作业仍在运行 → 本地 1 且 ok:true（未完成≠失败）",
+                rc == 1 and (jr or {}).get("ok") is True and (jr or {}).get("status") == "running"
+                and (jr or {}).get("exit_success") is None
+                and "仍在运行" in ((jr or {}).get("next_action") or ""),
+                "rc=%s %r" % (rc, repr(jr)[:200]))
         # v2.2.2：--force 放弃追踪（允许删，但要留痕）
         rc, jf, _ = _live_run(["log", tgt, "--job-id", kjob, "--cleanup", "--force"], timeout=60)
         s.check("--cleanup --force 强制清理且留痕",
@@ -1465,6 +1486,13 @@ def suite_live_exec_field(s):
                 bool(gk) and gk.get("waited_ms", 99999) < 20000, repr(gk)[:160])
         s.check("dead 状态带 hint 指引", bool(gk) and "job.rc" in (gk.get("hint") or ""),
                 repr(gk.get("hint"))[:120])
+        # v2.5.2 --require-success：dead（退出码不可知）→ 本地 1，不当成功也不误报具体退出码
+        rc, gd, _ = _live_run(["log", tgt, "--job-id", gjob, "--require-success"], timeout=60)
+        s.check("--require-success：dead（无退出码）→ 本地 1 + 明示退出码不可知",
+                rc == 1 and (gd or {}).get("ok") is True and (gd or {}).get("status") == "dead"
+                and (gd or {}).get("exit_code") is None
+                and "退出码不可知" in ((gd or {}).get("hint") or ""),
+                "rc=%s %r" % (rc, repr(gd)[:200]))
         p = _live_sub(["exec", tgt, "--cmd",
                        "pgrep -af '[s]leep 300' >/dev/null && echo ORPHAN_ALIVE "
                        "|| echo NO_ORPHAN", "--field", "stdout"], timeout=60)

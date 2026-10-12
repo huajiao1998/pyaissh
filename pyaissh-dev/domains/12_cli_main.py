@@ -316,6 +316,7 @@ def build_parser():
   pyaissh log h --job-id <id> --offset 0                 # 从头增量读（返回 next_offset）
   pyaissh log h --job-id <id> --offset <next_offset>     # 接着上次读（轮询不重复）
   pyaissh log h --job-id <id> --wait-rc 30               # 等结束（≤600s）并拿退出码
+  pyaissh log h --job-id <id> --require-success          # 让本地退出码=远端作业结果（自动化判活用它）
   pyaissh log h --job-id <id> --kill                     # 整组停掉（TERM→宽限 5s→KILL）
   pyaissh log h --job-id <id> --kill --cleanup           # 停掉并清理（推荐收尾方式）
   pyaissh log h --job-id <id> --cleanup                  # 清理远端作业目录（运行中会被拒绝）
@@ -350,6 +351,12 @@ def build_parser():
     p.add_argument("--wait-rc", dest="wait_rc", type=_positive_int,
                    help="阻塞等待作业结束（rc 出现或进程消失）最多 N 秒（上限 %d），收敛即返回"
                         % JOB_WAIT_MAX)
+    p.add_argument("--require-success", dest="require_success", action="store_true",
+                   help="让**本地退出码**承载远端作业结果（默认只看日志是否读到，恒 0）："
+                        "已结束且 exit_code=0 → 0；已结束但失败 → 远程退出码（255 映射为 254，"
+                        "同 exec）；仍在运行或 dead（退出码不可知）→ 1。"
+                        "shell 里 `if ($LASTEXITCODE -eq 0)` 因此能真判作业成败；"
+                        "不加本参数时行为逐字节不变")
     p.add_argument("--kill", action="store_true",
                    help="整组停掉作业（读 job.pid → 对进程组 TERM → 宽限 %ds → KILL）："
                         "被 kill 的作业随后判定为 dead（无退出码），状态机可收敛；需 --job-id"

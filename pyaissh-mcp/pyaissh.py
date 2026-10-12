@@ -135,7 +135,7 @@ except (ValueError, OSError, ImportError):
 被 00_head（信号区）、各 cmd_*（超时/常量）引用；拼接后与本包其余域同模块共享命名空间。
 """
 
-VERSION = "2.5.1"
+VERSION = "2.5.2"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -4346,10 +4346,20 @@ def _log_read(sftp, client, args, job_dir, conn, start):
                     "作业仍在运行（pid 未知）时被强制清理：本工具已失去该作业的追踪，"
                     "远端进程可能仍在跑（job.pid 缺失，只能人工 pgrep 定位）")
     if status == "finished":
-        result["next_action"] = ("作业已结束（exit_code=%s）。%s"
-                                 % (rc_val, "已清理远端作业目录"
-                                    if result.get("cleaned") else
-                                    "如需清理：加 --cleanup"))
+        # v2.5.2：尾部读法（不给 --offset）连续读同一作业会**重复**拿到尾部 N 行——
+        # 外部使用者实踩（发布作业收两遍日志，pnpm/git diff 整段重复）。默认载荷不动
+        # （stdout 内容是现有调用方的依赖），只把增量读的路子说清。
+        _tail_hint = ""
+        if args.offset is None:
+            _n = args.lines if args.lines else JOB_TAIL_LINES
+            _tail_hint = ("本次是尾部 %d 行，重复读同一作业会拿到同样内容；"
+                          "增量读用 --offset %s（配 next_offset 轮询，不重复不遗漏）。"
+                          % (_n, next_offset if next_offset is not None else 0))
+        result["next_action"] = ("作业已结束（exit_code=%s）。%s%s"
+                                 % (rc_val,
+                                    _tail_hint,
+                                    "已清理远端作业目录" if result.get("cleaned")
+                                    else "如需清理：加 --cleanup"))
     elif status == "dead":
         result["hint"] = ("无 job.rc 且进程已消失（被 kill / OOM / 崩溃）：退出码不可知，"
                           "状态机按 dead 收敛，不要再用 --wait-rc 等")
@@ -4417,6 +4427,11 @@ def cmd_log(args):
     if args.force and not args.cleanup:
         emit_error(args.json, "bad_args", "--force 只配合 --cleanup（强制清理运行中的作业目录）")
         return 2
+    if getattr(args, "require_success", False) and args.list_jobs:
+        emit_error(args.json, "bad_args",
+                   "--require-success 不配合 --list（列清单没有作业结果可判；"
+                   "请配 --job-id 或 --path 读具体作业）")
+        return 2
 
     conn, client, conn_ec = _connect_exec(args)
     if conn_ec is not None:
@@ -4436,6 +4451,19 @@ def cmd_log(args):
         _emit_result(args, result, header="%s job_id=%s log=%s"
                      % (head, result.get("job_id"), result["log"]),
                      sections=[("LOG", result["stdout"])])
+        if getattr(args, "require_success", False):
+            # v2.5.2：把远端作业结果映射到本地退出码。默认语义是"日志读到了"恒 0，
+            # 自动化只看 $LASTEXITCODE 会把失败的作业当成功——外部使用者反馈的真坑。
+            #  finished + rc=0 → 0；finished + 失败 → 远程退出码（255→254，与 exec 同规则）；
+            #  running（未结束，别误报失败）/ dead（退出码不可知）→ 1。
+            #  不新增退出码（契约集合 {0,1,2,124,130,254,255} 不变），具体语义看 JSON 的
+            #  status/exit_code/next_action；不带本参数时走下面 return 0，行为逐字节不变。
+            if result.get("status") == "finished":
+                _ec = result.get("exit_code")
+                if _ec == 0:
+                    return 0
+                return 254 if _ec == 255 else (_ec if isinstance(_ec, int) else 1)
+            return 1
         return 0
     except KeyboardInterrupt:
         emit_error(args.json, "interrupted", _interrupt_msg())
@@ -7678,6 +7706,7 @@ def build_parser():
   pyaissh log h --job-id <id> --offset 0                 # 从头增量读（返回 next_offset）
   pyaissh log h --job-id <id> --offset <next_offset>     # 接着上次读（轮询不重复）
   pyaissh log h --job-id <id> --wait-rc 30               # 等结束（≤600s）并拿退出码
+  pyaissh log h --job-id <id> --require-success          # 让本地退出码=远端作业结果（自动化判活用它）
   pyaissh log h --job-id <id> --kill                     # 整组停掉（TERM→宽限 5s→KILL）
   pyaissh log h --job-id <id> --kill --cleanup           # 停掉并清理（推荐收尾方式）
   pyaissh log h --job-id <id> --cleanup                  # 清理远端作业目录（运行中会被拒绝）
@@ -7712,6 +7741,12 @@ def build_parser():
     p.add_argument("--wait-rc", dest="wait_rc", type=_positive_int,
                    help="阻塞等待作业结束（rc 出现或进程消失）最多 N 秒（上限 %d），收敛即返回"
                         % JOB_WAIT_MAX)
+    p.add_argument("--require-success", dest="require_success", action="store_true",
+                   help="让**本地退出码**承载远端作业结果（默认只看日志是否读到，恒 0）："
+                        "已结束且 exit_code=0 → 0；已结束但失败 → 远程退出码（255 映射为 254，"
+                        "同 exec）；仍在运行或 dead（退出码不可知）→ 1。"
+                        "shell 里 `if ($LASTEXITCODE -eq 0)` 因此能真判作业成败；"
+                        "不加本参数时行为逐字节不变")
     p.add_argument("--kill", action="store_true",
                    help="整组停掉作业（读 job.pid → 对进程组 TERM → 宽限 %ds → KILL）："
                         "被 kill 的作业随后判定为 dead（无退出码），状态机可收敛；需 --job-id"

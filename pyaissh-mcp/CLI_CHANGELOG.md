@@ -1044,3 +1044,26 @@
 - `docs/exec.md` 新增整节讲这个坑（含正误写法对照与三种可用写法）；`SKILL.md` 速查第 8 条补
   "exec 的远端 stdin 恒为 EOF"；`_prepare_exec_command` 的 docstring 返回值订正为 4 个
   （原写 3 个，与实际 `return cmd, warnings, sudo_pw, orig_cmd` 不符）。
+
+## [2.5.2] - 2026-10-12
+
+### 新增
+- **`log --require-success`：让本地退出码承载远端作业结果**（外部使用者反馈：`ok:true` 只代表
+  "日志读到了"，自动化只看 `$LASTEXITCODE` 会把失败的作业当成功——实例
+  `{"ok":true,"status":"finished","exit_code":1,"exit_success":false}` 被当成升级成功）。
+  语义：已结束且 `exit_code=0` → 0；已结束但失败 → **远程退出码**（255 映射为 254，与 exec 同规则）；
+  仍在运行（未完成，不误报失败）或 `dead`（退出码不可知）→ 1。**不新增退出码**（契约集合
+  `{0,1,2,124,130,254,255}` 不变），"未完成"与"失败"靠 JSON 的 `status`/`exit_code`/`next_action`
+  区分；不加本参数时行为逐字节不变（老调用方零感知）。`--list` 配它会报 bad_args。
+  真机实测：exit 7 → 本地 7；exit 0 → 0；sleep 中 → 1 + `ok:true` + `status:running`；
+  dead（`--kill` 后）→ 1 + `hint` 明示退出码不可知。4 条断言落 `live_exec_field`。
+
+### 修改
+- **`log` 尾部读给出重复告警**（同一反馈的第二半）：不给 `--offset` 时是尾部 N 行（默认 100），
+  连续读同一作业会拿到**同样一段**（发布作业收两遍、`pnpm`/`git diff` 整段重复——外部使用者实踩）。
+  默认载荷不动（`stdout` 内容是现有调用方的依赖），`finished` 分支的 `next_action` 现在会明确
+  "本次是尾部 N 行，重复读会拿到同样内容；增量读用 --offset <next_offset>"。
+- 文档：`docs/exec.md` 补 `--require-success` 语义表、"别再重复收同一份日志"、以及
+  **"理想摘要"配方**（`--field job_id,status,exit_code,exit_success,log,next_offset` 拿元数据 +
+  `--offset <next> --lines 20` 拿增量正文，一屏搞定不必展开原文）；`docs/errors.md` 退出码表的
+  1/254 两行补 `--require-success` 语义；`SKILL.md` 后台作业节补 `ok:true` 歧义警告与增量读提示。

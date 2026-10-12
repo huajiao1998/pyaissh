@@ -82,10 +82,13 @@ python3 pyaissh.py exec root@1.2.3.4 --detach --cmd 'apt install -y nginx'  # �
 python3 pyaissh.py log  root@1.2.3.4 --list                                 # 列作业（状态/大小/退出码）
 python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --offset <next_offset>   # 增量读，不重复
 python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --wait-rc 30             # 等结束拿 exit_code
+python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --require-success        # 本地退出码=作业结果（自动化判活）
 python3 pyaissh.py log  root@1.2.3.4 --job-id <id> --kill --cleanup         # 停掉整组并清理
 ```
 - **为什么用**：`exec` 前台受宿主单次调用时长限制（宿主约 600s，pyaissh 自身可到 1200）；`--detach` 把作业丢到远端 `setsid+nohup` 后台（SSH 断开照跑），日志/退出码/pid 落 `/tmp/pyaissh-jobs/<job_id>/{job.log,job.rc,job.pid}`，AI 用 `log` 轮询增量读
 - **载荷字段是 `stdout`**（v2.2.1 起与 exec 对齐，`2>&1` 合并流）；状态三级：**finished**（有 job.rc 即退出码）/ **dead**（无 rc 且进程已消失：被 kill/OOM/崩溃，带 `hint`）/ **running**——被 kill 的作业不再永远 running，`--wait-rc` 能收敛
+- ⚠️ **`ok:true` 与本地退出码只代表"日志读到了"，不代表作业成功**（外部使用者真踩过：`ok:true, status:finished, exit_code:1, exit_success:false` 被当成升级成功）。判作业成败看 `status`+`exit_success`；**shell 里要一行判定就加 `--require-success`**（v2.5.2）：已结束失败 → 本地=远程退出码（255→254），仍在运行/`dead` → 本地 1（不新增退出码，语义看 JSON）
+- **别重复收同一份日志**：不给 `--offset` 是**尾部 100 行**，连续读同一作业会拿到同样一段（`next_action` 会提醒）；增量读用 `--offset <next_offset>`。要"一屏摘要"：`--field job_id,status,exit_code,exit_success,log,next_offset` + 按需 `--lines 20`
 - 目录 0700、文件 0600；`--cleanup` 在作业仍运行时**拒绝**（`job_running`，防自断追踪）——放弃追踪用 `--cleanup --force`（其后进程若仍在，结果直接给 `kill -9 -<pid>`，负号=进程组，不用先 pgrep）；正常收尾 `--kill --cleanup`
 - 与 `--sudo`/`--pty` 互斥（bad_args）；命令原文落远端 `job.sh`（别写明文凭据，用完 `--cleanup`）
 
