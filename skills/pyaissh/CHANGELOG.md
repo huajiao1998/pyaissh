@@ -1067,3 +1067,47 @@
   **"理想摘要"配方**（`--field job_id,status,exit_code,exit_success,log,next_offset` 拿元数据 +
   `--offset <next> --lines 20` 拿增量正文，一屏搞定不必展开原文）；`docs/errors.md` 退出码表的
   1/254 两行补 `--require-success` 语义；`SKILL.md` 后台作业节补 `ok:true` 歧义警告与增量读提示。
+
+## [2.5.3] - 2026-10-13
+
+### 文档订正（v2.5.2 发布后发现的三处问题，均为文档/措辞，无行为变更）
+- **`log` "理想摘要"示例有误**：原示例同时给了 `--offset` 和 `--lines 20`，而二者
+  **互斥**（同用连接前即 `bad_args` rc=2，见 `cmd_log`）——照文档做的调用方第一条就报错。
+  已拆成两种正确写法：增量读用 `--offset`（`--field ...,stdout` 一次同时拿正文和游标），
+  尾部读用 `--lines`。
+- **"先只取元数据、再按返回的新 offset 取正文"是陷阱**：`--field` 只控制**打印什么**，
+  不控制**读多少**——第一条调用已把那段日志读走并返回 `next_offset`，接着用它取正文会
+  **跳过刚才那段**（只能 `--offset 0` 重读补救）。配方已改为一次取走正文+游标，
+  并显式写出该陷阱与两种正确选择。
+- **退出码口径不准**：原文说"不新增退出码（契约集合 `{0,1,2,124,130,254,255}` 不变）"，
+  但又正确说明远端 exit 7 会返回本地 7——自相矛盾。已改为准确表述：
+  **工具自身错误沿用既有码（不新增码），远端命令/作业退出码原样透传**，所以本地退出码
+  **不限于**那个固定集合；判成败以 JSON 的 `status`/`exit_code`/`exit_success` 为准。
+- **`local_exit_code` 被误用于 log 路径**：该字段只存在于 `exec` 结果；`log` 结果没有它。
+  254 的歧义说明已收窄为"exec 看 `local_exit_code`+`exit_code` 双字段；log 只有 `exit_code`"
+  （本地 254 + JSON `exit_code=255` ⇒ 映射；本地 254 + JSON `exit_code=254` ⇒ 远程真实值）。
+- 顺带：`errors.md` 退出码表的 **4 行**（0/1/2/254）与表前口径段一并订正——0 行补"默认 `log`
+  读到日志即 0 不代表作业成功"、1 行去掉冗余解释、2 行补上 `log --list` 配 `--require-success`
+  与 `log` 同用 `--lines`/`--offset` 这两个 bad_args 来源、254 行收窄 `local_exit_code` 适用范围；
+  `log --require-success` 的 `--help` 补"远端退出码透传、本地码不限于固定集合"提示。
+- 源码侧同步：`cmd_log` 里 `--require-success` 上方的注释原写"不新增退出码（契约集合不变）"，
+  已改为同一准确口径；项目 `AGENTS.md` §0 红线的退出码表述同步订正。
+
+### 影响面
+- 无功能/接口行为变更（不动任何执行逻辑与 JSON 字段）；可见变化仅 `--version`（2.5.2→2.5.3）、
+  `log --help` 的 `--require-success` 帮助文本，以及上述文档措辞。
+
+## [2.5.4] - 2026-10-13
+
+### 修复（数据丢失级，外部 AI 报的实测缺陷）
+- **`host remove` 按裸字符串前缀删配置，会连带删掉其他主机的配置与专属凭据**。原实现
+  `_env_remove_keys` 用 `key.startswith(prefix)` 匹配，而别名合法字符**含下划线**——删 `prod` 时
+  `PYAISSH_HOST_PROD2`、`PYAISSH_HOST_PROD2_PASSWORD`、`PYAISSH_HOST_PROD_A`、
+  `PYAISSH_HOST_PROD_A_KEY` 全部命中。**实测：删一个 `prod` 一次误删 6 行**，其他主机的目标配置
+  和密码/密钥凭据静默丢失（`.env` 是明文文件，误删后只能靠备份恢复）。
+- 修复：改为按**完整键名**匹配——只删 `PYAISSH_HOST_<NAME>` / `..._PASSWORD` / `..._KEY` 这三种
+  （`host add` 会写的全部键），`prod2`/`prod_a` 等前缀同名别名不再被波及。修复后同一夹具
+  `removed` 从 6 行降为 2 行，其余 6 行原样保留。
+- 测试：`unit_host` 补 5 条前缀重叠断言（删 prod 不碰 prod2/prod_a 的配置与凭据、只删自己的 2 行、
+  删 prod2 反向不碰 prod_a、prod 删净后再删报"不存在"且不误删 prod_a）；原测试只用了 `prod`/`stage`
+  两个无前缀重叠关系的名字，覆盖不到这条路径。`--suite unit_host` **12 PASS / 0 FAIL**。

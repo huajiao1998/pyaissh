@@ -14,14 +14,19 @@
 
 ## 退出码语义（完整版）
 
+**口径（v2.5.3 订正）**：下表是**工具自身错误**的退出码（`bad_args`=2、连接失败=255 等，不新增码）；
+**远端命令/作业的退出码会被原样透传**——`exec` 的失败命令、以及 `log --require-success` 时的作业退出码
+都会成为本地退出码（远端 255 映射为 254）。所以**本地退出码不限于下面这个集合**，判成败一律以 JSON 的
+`status`/`exit_code`/`exit_success` 为准。
+
 | 码 | 含义 | 说明 |
 |---|---|---|
-| 0 | 成功 | |
-| 1 | 传输错误 / SFTP 超时；**`log --require-success` 时作业未结束**（`running`）或退出码不可知（`dead`） | upload/download/ls（`upload_failed`/`download_failed`/`ls_failed`/`*_timeout`）；后者仅在显式加了 `--require-success` 时出现——默认 `log` 只要读到日志就恒 0（`ok:true` 只代表"读到了"，不代表作业成功，详见 docs/exec.md） |
-| 2 | **所有参数错误**：argparse 层（未知参数/缺参数/`--port` 非数字/0/负值/越界/超时参数非整数）、exec 缺 `--cmd`、`--cmd-file` 读取失败（`read_cmd_failed`）、缺用户名/主机、target 内嵌端口非法、别名未配置、路径不存在或含通配符（`~user` 形式也归此类）、**session 类状态错**（`session_not_found`/`session_dead`/`session_exists`/非法会话名） | 均报 `bad_args` 或 `read_cmd_failed`；`--port 0`/负值在**命令行**直接报错退出 2，**静默回退 22 仅发生在 `PYAISSH_PORT` 环境变量**（越界也回退并打 WARN） |
+| 0 | 成功 | 注意：**默认的 `log` 只要读到日志就是 0**（`ok:true` 只代表"读到了"，不代表作业成功）——要判作业成败加 `--require-success` 或看 JSON |
+| 1 | 传输错误 / SFTP 超时；**`log --require-success` 时作业未结束**（`running`）或退出码不可知（`dead`） | upload/download/ls（`upload_failed`/`download_failed`/`ls_failed`/`*_timeout`）；后者仅在显式加了 `--require-success` 时出现 |
+| 2 | **所有参数错误**：argparse 层（未知参数/缺参数/`--port` 非数字/0/负值/越界/超时参数非整数）、exec 缺 `--cmd`、`--cmd-file` 读取失败（`read_cmd_failed`）、缺用户名/主机、target 内嵌端口非法、别名未配置、路径不存在或含通配符（`~user` 形式也归此类）、**session 类状态错**（`session_not_found`/`session_dead`/`session_exists`/非法会话名）、`log --list` 配 `--require-success`、`log` 同用 `--lines` 与 `--offset` | 均报 `bad_args` 或 `read_cmd_failed`；`--port 0`/负值在**命令行**直接报错退出 2，**静默回退 22 仅发生在 `PYAISSH_PORT` 环境变量**（越界也回退并打 WARN） |
 | 124 | **exec 超时**（对齐 GNU timeout 惯例） | `exec_idle_timeout`（连续无输出超 `--idle-timeout`）或 `exec_total_timeout`（总时长超 `--max-time`）；**远程进程可能仍在运行**（断开不会杀掉它），副作用命令重试前先 pgrep 确认/清理 |
 | 130 | 用户中断（Ctrl+C / SIGTERM，仅 POSIX） | 超时机制杀子进程（`subprocess.terminate()`/`timeout` 命令发 SIGTERM）同样走此路径。v1.4.0 起信号处理器**只置标志不再抛异常**（在 paramiko C 级 I/O 中抛 KI 会导致锁损坏死锁），由救援线程强断连接 + Python 轮询点检查标志，串行/并行/上传/下载/exec/test 全部可靠 130 + `interrupted` JSON + 零本地残留（v1.4.5 起 `test`/`--cmd-file -`/exec 排水阶段也覆盖，不再有信号被吞返回假成功）；`interrupted` 消息区分来源（`用户中断（SIGTERM）`/`用户中断（SIGINT）`）；**慢链路分片下载中断也秒级退出**（v1.4.3 起分片 worker 与主线程 join 均带信号检查，不再拖到 120s 看门狗）；中断路径硬退出（跳过解释器关闭阶段，退出码确定）；**Windows 的 terminate() 是硬杀不走信号**，无 JSON 无清理（调用方应靠 `--max-time` 兜底而非外部强杀） |
-| 254 | exec 成功但远程退出码恰为 255；**`log --require-success` 时作业退出码恰为 255** | 255 保留给连接失败语义；JSON 的 `local_exit_code` 字段即本地实际退出码（254），`exit_code` 仍是远程真实值 255。**歧义提示**：本地退出码 254 可能是"远程真实 254"或"远程 255 的映射"——区分只看 JSON 的 `exit_code`/`local_exit_code` 双字段（纯 `$?` 消费者无法区分，契约要求决策以 JSON 为准） |
+| 254 | **exec 成功但远程退出码恰为 255**；`log --require-success` 时作业退出码恰为 255（同一映射规则） | 255 保留给连接失败语义。`exec` 结果里 `local_exit_code` 字段即本地实际退出码（254）、`exit_code` 仍是远程真实值 255；**`log` 结果没有 `local_exit_code` 字段**，判据看 JSON 的 `exit_code`（本地 254 而 JSON `exit_code=255` ⇒ 映射；本地 254 而 JSON `exit_code=254` ⇒ 远程真实 254）。纯 `$?` 消费者无法区分，契约要求决策以 JSON 为准 |
 | 255 | 连接失败，以及 exec/test/log/session 的执行期错误（`exec_failed`/`connection_lost`/`test_failed`/`detach_failed`/`log_failed`/`kill_failed`/`session_failed`/`send_failed`/`keys_failed`/`session_read_failed`/**`tmux_missing`/`tmux_unsupported`/`tmux_failed`**） | **退出码仅作粗筛，决策一律以 JSON `error` 字段为准** |
 
 ## 错误类型（JSON `error` 字段）与建议动作（完整表）

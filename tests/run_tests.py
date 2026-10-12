@@ -980,6 +980,47 @@ def suite_unit_host(s):
         # add 非法名 -> 2
         rc = quiet(lambda: hm.cmd_host_add(ns(name="bad name!", host_target="root@1.2.3.4", password=None, key=None)))
         s.check("host add 非法名报错", rc == 2)
+        # v2.5.4 前缀重叠（外部 AI 报的实测缺陷）：别名允许下划线，prod2 / prod_a 的键
+        # （PYAISSH_HOST_PROD2、PYAISSH_HOST_PROD_A）都以 PYAISSH_HOST_PROD 开头，
+        # 删 prod 绝不能连带删掉它们的配置与专属凭据。原实现用裸 startswith(prefix)
+        # → 删 prod 一次误删 6 行（prod2 目标+密码、prod_a 目标+密钥），属数据丢失级；
+        # 现按完整键名匹配（目标/密码/密钥三种）。
+        # 断言注意：_env_write_value 只在值含空格/#/引号时才加双引号，这些目标值都不含，
+        # 所以按"无引号"断言（别照抄 add 时带引号的写法）。
+        quiet(lambda: hm.cmd_host_add(ns(name="prod", host_target="root@1.2.3.4",
+                                         password="PwProd", key=None)))
+        quiet(lambda: hm.cmd_host_add(ns(name="prod2", host_target="root@5.6.7.8",
+                                         password="PwProd2", key=None)))
+        quiet(lambda: hm.cmd_host_add(ns(name="prod_a", host_target="root@9.9.9.9",
+                                         password=None, key="/k/prod_a")))
+        before = open(env_p, encoding="utf-8").read()
+        rc = quiet(lambda: hm.cmd_host_remove(ns(name="prod")))
+        txt = open(env_p, encoding="utf-8").read()
+        s.check("前缀重叠：删 prod 不碰 prod2 / prod_a 的配置", rc == 0
+                and "PYAISSH_HOST_PROD2=root@5.6.7.8" in txt
+                and "PYAISSH_HOST_PROD_A=root@9.9.9.9" in txt, txt)
+        s.check("前缀重叠：删 prod 不碰 prod2 / prod_a 的专属凭据", rc == 0
+                and "PYAISSH_HOST_PROD2_PASSWORD=PwProd2" in txt
+                and "PYAISSH_HOST_PROD_A_KEY=/k/prod_a" in txt, txt)
+        # add prod 只写 2 行（目标 + 密码，未给 key），故删除行数差应为 2
+        s.check("前缀重叠：删 prod 只删自己的 2 行", rc == 0
+                and "PYAISSH_HOST_PROD=" not in txt
+                and "PYAISSH_HOST_PROD_PASSWORD=" not in txt
+                and before.count("\n") - txt.count("\n") == 2, txt)
+        # 删 prod2 同理不能碰 prod_a（反向验证）
+        rc = quiet(lambda: hm.cmd_host_remove(ns(name="prod2")))
+        txt = open(env_p, encoding="utf-8").read()
+        s.check("前缀重叠：删 prod2 不碰 prod_a（反向）", rc == 0
+                and "PYAISSH_HOST_PROD_A=root@9.9.9.9" in txt
+                and "PYAISSH_HOST_PROD_A_KEY=/k/prod_a" in txt
+                and "PYAISSH_HOST_PROD2" not in txt, txt)
+        # prod 已删净：再删一次应报"不存在"，且不能误删 prod_a
+        rc = quiet(lambda: hm.cmd_host_remove(ns(name="prod")))
+        txt = open(env_p, encoding="utf-8").read()
+        s.check("前缀重叠：prod 已删净后 remove 报不存在、且不误删 prod_a",
+                rc == 2 and "PYAISSH_HOST_PROD_A=" in txt, txt)
+        # 收尾：把 prod_a 也删掉，恢复夹具干净（避免影响后续断言读 list）
+        quiet(lambda: hm.cmd_host_remove(ns(name="prod_a")))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

@@ -715,17 +715,29 @@ def cmd_host_add(args):
     return 0
 
 
+# host add 会写的三种键：别名目标、专属密码、专属密钥。
+# 删除别名时必须按**完整键名**匹配——别名合法字符含下划线，所以 prod2 / prod_a 的键
+# （PYAISSH_HOST_PROD2、PYAISSH_HOST_PROD_A）都以 PYAISSH_HOST_PROD 开头。
+_HOST_KEY_SUFFIXES = ("", "_PASSWORD", "_KEY")
+
+
 def _env_remove_keys(env_path, prefix):
-    """从 .env 删除所有以 prefix 开头的键行（返回删除行数）。"""
+    """从 .env 删除别名为 prefix 的键行（目标行 + 专属密码/密钥行，返回删除行数）。
+
+    prefix 形如 PYAISSH_HOST_PROD；只删 PYAISSH_HOST_PROD、PYAISSH_HOST_PROD_PASSWORD、
+    PYAISSH_HOST_PROD_KEY 这三个**完整键名**。
+    **切勿改成裸 startswith(prefix)**：2026-10-13 外部 AI 报的实测缺陷——删 prod 会把
+    prod2 的目标与密码、prod_a 的目标与密钥一起删掉（一次误删 6 行，凭据随之丢失）。
+    """
     if not os.path.isfile(env_path):
         return 0
+    exact = set(prefix + sfx for sfx in _HOST_KEY_SUFFIXES)
     with open(env_path, "r", encoding="utf-8", newline="") as f:
         lines = f.read().splitlines(keepends=True)
-    newline_eol = "\r\n" if any(l.endswith("\r\n") for l in lines) else "\n"
     kept, removed = [], 0
     for ln in lines:
         key = ln.split("=", 1)[0].strip()
-        if key.startswith(prefix):
+        if key in exact:
             removed += 1
             continue
         kept.append(ln)

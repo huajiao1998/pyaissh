@@ -355,6 +355,8 @@ def build_parser():
                    help="让**本地退出码**承载远端作业结果（默认只看日志是否读到，恒 0）："
                         "已结束且 exit_code=0 → 0；已结束但失败 → 远程退出码（255 映射为 254，"
                         "同 exec）；仍在运行或 dead（退出码不可知）→ 1。"
+                        "注意：远端退出码是**透传**的，本地退出码因此不限于工具自身那几个固定码"
+                        "（2/124/130/254/255 等），判成败以 JSON 的 status/exit_code 为准。"
                         "shell 里 `if ($LASTEXITCODE -eq 0)` 因此能真判作业成败；"
                         "不加本参数时行为逐字节不变")
     p.add_argument("--kill", action="store_true",

@@ -126,16 +126,20 @@ python3 pyaissh.py log root@1.2.3.4 --job-id <id> --wait-rc 300              # �
 python3 pyaissh.py log root@1.2.3.4 --job-id <id> --require-success          # 本地退出码=作业结果（自动化判活）
 python3 pyaissh.py log root@1.2.3.4 --job-id <id> --cleanup                  # 清理远端作业目录
 ```
-- **`--require-success`（v2.5.2）：让本地退出码承载远端作业结果**。默认语义是"**日志读到了**"就 `return 0`——`ok:true` 与本地退出码都只说明读取成功，跟作业成败无关；自动化里 `if ($LASTEXITCODE -eq 0)` 因此会把**失败的作业当成功**（外部使用者真踩过）。加上本参数后：已结束且 `exit_code=0` → `0`；已结束但失败 → **远程退出码**（`255` 映射为 `254`，与 `exec` 同规则）；仍在运行或 `dead`（退出码不可知）→ `1`。**不新增退出码**（契约集合 `{0,1,2,124,130,254,255}` 不变），"未完成"与"失败"靠 JSON 的 `status`/`exit_code`/`next_action` 区分。不加本参数时行为逐字节不变
+- **`--require-success`（v2.5.2）：让本地退出码承载远端作业结果**。默认语义是"**日志读到了**"就 `return 0`——`ok:true` 与本地退出码都只说明读取成功，跟作业成败无关；自动化里 `if ($LASTEXITCODE -eq 0)` 因此会把**失败的作业当成功**（外部使用者真踩过）。加上本参数后：已结束且 `exit_code=0` → `0`；已结束但失败 → **远程退出码**（`255` 映射为 `254`，与 `exec` 同规则）；仍在运行或 `dead`（退出码不可知）→ `1`。**退出码口径**：工具自身的错误仍用既有码（`bad_args`=2、连接失败=255 等，不新增码），**远端作业退出码则原样透传**——所以本地退出码**不是**那个固定集合 `{0,1,2,124,130,254,255}`；判成败一律以 JSON 的 `status`/`exit_code`/`exit_success` 为准，"未完成"与"失败"靠 `status`/`next_action` 区分。不加本参数时行为逐字节不变
 - **别再重复收同一份日志（v2.5.2 提示）**：不给 `--offset` 时是**尾部 N 行**（默认 100），连续读同一作业会拿到**同样一段**（发布作业收两遍、`pnpm`/`git diff` 整段重复——外部使用者实踩）。正解是用 `--offset <next_offset>` 增量读（不重复不遗漏）。finished 状态的 `next_action` 现在会主动提醒这一点
 - **"理想摘要"配方**（任务 ID / 状态 / 退出码 / 最新几行 / 日志位置，一屏搞定，不必展开原文）：
 ```bash
-# 元数据一行拿全（--field 只取裸值，不进 JSON）
+# ✅ 增量读：用 --offset（推进游标，不重复不遗漏）；--field 只决定打印什么，不决定读多少
 python3 pyaissh.py log root@1.2.3.4 --job-id <id> --offset <next_offset> \
-    --field job_id,status,exit_code,exit_success,log,next_offset
-# 再按需取最新几行正文（别用默认的尾部 100 行）
-python3 pyaissh.py log root@1.2.3.4 --job-id <id> --offset <next_offset> --lines 20
+    --field job_id,status,exit_code,exit_success,log,next_offset,has_more,stdout
+# ✅ 只看最新几行：用 --lines（尾部读，返回的 next_offset 即 EOF）
+python3 pyaissh.py log root@1.2.3.4 --job-id <id> --lines 20
 ```
+  ⚠️ **`--offset` 与 `--lines` 互斥**（二选一；同用连接前就 `bad_args` rc=2）。
+  ⚠️ **别"先只取元数据、再用它返回的新 offset 取正文"**：`--field` 不控制读取——
+  第一条调用已经把那段日志读走，接着用它返回的 `next_offset` 会**跳过刚才那段**（只能 `--offset 0` 重读补救）。
+  要元数据就别在那一条里推进游标：要么按上面第一条把 `stdout` 一起取走，要么改用 `--lines` 尾部读。
 - **机制**：作业脚本落远端 `/tmp/pyaissh-jobs/<job_id>/`（`job.sh` = 你的命令原文、`run.sh` = 运行器），`setsid nohup` 启动 → **SSH 断开、宿主单次调用超时都不影响作业**；输出合并进 `job.log`，结束时退出码写入 `job.rc`，进程组 leader pid 写入 `job.pid`
 - **状态机（v2.2.1 三级）**：`finished`（`job.rc` 存在 = 退出码）/ **`dead`**（无 rc 且 `job.pid` 存活探测判定进程已消失——被 kill / OOM / 崩溃，退出码不可知）/ `running`。被 kill 的作业**不再永远 running**，`--wait-rc` 与轮询都能收敛；`dead` 时结果带 `hint` 说明
 - **`log` 载荷字段是 `stdout`**（v2.2.1 起，与 `exec` 对齐；它是 `2>&1` **合并流**，`stream:"stdout+stderr"` 声明）：`pyaissh log h --job-id <id> --field stdout` 直接取裸内容

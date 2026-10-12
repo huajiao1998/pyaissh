@@ -135,7 +135,7 @@ except (ValueError, OSError, ImportError):
 被 00_head（信号区）、各 cmd_*（超时/常量）引用；拼接后与本包其余域同模块共享命名空间。
 """
 
-VERSION = "2.5.2"
+VERSION = "2.5.4"
 
 # =========================================================================
 # 代码地图（维护用）：改功能 → 按区域定位函数（grep 函数名即得；不写行号，
@@ -1886,17 +1886,29 @@ def cmd_host_add(args):
     return 0
 
 
+# host add 会写的三种键：别名目标、专属密码、专属密钥。
+# 删除别名时必须按**完整键名**匹配——别名合法字符含下划线，所以 prod2 / prod_a 的键
+# （PYAISSH_HOST_PROD2、PYAISSH_HOST_PROD_A）都以 PYAISSH_HOST_PROD 开头。
+_HOST_KEY_SUFFIXES = ("", "_PASSWORD", "_KEY")
+
+
 def _env_remove_keys(env_path, prefix):
-    """从 .env 删除所有以 prefix 开头的键行（返回删除行数）。"""
+    """从 .env 删除别名为 prefix 的键行（目标行 + 专属密码/密钥行，返回删除行数）。
+
+    prefix 形如 PYAISSH_HOST_PROD；只删 PYAISSH_HOST_PROD、PYAISSH_HOST_PROD_PASSWORD、
+    PYAISSH_HOST_PROD_KEY 这三个**完整键名**。
+    **切勿改成裸 startswith(prefix)**：2026-10-13 外部 AI 报的实测缺陷——删 prod 会把
+    prod2 的目标与密码、prod_a 的目标与密钥一起删掉（一次误删 6 行，凭据随之丢失）。
+    """
     if not os.path.isfile(env_path):
         return 0
+    exact = set(prefix + sfx for sfx in _HOST_KEY_SUFFIXES)
     with open(env_path, "r", encoding="utf-8", newline="") as f:
         lines = f.read().splitlines(keepends=True)
-    newline_eol = "\r\n" if any(l.endswith("\r\n") for l in lines) else "\n"
     kept, removed = [], 0
     for ln in lines:
         key = ln.split("=", 1)[0].strip()
-        if key.startswith(prefix):
+        if key in exact:
             removed += 1
             continue
         kept.append(ln)
@@ -4456,8 +4468,10 @@ def cmd_log(args):
             # 自动化只看 $LASTEXITCODE 会把失败的作业当成功——外部使用者反馈的真坑。
             #  finished + rc=0 → 0；finished + 失败 → 远程退出码（255→254，与 exec 同规则）；
             #  running（未结束，别误报失败）/ dead（退出码不可知）→ 1。
-            #  不新增退出码（契约集合 {0,1,2,124,130,254,255} 不变），具体语义看 JSON 的
-            #  status/exit_code/next_action；不带本参数时走下面 return 0，行为逐字节不变。
+            #  口径（v2.5.3 订正）：工具自身错误沿用既有码（bad_args=2 / 连接失败=255 等，
+            #  不新增码），但**远端作业退出码是透传的**——所以本地退出码不限于那个固定集合
+            #  {0,1,2,124,130,254,255}（exit 7 就会返回 7）。判成败以 JSON 的
+            #  status/exit_code/exit_success 为准；不带本参数时走下面 return 0，行为逐字节不变。
             if result.get("status") == "finished":
                 _ec = result.get("exit_code")
                 if _ec == 0:
@@ -7745,6 +7759,8 @@ def build_parser():
                    help="让**本地退出码**承载远端作业结果（默认只看日志是否读到，恒 0）："
                         "已结束且 exit_code=0 → 0；已结束但失败 → 远程退出码（255 映射为 254，"
                         "同 exec）；仍在运行或 dead（退出码不可知）→ 1。"
+                        "注意：远端退出码是**透传**的，本地退出码因此不限于工具自身那几个固定码"
+                        "（2/124/130/254/255 等），判成败以 JSON 的 status/exit_code 为准。"
                         "shell 里 `if ($LASTEXITCODE -eq 0)` 因此能真判作业成败；"
                         "不加本参数时行为逐字节不变")
     p.add_argument("--kill", action="store_true",

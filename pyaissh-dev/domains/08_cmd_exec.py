@@ -1674,8 +1674,10 @@ def cmd_log(args):
             # 自动化只看 $LASTEXITCODE 会把失败的作业当成功——外部使用者反馈的真坑。
             #  finished + rc=0 → 0；finished + 失败 → 远程退出码（255→254，与 exec 同规则）；
             #  running（未结束，别误报失败）/ dead（退出码不可知）→ 1。
-            #  不新增退出码（契约集合 {0,1,2,124,130,254,255} 不变），具体语义看 JSON 的
-            #  status/exit_code/next_action；不带本参数时走下面 return 0，行为逐字节不变。
+            #  口径（v2.5.3 订正）：工具自身错误沿用既有码（bad_args=2 / 连接失败=255 等，
+            #  不新增码），但**远端作业退出码是透传的**——所以本地退出码不限于那个固定集合
+            #  {0,1,2,124,130,254,255}（exit 7 就会返回 7）。判成败以 JSON 的
+            #  status/exit_code/exit_success 为准；不带本参数时走下面 return 0，行为逐字节不变。
             if result.get("status") == "finished":
                 _ec = result.get("exit_code")
                 if _ec == 0:
