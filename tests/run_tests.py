@@ -52,9 +52,9 @@ _py_module = None
 # reaper（每主机一个，默认 300s 一轮）只是"没人再回来"的兜底。
 # 因此回收类用例主要靠"等够 TTL + 发一条会话命令触发懒扫"，reaper 类用例则**显式**给那次
 # start 传 PYAISSH_SESSION_REAP_INTERVAL=3（间隔在 start 时写进远端 reap.sh），
-# 这样不管有没有 --fast 都是几秒钟的事。`--fast` 只是把默认间隔也调小。
+# 这样不管有没有 --fast 都是几秒钟的事。`--fast` 只把**默认**间隔也调小（影响之后新建的会话）。
+# 曾经这里还有个 _REAP（想把等待按比例缩短），但没有任何代码读它——名不副实，2026-10-12 删掉。
 _FAST_REAP = 3
-_REAP = int(os.environ.get("PYAISSH_SESSION_REAP_INTERVAL") or 300)
 
 _py_module = None
 
@@ -2469,18 +2469,26 @@ def _run_suite(idx):
     为什么要接住异常（2026-09-24 教训）：套件中途抛异常（例如新加的断言引用了还没赋值的变量）
     会让整个 runner 带 traceback 退出——后面的套件根本没跑，而 PowerShell 管道里"最后一个命令
     成功"还会让外层看起来是 exit 0。那次我先把它误读成"单位集通过"。现在崩溃=FAIL 且不中断。
+
+    v2.5.2 起打印每块耗时：全量 6-8 分钟里"时间花在哪"此前只能靠读代码推断，
+    加一行 elapsed 让后续优化有数据（SKIP/CRASH 也打，别让缺口藏在零值里）。
     """
     name, desc, fn = SUITES[idx]
     print("\n>>> %s（%s）" % (name, desc))
     s = _Suite(name)
+    _t0 = time.time()
     try:
         fn(s)
     except Exception:
         print("SUITE CRASH（记 FAIL，继续跑其余套件）:\n%s" % traceback.format_exc())
+        print("--- %s：%.1fs（CRASH）" % (name, time.time() - _t0))
         return False
+    _dt = time.time() - _t0
     if s.pass_n == 0 and s.fail_n == 0:
+        print("--- %s：%.1fs（SKIP）" % (name, _dt))
         return None  # SKIP（live 缺凭据返回 None 已 print）
     n, f = s.result()
+    print("--- %s：%.1fs" % (name, _dt))
     return f == 0
 
 
@@ -2519,9 +2527,9 @@ def main():
     ap.add_argument("--suite", help="按名字选套件（逗号分隔，见 --list）——开发时只跑动过的路径，"
                                    "例如 --suite live_session_engine,live_session_lifecycle")
     ap.add_argument("--fast", action="store_true",
-                    help="快跑：把每主机 reaper 的检查间隔调到 %ds（PYAISSH_SESSION_REAP_INTERVAL），"
-                         "把「等 reaper 收会话」的等待按比例缩短（默认 300s，真实生产值）。"
-                         "注：回收主路径是惰性扫（任何会话命令都触发），多数回收用例本来就只需几秒"
+                    help="快跑：把 PYAISSH_SESSION_REAP_INTERVAL 设为 %ds（默认 300s）——"
+                         "影响**之后新建**会话写进远端 reap.sh 的间隔。注意它不缩放测试里的"
+                         "等待（回收主路径是惰性扫，多数用例本就只等几秒；reaper 用例显式传 3s）"
                          % _FAST_REAP)
     ap.add_argument("--release", action="store_true",
                     help="全量/整个模式（--all / --session）需显式确认：加本参数，"
@@ -2546,8 +2554,7 @@ def main():
         return 0
     if a.fast:
         os.environ["PYAISSH_SESSION_REAP_INTERVAL"] = str(_FAST_REAP)
-        globals()["_REAP"] = _FAST_REAP
-        print("[fast] reaper 间隔=%ds（默认 300s），等待按比例缩短" % _FAST_REAP)
+        print("[fast] reaper 间隔=%ds（默认 300s；只影响之后新建的会话，不缩放测试等待）" % _FAST_REAP)
     if a.all:
         order = list(range(len(SUITES)))
     elif a.unit:
