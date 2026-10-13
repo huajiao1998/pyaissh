@@ -16,7 +16,7 @@ pyaissh-mcp/ 成为一个**自包含的分发包**（适配器 + 完整 pyaissh 
     pyaissh.cmd       → pyaissh.cmd       （Windows 入口）
     SKILL.md          → SKILL.md          （技能入口）
     CHANGELOG.md      → CLI_CHANGELOG.md  （CLI 变更记录；改名避免与适配器 CHANGELOG 冲突）
-    docs/*.md         → docs/*.md         （技能文档七篇）
+    docs/*.md         → docs/*.md         （技能文档八篇）
 不同步：.env.example（适配器有自己的凭据模板）、test/（测试不出包）。
 
 退出码：0 = 全部一致；1 = 有漂移或源缺失。
@@ -26,16 +26,20 @@ pyaissh-mcp/ 成为一个**自包含的分发包**（适配器 + 完整 pyaissh 
 # --- 中文输出保护（2026-09-24 统一规则）---
 # Windows 默认按本地代码页（cp936/GBK）编码 stdout，打印中文会乱码、遇到 GBK 编不出的
 # 字符（如 ⬜）直接 UnicodeEncodeError 崩溃；管道/重定向下同样如此。显式设 UTF-8 一劳永逸。
+# ⚠️ import 必须在本块**之前**：2026-10-13 修过一个真 bug——本块原本写在 `import sys` 之前，
+#   try 里 `sys.stdout` 必然 NameError，又被 `except Exception: pass` 吞掉，UTF-8 重配
+#   **从未执行过**（中文输出一直依赖系统代码页）。顺序别改回去。
+import hashlib
+import os
+import shutil
+import sys
+
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
 # --- 中文输出保护结束 ---
-import hashlib
-import os
-import shutil
-import sys
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 SKILL = os.path.join(os.path.dirname(BASE), "skills", "pyaissh")

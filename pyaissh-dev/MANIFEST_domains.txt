@@ -17,7 +17,9 @@
 #   域内标识而非域边界，本就无法还原域文件；旧实现还会先清空 domains/ 再切分，锚一过期
 #   即"域文件被删空"。锚列随之删除（唯一消费者是 split）——要改代码就改 domains/ 后跑 dist。
 #
-# 本文件仍被 tests/run_tests.py 的 unit_artifacts 校验（12 域 + 域文件齐全）。
+# 本文件仍被 tests/run_tests.py 的 unit_artifacts 校验（**13 域** + 域文件齐全）。
+# 注意区分两个数：域**文件** 13 个（00_head + 01..12），join 插入的**横幅** 12 个
+# （00_head 是文件头/docstring/import，不插横幅）——下文"域 NN/12"指横幅编号。
 00_head.py
 01_globals.py
 02_cred_regex.py

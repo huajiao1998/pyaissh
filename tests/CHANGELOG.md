@@ -492,3 +492,31 @@
   `_REAP` 变量**定义了、被赋值、从来没人读**——比例缩短从未实现。删除死变量，帮助文字与
   启动日志改为如实描述"只把 PYAISSH_SESSION_REAP_INTERVAL 设为 3s，影响之后新建的会话，
   不缩放测试等待"（回收主路径是惰性扫，多数用例本就只等几秒；reaper 用例显式传 3s）。
+
+## [2026-10-13] 修 sync_check.py 的 UTF-8 重配失效 + 文档数字漂移上闸
+
+### 修的真 bug（外部 AI 报）
+- **`pyaissh-mcp/sync_check.py` 的中文输出保护从未生效**：`try: sys.stdout.reconfigure(...)`
+  块写在 `import sys` **之前**，`sys` 未定义必然 `NameError`，又被 `except Exception: pass`
+  吞掉 ⇒ UTF-8 重配一次都没执行过，Windows 下中文输出一直依赖系统代码页（cp936）。
+  修法：把 `import hashlib/os/shutil/sys` 提到该块之前，并把"顺序别改回去"写进注释。
+  验证：导入该模块后 `sys.stdout.encoding` 实测 = `utf-8`。
+
+### 修的文档漂移（同批报告，另发现 2 处未报的）
+- `sync_check.py` docstring"技能文档**七篇**"→ 八篇（`DOCS` 元组实际就列了 8 个，
+  数与表不符）；`pyaissh-mcp/README.md` 同样"七篇"→ 八篇。
+- `MANIFEST_domains.txt`"校验（**12 域**…）"→ 13 域（与 `unit_artifacts` 的
+  "MANIFEST 13 域"断言矛盾）；`pyaissh-dev/README.md`"MANIFEST 的 12 域"→ 13 域。
+  同时在 MANIFEST 里写清两个数的区别：域**文件** 13 个（`00_head`+`01..12`）、
+  join 插入的**横幅** 12 个（`00_head` 不插横幅），"域 NN/12"指横幅编号。
+
+### 上闸（根因是这些数字没有断言看守）
+`suite_unit_artifacts` 新增 **5 条**（33 → 38）：`sync_check` 的 `DOCS` 元组与
+`skills/pyaissh/docs` 实际文件一致、其 docstring 写"八篇"、MANIFEST docstring 写"13 域"、
+`pyaissh-dev/README` 写"13 域"、`pyaissh-mcp/README` 写"八篇"。**全部与代码里的权威源比对**，
+改内容忘改数字会被测出来。
+
+### 制品影响
+零（改的都是 `pyaissh-mcp/sync_check.py`、`pyaissh-dev/{README.md,MANIFEST_domains.txt}`、
+`pyaissh-mcp/README.md` 与 tests，不动 `domains/` 与 `skills/pyaissh/` 内容）——
+`dist` 后制品 md5 与修改前一致（`df71d3f790ba0ac1a8827864e7cde9a4`），**不需要发版**。

@@ -14,7 +14,7 @@ Exposes pyaissh (the structured SSH CLI built for AI agents) as MCP tools: JSON-
 |---|---|
 | `pyaissh_mcp.py` | MCP 服务器（stdio JSON-RPC，零 SDK 依赖）|
 | `pyaissh.py` / `pyaissh` / `pyaissh.cmd` | **完整 pyaissh CLI 固定副本**（也经 `sync_check.py` 与 `skills/pyaissh/` 逐一 md5 校验）——可脱离 MCP 直接用 |
-| `SKILL.md` + `docs/*.md` | **技能文档完整副本**（SKILL.md 入口 + contract/exec/transfer/errors/jump/setup/edge-cases 七篇）|
+| `SKILL.md` + `docs/*.md` | **技能文档完整副本**（SKILL.md 入口 + contract/exec/transfer/errors/jump/setup/edge-cases/session 八篇）|
 | `CLI_CHANGELOG.md` | pyaissh CLI 的变更记录（改名以免与适配器自己的 `CHANGELOG.md` 冲突）|
 | `CHANGELOG.md` | 本适配层自己的变更记录 |
 | `.env.example` | 凭据模板（适配器侧重；CLI 侧的模板与规则见 `docs/setup.md`）|

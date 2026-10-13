@@ -680,6 +680,41 @@ def suite_unit_artifacts(s):
                    if not os.path.exists(os.path.join(os.path.dirname(mf), "domains", n))]
         s.check("域文件齐全（MANIFEST 列出的 13 个都在）", not missing, "缺: %s" % missing)
 
+    # ---- 文档/清单数字漂移闸（v2.5.4 加：外部 AI 报"七篇/12 域"旧字样）----
+    # 根因：这些数字只写在注释/README 里，没有任何断言看守，改完内容忘了改数字就静默漂移，
+    # 削弱维护者对文档的信任。做法：拿**代码里的权威源**（DOCS 元组 / MANIFEST 行数 /
+    # 域文件数）去比，再回头校验文档文字与权威源一致。
+    _dev = os.path.join(_REPO, "pyaissh-dev")
+    _docs_src = sorted(f for f in os.listdir(os.path.join(_REPO, "skills", "pyaissh", "docs"))
+                       if f.endswith(".md"))
+    _sync_py = os.path.join(_REPO, "pyaissh-mcp", "sync_check.py")
+    _docs_decl = None
+    _doc_text = ""
+    if os.path.exists(_sync_py):
+        _doc_text = open(_sync_py, encoding="utf-8").read()
+        _m = re.search(r"^DOCS = \((.*?)\)", _doc_text, re.S | re.M)
+        if _m:
+            _docs_decl = sorted(re.findall(r'"([^"]+)"', _m.group(1)))
+    s.check("sync_check DOCS 元组与 skills docs 实际文件一致",
+            _docs_decl is not None and _docs_decl == _docs_src,
+            "decl=%r actual=%r" % (_docs_decl, _docs_src))
+    s.check("sync_check docstring 写\"八篇\"（与 DOCS 实际 %d 篇一致）" % len(_docs_src),
+            "技能文档八篇" in _doc_text and len(_docs_src) == 8,
+            "docs=%d" % len(_docs_src))
+    _mf_text = open(mf, encoding="utf-8").read() if os.path.exists(mf) else ""
+    _n_domains = len([f for f in os.listdir(os.path.join(_dev, "domains"))
+                      if re.match(r"^\d\d_\w+\.py$", f)])
+    s.check("MANIFEST docstring 写 13 域（与实际域文件数一致）",
+            "13 域" in _mf_text and _n_domains == 13, "domains=%d" % _n_domains)
+    _dev_readme = os.path.join(_dev, "README.md")
+    _dr = open(_dev_readme, encoding="utf-8").read() if os.path.exists(_dev_readme) else ""
+    s.check("pyaissh-dev/README 写 13 域（与 MANIFEST 一致）",
+            "13 域" in _dr and "MANIFEST 的 12 域" not in _dr)
+    _mcp_readme = os.path.join(_REPO, "pyaissh-mcp", "README.md")
+    _mr = open(_mcp_readme, encoding="utf-8").read() if os.path.exists(_mcp_readme) else ""
+    s.check("pyaissh-mcp/README 写八篇（与 docs 实际一致）",
+            "八篇" in _mr and "七篇" not in _mr)
+
     # ---- 编码不变量（2026-09-24 定：所有脚本一律 UTF-8 + 显式声明 I/O 编码）----
     # 为什么上闸：本机代码页是 GBK/936，而工具/脚本产出 UTF-8。历史上踩过两类事：
     #   ① 源码被 GBK 存过 → 中文注释/字符串直接乱码；
