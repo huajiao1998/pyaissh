@@ -990,8 +990,23 @@ def suite_unit_artifacts(s):
     with _ctx.redirect_stdout(_buf):
         _m.emit({"ok": True, "action": "probe"}, use_json=True)
     _probe = json.loads(_buf.getvalue())
-    s.check("emit：无连接层警告时不给结果加 warnings 键（字段集不变）",
-            "warnings" not in _probe, repr(_probe))
+    s.check("emit：warnings 恒存在且为空列表（v2.5.5 起，不再「有警告才建键」）",
+            _probe.get("warnings") == [], repr(_probe))
+    # v2.5.5（用户拍板"恒有"）：warnings 必须在**所有**输出路径上存在且为 list。
+    # 起因（2026-10-17 实测）：exec 给 `[]`，而 host list 与 argparse 参数错**根本没有这个键**
+    # → 消费者写 r["warnings"] 会 KeyError，写 r.get("warnings") 又把"没有"和"空"混成一个。
+    # 这里覆盖三条真实曾不一致的路径（成功 / 子命令错 / 参数错）。
+    _shape_bad = []
+    for _argv in (["version"], ["host", "list"], ["no_such_subcommand_xyz"], ["exec"]):
+        _pr = subprocess.run([sys.executable, "-B", _bin()] + _argv,
+                             capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=60, cwd=_REPO,
+                             env=dict(os.environ, PYAISSH_PASSWORD=""))
+        _jj = _last_json(_pr) or {}
+        if not isinstance(_jj.get("warnings"), list):
+            _shape_bad.append((_argv, _jj.get("warnings")))
+    s.check("warnings 在全路径恒存在且为 list（成功 / 子命令错 / 参数错）",
+            not _shape_bad, "缺或非 list: %s" % (_shape_bad,))
     _m._CONN_WARNINGS.append("probe-warning")
     _buf2 = _io.StringIO()
     with _ctx.redirect_stdout(_buf2):

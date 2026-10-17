@@ -723,8 +723,14 @@ def emit(result, header=None, sections=None, use_json=False):
     警告（如 --jump-password 走了命令行）不能只走 stderr：纯 --json 消费方把 stderr 丢掉，
     而那正是主要受众。只在真有警告时才建键，其余结果字段集逐字节不变。
     """
+    # v2.5.5：warnings **恒存在**（空列表），不再"有警告才建键"。
+    # 起因（2026-10-17 实测）：各命令的缺省形态不一致——exec 给 "warnings": []，
+    # 而 host list / argparse 错误干脆没有这个键。消费者写 result["warnings"] 会
+    # KeyError，写 result.get("warnings") 又把"没有"和"空"混成同一个。warnings 是
+    # 双通道提醒的正规载体，是消费者**必须看**的字段——缺席等于把提示静默吞掉，
+    # 正是这套机制要防的"哑"。定这条规矩的是用户（选 A：恒有）。
+    _w = result.setdefault("warnings", [])
     if _CONN_WARNINGS:
-        _w = result.setdefault("warnings", [])
         for _m in _CONN_WARNINGS:
             if _m not in _w:
                 _w.append(_m)
@@ -7675,16 +7681,12 @@ class PsshArgumentParser(argparse.ArgumentParser):
             # 不打印不输出，由外层 error() 统一打印一次（否则 JSON 会
             # 重复输出两行，破坏"单行 JSON"契约）
             raise SystemExit(2)
-        err = {"ok": False, "error": "bad_args", "message": "参数错误: %s" % message,
-               "retryable": False}  # 参数错不可重试（重试同样失败）
-        if not self._want_text_mode():
-            # 默认 JSON 模式：整行 JSON（与成功路径一致，AI 直接 loads）
-            print(json.dumps(err, ensure_ascii=False), flush=True)
-        else:
-            # 可读模式：与 emit_error 一致的 ---ERROR.<nonce>--- 包裹格式
-            print("---ERROR.%s---" % _TEXT_NONCE, flush=True)
-            print(json.dumps(err, ensure_ascii=False), flush=True)
-            print("---END.%s---" % _TEXT_NONCE, flush=True)
+        # v2.5.5：改走 emit_error 同一个 funnel。原来这里手搓一个 4 键对象
+        # （ok/error/message/retryable），缺 version/action/duration_ms/warnings，
+        # 于是"参数错"和其它所有错误是**两种形状**——消费者按一种写就漏。
+        # 更关键的是 warnings 缺席：这类错误恰恰最需要把连接层提示带出来。
+        emit_error(not self._want_text_mode(), "bad_args",
+                   "参数错误: %s" % message)
         self.print_usage(sys.stderr)
         sys.exit(2)
 
