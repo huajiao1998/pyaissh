@@ -65,6 +65,7 @@ import base64
 import codecs
 import errno
 import fnmatch
+import hashlib
 import json
 import os
 import posixpath

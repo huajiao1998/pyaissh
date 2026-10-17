@@ -65,13 +65,13 @@ pyaissh session kill  h --name work                       # 收尾（tmux 会话
 
 | 子命令 | 作用 | 关键字段/参数 |
 |---|---|---|
-| `start <target> [--name main]` | 起会话（远端 tmux，专用 socket `pyaissh`）| 返回 `pid`/`pty`（恒 `true`）/`ready`/`log`/[`permissions`](contract.md)，以及 4 个辅助字段：`ready_wait_ms`（就绪等待耗时的毫秒数，`--wait-ready` 调优参考）、`ttl_default_seconds`（未给 `--ttl` 时的默认 TTL 秒数）、`session_dir`（远端会话根目录，默认 `/tmp/pyaissh-sessions`，`--session-dir` 可改）、`attach_hint`（同名会话已存在时给的一句话提示，指向 `--attach` 可接上）；`--cols`（默认 200，防折行）、`--ttl`、`--attach`、`--wait-ready`；**`--no-pty` 已删除**（传了被 argparse 拒绝，`rc=2`，tmux 永远提供 PTY） |
+| `start <target> [--name main]` | 起会话（远端 tmux，专用 socket `pyaissh`）| 返回 `pid`/`pty`（恒 `true`）/`ready`/`log`/[`permissions`](contract.md)，以及 `ready_wait_ms`（`int`，毫秒：就绪等待耗时，`--wait-ready` 调优参考）；`--cols`（默认 200，防折行）、`--ttl`、`--attach`、`--wait-ready`；**`--no-pty` 已删除**（传了被 argparse 拒绝，`rc=2`，tmux 永远提供 PTY） |
 | **`run <target> --name S --cmd '…'`** | **跑一条并等它结束（推荐；=`send`+等待合成一次调用）** | 返回与 `read` 同构：`stdout`/`exit_code`/`status`(`done`\|`running`)/`token`/`next_offset`；`--wait-rc N`（默认 60，上限 600）超时回 `running`，`--no-wait` 只发送 |
 | `send <target> --name S (--cmd '…' \| --cmd-file -)` | 只喂命令不等（需要边跑边增量读时用）| 返回 `token`/`offset`/`next_offset`；命令文本 CRLF 默认归一（`--keep-crlf` 保留）|
 | `read <target> --name S [--offset N] [--lines N] [--wait-rc SECS] [--token T]` | 读输出：尾部 / 增量 / 等某条命令结束 | 载荷字段 `stdout`（合并流，已清洗 CR/ANSI/哨兵行）、`next_offset`、`status`(`done`\|`running`)、`exit_code`、`token`；`--keep-ansi` 保留颜色码 |
 | `ctrl-c <target> --name S [--force]` | **中断正在执行的命令**：往 pane 注入 Ctrl-C（tty 交给**前台进程组**）；`--force` = 对内核给出的前台进程组（`ps -o tpgid=`）发 SIGKILL | `signal`(`INT`\|`KILL`)/`signaled_groups`/`signaled_children`/`signaled_count`；会话**不死**，状态保留——**但这道命令的退出码哨兵不会出现**（别再 `--wait-rc`） |
 | `keys <target> --name S --data 'y\n'` | 向 pane 注入按键/文本（应答提示、Ctrl-D）| 原始字节经 tmux 缓冲区灌入；`--data` 支持 `\n \r \t \xNN \\`；`--raw` 原样；`--cmd-file` 送原始字节 |
-| `list <target>` | 列该主机会话（存活/日志大小/最后活动/剩余保活）| `sessions[]`：`session`/`pid`(=`shell_pid`)/`status`(`running`\|`dead`)/`pty`/`log_bytes`/`age_seconds`/`idle_seconds`/`expires_in_seconds`/`current_command`/`tmux_session`；**不续期**，但会顺手做一次惰性回收 |
+| `list <target>` | 列该主机会话（存活/日志大小/最后活动/剩余保活）| `session_dir`（`str`：远端会话根目录，默认 `/tmp/pyaissh-sessions`，`--session-dir` 可改）；`sessions[]`：`session`/`pid`(=`shell_pid`)/`status`(`running`\|`dead`)/`pty`/`log_bytes`/`age_seconds`/`idle_seconds`/`expires_in_seconds`/`current_command`/`tmux_session`；**不续期**，但会顺手做一次惰性回收 |
 | `kill <target> (--name S \| --all) [--keep-dir]` | 结束会话：先取 `pane_pid` 的**进程树闭包快照** → `tmux kill-session` → 对幸存者 TERM→KILL→校验 → 删目录 | `swept`（闭包大小）/`remaining`/`roots`（是否拿到权威根 = pane_pid）/`verified`（有根且无幸存）/`cleaned`/`tmux_killed`；`orphans`/`orphans_total`/`orphan_remaining_total` **恒返回且恒空**（见下） |
 
 ## 引擎：为什么换成 tmux（v2.4.0）
@@ -240,7 +240,9 @@ t4   干完活，最后一条命令       ← 到期 = t4+TTL；之后没有任�
 ```
 
 **超过 TTL 才回来的后果**：会话已被回收 ⇒ `run/send/read` 报 `session_not_found`（提示"可能已被
-空闲回收"），`start --attach` 会当成不存在而**新建**（`attached: false`，cwd/变量丢失）。
+空闲回收"），载荷带 `ttl_default_seconds`（`int`：当前默认 TTL 秒数，`--ttl 0` 关闭）；`start --attach`
+会当成不存在而**新建**（`attached: false`，cwd/变量丢失）。会话**还活着**时 `start` 同名撞车报
+`session_exists`（`rc=2`），载荷带 `attach_hint`（`str`：一句话提示，指向 `--attach` 可接上）。
 
 **回收动作**：`tmux kill-session` + `rm -rf 目录`，并往 `<root>/.reaper.log` 追加一行
 （`reclaim <name> idle=…s ttl=…s at <epoch>`）。过期但 tmux 会话已经不在的残留目录

@@ -1722,6 +1722,7 @@ def suite_live_transfer(s):
     if not _preflight("root", os.environ.get("PYAISSH_TEST_PASSWORD"), "transfer 集 root"):
         return None
     tgt = _live_host()
+    _mod = _module()  # 复用产物里的续传指纹算法，别在测试里复制一份（会漂）
     local = os.path.join(_REPO, "tests", "_tmp_xfer.bin")
     dl = os.path.join(_REPO, "tests", "_tmp_xfer_dl.bin")
     part = dl + ".part"
@@ -1765,7 +1766,10 @@ def suite_live_transfer(s):
     src_bytes = open(local, "rb").read()
     _rc, _js, _ = _live_run(["exec", tgt, "--cmd", "stat -c '%s %Y' /tmp/_t_xfer.bin"])
     _sp = (_js.get("stdout", "").split() if _js else [])
-    _stamp = "%s:%s" % (_sp[0], _sp[1]) if len(_sp) >= 2 else ""
+    # 指纹 = 大小:修改时间:首尾4KB哈希（v2.5.5 起；只有大小+时间会在"同尺寸+
+    # 时间戳被规范化"时同时不变，内容取样补上这一格）
+    _probe = _mod._resume_probe_bytes(src_bytes)
+    _stamp = "%s:%s:%s" % (_sp[0], _sp[1], _probe) if len(_sp) >= 2 else ""
     head = src_bytes[:len(src_bytes) * 2 // 5]
     if os.path.exists(part):
         os.remove(part)
@@ -1807,9 +1811,12 @@ def suite_live_transfer(s):
             "ok=%r 大小=%r" % (j and j.get("ok"),
                                os.path.getsize(dl) if os.path.exists(dl) else None))
     if ok_mis:
-        s.check("作废续传点告警走双通道（stderr + 结果 warnings）",
-                any("不符" in str(w) for w in (j.get("warnings") or [])) and "不符" in pstderr,
-                "warnings=%r" % (j.get("warnings"),))
+        # 断言用**结构化计数**而不是告警正文里的字串（外部对端 2026-10-17 提醒，
+        # 而且本项目刚吃过教训：上一条用例原用"续传"二字当判据，新告警含同样的字
+        # 就让它假通过）。stderr 侧只认自有的 [WARN] 前缀，不认文案内容。
+        _w = j.get("warnings") or []
+        s.check("作废续传点告警走双通道（warnings 恰 1 条 + stderr 有 WARN）",
+                len(_w) == 1 and "WARN" in pstderr, "warnings=%r" % (_w,))
     # T6 upload --exclude 目录排除（v2.1）：本地树含 node_modules/.git → 不上传
     deploy_dir = os.path.join(_REPO, "tests", "_tmp_deploy")
     os.makedirs(os.path.join(deploy_dir, "node_modules", "esbuild"), exist_ok=True)

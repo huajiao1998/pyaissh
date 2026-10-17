@@ -248,6 +248,7 @@ def cmd_upload(args):
                     if args.resume:
                         _mtime_u = os.path.getmtime(local)
                         _part_u = remote + ".part"
+                        _probe_u = _resume_probe_local(local)
                         try:
                             sftp.stat(_part_u)
                             _exists_u = True
@@ -256,13 +257,13 @@ def cmd_upload(args):
                         except Exception:
                             _exists_u = False
                         if _exists_u and not _resume_remote_valid(
-                                sftp, _part_u, size, _mtime_u):
+                                sftp, _part_u, size, _mtime_u, _probe_u):
                             _resume_discard_remote(sftp, _part_u)
                             _msg_u = ("续传点与当前本地文件不符（源文件已变化），"
                                       "旧断点已作废并重新传输: %s" % _sanitize_log_text(name))
                             log("[WARN] " + _msg_u)
                             walk_warnings.append(_msg_u)
-                        _resume_remote_stamp(sftp, _part_u, size, _mtime_u)
+                        _resume_remote_stamp(sftp, _part_u, size, _mtime_u, _probe_u)
                     _sftp_put_atomic(sftp, local, remote, progress=bytes_uploaded,
                                      resume=bool(args.resume))
                     if args.resume:
@@ -577,14 +578,15 @@ def cmd_download(args):
                 # 分片当"已完成"跳过，拼出大小正确、md5 错误、却报 ok:true 的混合文件。
                 if args.resume:
                     _part_r = local + ".part"
+                    _probe_r = _resume_probe_sftp(sftp, remote, size)
                     if os.path.exists(_part_r) and not _resume_local_valid(
-                            _part_r, size, rstat.st_mtime):
+                            _part_r, size, rstat.st_mtime, _probe_r):
                         _resume_discard_local(_part_r)
                         _msg_r = ("续传点与当前远端文件不符（远端文件已变化），"
                                   "旧断点已作废并重新传输: %s" % _sanitize_log_text(name))
                         log("[WARN] " + _msg_r)
                         dl_warnings.append(_msg_r)
-                    _resume_local_stamp(_part_r, size, rstat.st_mtime)
+                    _resume_local_stamp(_part_r, size, rstat.st_mtime, _probe_r)
                 k = args.parallel
                 if k is None:
                     k = 4 if size >= PARALLEL_MIN_SIZE else 1

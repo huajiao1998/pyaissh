@@ -525,15 +525,70 @@ def _part_path(target):
 # 大小完全一样——**静默的混合文件**（旧源的段被当"已完成"跳过，新源段拼上去）。
 # 根因：分片标记 <part>.done.<i> 只按序号记，不含任何源文件身份。传输中断后
 # 远端文件若被替换（重新部署/重新构建），旧标记照样命中。
-# 修法：续传点旁写一份指纹 <part>.src = "<size>:<mtime>"，续传前比对；不一致
-# 或指纹缺失（含旧版本留下的断点）一律作废旧断点重传——宁可多传一次，绝不
-# 拼出看似成功的坏文件。
+# 修法：续传点旁写一份指纹 <part>.src = "<size>:<mtime>:<首尾4KB哈希>"，续传前
+# 比对；不一致或指纹缺失（含旧版本留下的断点）一律作废旧断点重传——宁可多传
+# 一次，绝不拼出看似成功的坏文件。
+# 为什么还要内容指纹（外部对端 2026-10-17 提醒，成立）：大小+修改时间在"同尺寸 +
+# 时间戳被规范化"（可复现构建、带 -p 的部署/解包）时会同时不变，那层就瞎了。
+# 首尾各 4KB 取样只多读 8KB，却能把这种情形区分开。
 _RESUME_MAX_CHUNKS = 9  # --parallel 上限 8，多留一个位
 
 
-def _resume_stamp(size, mtime):
-    """续传点指纹：远端文件大小 + 修改时间（秒级足够区分重新部署/重建）。"""
-    return "%d:%d" % (size, int(mtime or 0))
+def _resume_probe_parts(head, tail):
+    """首尾两段内容的 sha256 前 16 位（廉价内容指纹）。tail 为空表示文件 ≤4KB。
+    注意：这里**故意不包 try/except**——算不出来说明环境有问题（如漏 import），
+    必须让它炸出来，不能静默降级成空指纹（否则又变成"看着在守护其实没守"）。"""
+    h = hashlib.sha256()
+    h.update(head[:4096])
+    if tail:
+        h.update(b"\x00")
+        h.update(tail[-4096:])
+    return h.hexdigest()[:16]
+
+
+def _resume_probe_bytes(data):
+    """整段字节的首尾指纹（测试与本地文件共用）。"""
+    if not data:
+        return _resume_probe_parts(b"", b"")
+    tail = data[-4096:] if len(data) > 4096 else b""
+    return _resume_probe_parts(data[:4096], tail)
+
+
+def _resume_probe_local(path):
+    """本地文件首尾指纹；读不了返回空串（降级为只看大小+时间）。"""
+    try:
+        sz = os.path.getsize(path)
+        with open(path, "rb") as f:
+            head = f.read(4096)
+            tail = b""
+            if sz > 4096:
+                f.seek(max(0, sz - 4096))
+                tail = f.read(4096)
+        return _resume_probe_parts(head, tail)
+    except OSError:
+        return ""
+
+
+def _resume_probe_sftp(sftp, remote, size):
+    """远端文件首尾指纹；读不了返回空串（降级为只看大小+时间）。"""
+    try:
+        _sftp_touch_activity(sftp)
+        with sftp.open(remote, "rb") as f:
+            head = f.read(4096)
+            tail = b""
+            if size > 4096:
+                f.seek(max(0, size - 4096))
+                tail = f.read(4096)
+        return _resume_probe_parts(head, tail)
+    except (socket.timeout, TimeoutError):
+        raise
+    except Exception:
+        return ""
+
+
+def _resume_stamp(size, mtime, probe=""):
+    """续传点指纹：大小 + 修改时间 + 首尾内容取样（probe 为空表示降级）。"""
+    return "%d:%d:%s" % (size, int(mtime or 0), probe or "-")
 
 
 def _resume_aux_paths(part):
@@ -541,20 +596,20 @@ def _resume_aux_paths(part):
     return [part + ".src"] + ["%s.done.%d" % (part, i) for i in range(_RESUME_MAX_CHUNKS)]
 
 
-def _resume_local_valid(part, size, mtime):
+def _resume_local_valid(part, size, mtime, probe=""):
     """本地续传点是否属于当前源文件（True 才允许续）。指纹缺失/读不出 → False。"""
     try:
         with open(part + ".src", encoding="utf-8") as f:
-            return f.read().strip() == _resume_stamp(size, mtime)
+            return f.read().strip() == _resume_stamp(size, mtime, probe)
     except (OSError, ValueError):
         return False
 
 
-def _resume_local_stamp(part, size, mtime):
+def _resume_local_stamp(part, size, mtime, probe=""):
     """写入本地续传点指纹（写不了不影响本次传输，只影响下次能否续——下次按不可续处理）。"""
     try:
         with open(part + ".src", "w", encoding="utf-8", newline="\n") as f:
-            f.write(_resume_stamp(size, mtime) + "\n")
+            f.write(_resume_stamp(size, mtime, probe) + "\n")
     except OSError:
         pass
 
@@ -583,25 +638,25 @@ def _resume_cleanup_local(part):
             pass
 
 
-def _resume_remote_valid(sftp, part, size, mtime):
+def _resume_remote_valid(sftp, part, size, mtime, probe=""):
     """远端续传点（上传侧）是否属于当前本地源文件。指纹缺失/读不出 → False。"""
     try:
         _sftp_touch_activity(sftp)
         with sftp.open(part + ".src", "r") as f:
             got = f.read(64).decode("utf-8", "replace").strip()
-        return got == _resume_stamp(size, mtime)
+        return got == _resume_stamp(size, mtime, probe)
     except (socket.timeout, TimeoutError):
         raise
     except Exception:
         return False
 
 
-def _resume_remote_stamp(sftp, part, size, mtime):
+def _resume_remote_stamp(sftp, part, size, mtime, probe=""):
     """写入远端续传点指纹（上传侧）。"""
     try:
         _sftp_touch_activity(sftp)
         with sftp.open(part + ".src", "w") as f:
-            f.write(_resume_stamp(size, mtime) + "\n")
+            f.write(_resume_stamp(size, mtime, probe) + "\n")
     except (socket.timeout, TimeoutError):
         raise
     except Exception:
