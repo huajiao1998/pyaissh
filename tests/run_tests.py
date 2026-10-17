@@ -715,6 +715,102 @@ def suite_unit_artifacts(s):
     s.check("pyaissh-mcp/README 写八篇（与 docs 实际一致）",
             "八篇" in _mr and "七篇" not in _mr)
 
+    # ---- 交接文档闸（2026-10-17 加）----
+    # 为什么上闸：dsh-tavern 那套交接体系已很规范（单一入口 + NOW + 检查器），但它自己的
+    # NOW.md 写着"本次小修待提交"，而该提交在 NOW 更新后 3 分钟就已落地——检查器只查格式/
+    # 长度/链接，**不查"文档说的状态与 git 是否一致"**，所以漂移没人发现。
+    # 这里补上那一环：版本号、HEAD 都必须与真实源对上，过期直接 FAIL 而不是静默。
+    _nw_p = os.path.join(_REPO, "docs", "NOW.md")
+    _st_p = os.path.join(_REPO, "docs", "START.md")
+    _nw = open(_nw_p, encoding="utf-8").read() if os.path.exists(_nw_p) else ""
+    _st = open(_st_p, encoding="utf-8").read() if os.path.exists(_st_p) else ""
+    s.check("docs/NOW.md 存在且 ≤50 行（当前接力棒要短）",
+            bool(_nw) and len(_nw.splitlines()) <= 50, "%d 行" % len(_nw.splitlines()))
+    s.check("NOW.md 写的版本 == VERSION 常量",
+            bool(_nw) and ("**%s**" % m.VERSION) in _nw, "VERSION=%s" % m.VERSION)
+    _git_sha = ""
+    try:
+        _gp = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True,
+                             text=True, encoding="utf-8", errors="replace", timeout=20,
+                             cwd=_REPO)
+        if _gp.returncode == 0:
+            _git_sha = _gp.stdout.strip()
+    except Exception as _e:
+        _git_sha = ""
+        print("  （交接闸：git 不可用，跳过 HEAD 比对：%s）" % _e)
+    # ⚠ 这里不能要求「NOW.md 的 HEAD == 当前 HEAD」：提交 NOW.md 本身就会移动 HEAD，
+    # 于是这条断言在提交后**必然**为假——谁提交谁撞红（2026-10-17 自查发现，原写法正是如此，
+    # 只因 docs/ 当时整目录未跟踪、HEAD 恰好等于文档里那个值才一直是绿的）。
+    # 正确口径：文档记的必须是一个**真实存在的历史提交**，且**自那以后只有文档变动**。
+    # 这样「只提交文档」不会撞红，「改了代码却忘了更新交接」仍然会红。
+    def _git_run(*_a):
+        return subprocess.run(["git"] + list(_a), capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=30, cwd=_REPO)
+
+    if _git_sha:
+        _rec_m = re.search(r"对应 HEAD：\*\*([0-9a-f]{7,40})\*\*", _nw)
+        _rec_sha = _rec_m.group(1) if _rec_m else ""
+        _head_ok = False
+        if not _rec_sha:
+            _head_why = "NOW.md 没写「对应 HEAD：**<sha>**」"
+        elif _git_run("rev-parse", "--verify", "--quiet",
+                      _rec_sha + "^{commit}").returncode != 0:
+            _head_why = "NOW.md 的 HEAD %s 不是本仓提交" % _rec_sha
+        elif _git_sha.startswith(_rec_sha) or _rec_sha.startswith(_git_sha):
+            _head_ok, _head_why = True, "== 当前 HEAD %s" % _git_sha
+        elif _git_run("merge-base", "--is-ancestor", _rec_sha, "HEAD").returncode != 0:
+            _head_why = "NOW.md 的 HEAD %s 不在当前分支历史上" % _rec_sha
+        else:
+            _df = _git_run("diff", "--name-only", "%s..HEAD" % _rec_sha)
+            _paths = [p.strip() for p in _df.stdout.splitlines() if p.strip()]
+            _bad = [p for p in _paths
+                    if not (p.replace("\\", "/").startswith("docs/") or p == "MEMORY.md")]
+            _head_ok = not _bad
+            _head_why = ("其后仅 %d 个文档改动（%s…）" % (len(_paths), _rec_sha)
+                         if _head_ok else "其后有非文档改动，请更新 NOW.md 的 HEAD: %s" % _bad[:5])
+        s.check("NOW.md 的 HEAD 指向真实提交且其后仅有文档改动（防文档落后于代码）",
+                _head_ok, _head_why)
+    # START.md 的相对链接必须全部存在（Markdown <...> 形式）
+    _missing_links = []
+    for _rel in re.findall(r"<([^<>]+\.md)(?:#[^<>]*)?>", _st):
+        if _rel.startswith(("http://", "https://")):
+            continue
+        _p = os.path.normpath(os.path.join(os.path.dirname(_st_p), _rel))
+        if not os.path.exists(_p):
+            _missing_links.append(_rel)
+    s.check("docs/START.md 的相对链接均存在（无死链）", bool(_st) and not _missing_links,
+            "缺: %s" % _missing_links if _missing_links else "无链接可查")
+
+    # ---- 字段文档覆盖闸（2026-10-17 加）----
+    # 起因：EigenFlux 上一个对端问"新增字段由谁保证落进一个有文档的域，这个保证本身有没有读数"。
+    # 当时**没有读数**，而且一测就抓到 4 个漏网的（attach_hint / ready_wait_ms / session_dir /
+    # ttl_default_seconds——全是 session start 的返回字段，SKILL.md 与 docs/ 里一次都没出现）。
+    # 做法：拿契约基线的 fixture 当"字段清单"（它本来就是按用例枚举 key 的唯一权威源），
+    # 要求每个字段名在 SKILL.md 或 docs/*.md 里至少出现一次。新增字段不写文档 → 直接 FAIL。
+    _fx_p = os.path.join(_REPO, "tests", "contract", "session_contract_v2.json")
+    _fx_fields = set()
+    if os.path.exists(_fx_p):
+        try:
+            _fx = json.load(open(_fx_p, encoding="utf-8"))
+            for _case, _keys in _fx.items():
+                if isinstance(_keys, list):
+                    _fx_fields.update(_keys)
+        except Exception as _e:
+            print("  （字段文档闸：fixture 解析失败：%s）" % _e)
+    _doc_all = ""
+    _doc_dir = os.path.join(_REPO, "skills", "pyaissh", "docs")
+    _doc_paths = [os.path.join(_REPO, "skills", "pyaissh", "SKILL.md")]
+    if os.path.isdir(_doc_dir):
+        _doc_paths += [os.path.join(_doc_dir, f) for f in os.listdir(_doc_dir) if f.endswith(".md")]
+    for _dp in _doc_paths:
+        if os.path.exists(_dp):
+            _doc_all += open(_dp, encoding="utf-8").read()
+    _undoc = sorted(f for f in _fx_fields if f not in _doc_all)
+    s.check("契约 fixture 里每个字段都在 SKILL.md/docs 有记录（%d 个字段）" % len(_fx_fields),
+            bool(_fx_fields) and not _undoc,
+            "未写文档: %s" % _undoc if _undoc else "全部有文档")
+
+
     # ---- 编码不变量（2026-09-24 定：所有脚本一律 UTF-8 + 显式声明 I/O 编码）----
     # 为什么上闸：本机代码页是 GBK/936，而工具/脚本产出 UTF-8。历史上踩过两类事：
     #   ① 源码被 GBK 存过 → 中文注释/字符串直接乱码；
