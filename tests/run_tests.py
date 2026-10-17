@@ -1550,6 +1550,17 @@ def suite_live_exec_field(s):
         s.check("log 续读不重复", bool(j4)
                 and (j3.get("stdout", "") + j4.get("stdout", "")).count("detach_hi") == 1,
                 "first=%r second=%r" % (j3.get("stdout"), j4.get("stdout")))
+        # 保真（v2.5.5 修）：--offset 超出当前日志大小，说明文件被截断/清理/替换过。
+        # 以前静默夹到 EOF → 返回空 + has_more=false，调用方会当成"没有新输出"（静默错）。
+        # 现在必须出声：warnings 恰 1 条 + stderr 有 [WARN]（断言只认结构化计数与自有前缀，
+        # 不认告警正文）。
+        rc, jbig, pbig = _live_run(["log", tgt, "--job-id", jid,
+                                    "--offset", "999999999"], timeout=60)
+        s.check("log --offset 越界时明确告警（不静默当「没有新输出」）",
+                bool(jbig) and jbig.get("stdout") == ""
+                and len(jbig.get("warnings") or []) == 1 and "WARN" in pbig,
+                "warnings=%r stdout=%r" % (jbig and jbig.get("warnings"),
+                                           jbig and jbig.get("stdout")))
         rc, j5, _ = _live_run(["log", tgt, "--job-id", jid, "--cleanup"], timeout=60)
         s.check("log --cleanup 清理", bool(j5) and j5.get("cleaned") is True)
         rc, j6, _ = _live_run(["log", tgt, "--job-id", jid], timeout=60)

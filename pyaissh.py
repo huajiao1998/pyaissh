@@ -4452,9 +4452,15 @@ def _log_read(sftp, client, args, job_dir, conn, start):
     next_offset = None
     has_more = False
     tail_window_cut = False
+    offset_clamped = None
     if args.offset is not None:
         off = max(0, int(args.offset))
         if off > size:
+            # offset 超出当前文件大小 = 日志被截断/清理/替换过，之前读到的位置已经不属于
+            # 这个文件了。静默夹到 EOF 会让调用方看到"返回空 + has_more=false"，误以为
+            # "没有新输出"——而真相是文件换了。这里必须出声（stderr + warnings 双通道），
+            # 否则整条命令的输出看起来完全正常（2026-10-17 保真类修复）。
+            offset_clamped = off
             off = size
         with sftp.open(log_path, "rb") as f:
             f.seek(off)
@@ -4494,6 +4500,13 @@ def _log_read(sftp, client, args, job_dir, conn, start):
         "host": conn["host"], "user": conn["user"], "port": conn["port"],
         "warnings": [], "duration_ms": int((time.time() - start) * 1000),
     }
+    if offset_clamped is not None:
+        _clamp_msg = ("--offset %d 超出当前日志大小 %d 字节：日志在两次读之间被截断/清理/替换过，"
+                      "本次已从文件末尾读（载荷可能为空）。**别把它当成「没有新输出」**——"
+                      "重新从头读（--offset 0），或对比 log_bytes 是否变小"
+                      % (offset_clamped, size))
+        log("[WARN] " + _clamp_msg)
+        result["warnings"].append(_clamp_msg)
     if kill_info is not None:
         result["kill"] = kill_info
     if args.cleanup and paths:

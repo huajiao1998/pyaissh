@@ -140,6 +140,7 @@ python3 pyaissh.py log root@1.2.3.4 --job-id <id> --lines 20
   ⚠️ **别"先只取元数据、再用它返回的新 offset 取正文"**：`--field` 不控制读取——
   第一条调用已经把那段日志读走，接着用它返回的 `next_offset` 会**跳过刚才那段**（只能 `--offset 0` 重读补救）。
   要元数据就别在那一条里推进游标：要么按上面第一条把 `stdout` 一起取走，要么改用 `--lines` 尾部读。
+  ⚠️ **`--offset` 大于当前文件大小 = 日志被截断/清理/替换过**（v2.5.5 起会告警，不再静默）：本次从文件末尾读、载荷可能为空，`next_offset` 回落到 `log_bytes`。**别把它当成「没有新输出」**——重新 `--offset 0` 读，或对比 `log_bytes` 是否比上次小。没有这条告警时，"文件换了"和"没新内容"在输出上完全一样。
 - **机制**：作业脚本落远端 `/tmp/pyaissh-jobs/<job_id>/`（`job.sh` = 你的命令原文、`run.sh` = 运行器），`setsid nohup` 启动 → **SSH 断开、宿主单次调用超时都不影响作业**；输出合并进 `job.log`，结束时退出码写入 `job.rc`，进程组 leader pid 写入 `job.pid`
 - **状态机（v2.2.1 三级）**：`finished`（`job.rc` 存在 = 退出码）/ **`dead`**（无 rc 且 `job.pid` 存活探测判定进程已消失——被 kill / OOM / 崩溃，退出码不可知）/ `running`。被 kill 的作业**不再永远 running**，`--wait-rc` 与轮询都能收敛；`dead` 时结果带 `hint` 说明
 - **`log` 载荷字段是 `stdout`**（v2.2.1 起，与 `exec` 对齐；它是 `2>&1` **合并流**，`stream:"stdout+stderr"` 声明）：`pyaissh log h --job-id <id> --field stdout` 直接取裸内容
