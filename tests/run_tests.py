@@ -2002,19 +2002,27 @@ def suite_live_session_ttl(s):
     _live_run(["session", "kill", tgt, "--name", _ttlr], timeout=60)
 
     # T3：list **不续期**（看一眼≠在用）：一直 list 也照样到点被收
-    #     注：start 自身耗时也算 idle，所以 TTL 取 10、两次等待 5+6 才稳
+    #     脆弱点与修法（2026-10-13 实测 flake）：原写法 TTL=10 + 固定睡 5+6，而
+    #     `session start` 自身耗时也算 idle——机器一慢（该轮 ttl 块 157s vs 常态 120s），
+    #     start 吃掉 5s 以上余量，第 5 秒那次 list 时会话已过期 ⇒ 假失败
+    #     `中途在=False`。改为**读实际过期点自适应等待**：TTL 放大到 20，第一次 list 后拿
+    #     `expires_in_seconds`，睡到"原定过期点 + 3s 余量"，与 start 快慢无关。
     _ttl3 = name + "nolist"
-    _live_run(["session", "start", tgt, "--name", _ttl3, "--ttl", "10"], timeout=90)
-    time.sleep(5)
+    _live_run(["session", "start", tgt, "--name", _ttl3, "--ttl", "20"], timeout=90)
+    time.sleep(3)
     rc, _jl3a, _ = _live_run(["session", "list", tgt], timeout=60)
-    _alive3 = any(x.get("session") == _ttl3 for x in (_jl3a or {}).get("sessions", []))
-    time.sleep(6)
+    _row3 = next((x for x in (_jl3a or {}).get("sessions", []) if x.get("session") == _ttl3), None)
+    _alive3 = bool(_row3)
+    _exp3 = _row3.get("expires_in_seconds") if _row3 else None
+    _wait3 = (_exp3 + 3) if isinstance(_exp3, int) else 24
+    time.sleep(_wait3)
     rc, _jl3b, _ = _live_run(["session", "list", tgt], timeout=60)
     s.check("T3 list 不续期：中途 list 过也照样到点回收",
             _alive3 and not any(x.get("session") == _ttl3
                                 for x in (_jl3b or {}).get("sessions", [])),
-            "中途在=%s 之后=%r" % (_alive3, [_x.get("session")
-                                            for _x in (_jl3b or {}).get("sessions", [])]))
+            "中途在=%s expires_in=%s 等了%ss 之后=%r"
+            % (_alive3, _exp3, _wait3,
+               [_x.get("session") for _x in (_jl3b or {}).get("sessions", [])]))
 
     # T4：--ttl 0 关闭回收 —— 不装 reaper、也不被任何清扫收掉
     _t0 = name + "off"
@@ -2212,7 +2220,12 @@ def suite_live_session_engine(s):
                 "for p in $ALL; do [ -n \"$p\" ] || continue; N=$((N+1)); "
                 "  RSS=$((RSS + $(awk '/VmRSS/{print $2}' /proc/$p/status 2>/dev/null || echo 0))); "
                 "  CPU=$((CPU + $(awk '{print $14+$15}' /proc/$p/stat 2>/dev/null || echo 0))); done; "
-                "echo \"procs=$N\"; echo \"rss_kb=$RSS\"; echo \"cpu=$CPU\"") % " ".join(_perf)
+                "echo \"procs=$N\"; echo \"rss_kb=$RSS\"; echo \"cpu=$CPU\"; "
+                 # 同时回传 PID 集合：两次采样的进程集合若不同（会话被回收 / reaper 自行退出 /
+                 # tmux server 重启），CPU 差值就不可比——曾实测报出 cpu_delta=-14（CPU 时间
+                 # 不可能为负），根因是某 PID 第二次已不在、/proc 读不到被 awk 兜底成 0。
+                 # 明确报"测量无效"，别让荒谬数字伪装成产品问题。
+                 "echo \"pids=$(echo $ALL | tr ' ' '\\n' | sort -n | tr '\\n' ' ')\"") % " ".join(_perf)
     rc, _jp1, _ = _live_run(["exec", tgt, "--cmd", _pscript], timeout=60)
     time.sleep(20)
     rc, _jp2, _ = _live_run(["exec", tgt, "--cmd", _pscript], timeout=60)
@@ -2227,8 +2240,16 @@ def suite_live_session_engine(s):
             _rss_mb > 0 and _rss_mb <= 25.0, "rss=%.1f MB（%s）" % (_rss_mb, _p1))
     s.check("PERF-02/03 常驻进程 ≤ 5（tmux server + 3 shell + reaper）且每会话无辅助进程",
             0 < int(_field(_p1, "procs") or 0) <= 5, "procs=%s" % _field(_p1, "procs"))
-    s.check("PERF-04 20 秒空闲 CPU ≤ 2 jiffy（不烧 CPU）",
-            0 <= _dcpu <= 2, "cpu_delta=%s jiffy" % _dcpu)
+    _pids1 = _field(_p1, "pids")
+    _pids2 = _field(_p2, "pids")
+    if _pids1 != _pids2:
+        # 进程集合变了 ⇒ 两次 CPU 采样不可比（差值为负纯是测量假象）。明确 FAIL 并说清原因，
+        # 而不是像此前那样报一个"cpu_delta=-14"的荒谬数字（2026-10-13 实测踩过）。
+        s.check("PERF-04 20 秒空闲 CPU ≤ 2 jiffy（不烧 CPU）", False,
+                "PID 集合在 20s 内变化，测量无效：%r -> %r" % (_pids1, _pids2))
+    else:
+        s.check("PERF-04 20 秒空闲 CPU ≤ 2 jiffy（不烧 CPU）",
+                0 <= _dcpu <= 2, "cpu_delta=%s jiffy（pids=%s）" % (_dcpu, _pids1))
     for _pn in _perf:
         _live_run(["session", "kill", tgt, "--name", _pn], timeout=60)
 
