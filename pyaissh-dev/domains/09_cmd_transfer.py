@@ -242,8 +242,31 @@ def cmd_upload(args):
                             pass
                         raise
                 else:
+                    # 上传续传同样要绑定源身份：本地文件在两次 --resume 之间被
+                    # 重新构建/改写时，远端旧 .part 的前 N 字节属于另一个文件，
+                    # 续上去就是静默的混合文件（与下载侧同源缺陷，一并修）。
+                    if args.resume:
+                        _mtime_u = os.path.getmtime(local)
+                        _part_u = remote + ".part"
+                        try:
+                            sftp.stat(_part_u)
+                            _exists_u = True
+                        except (socket.timeout, TimeoutError):
+                            raise
+                        except Exception:
+                            _exists_u = False
+                        if _exists_u and not _resume_remote_valid(
+                                sftp, _part_u, size, _mtime_u):
+                            _resume_discard_remote(sftp, _part_u)
+                            _msg_u = ("续传点与当前本地文件不符（源文件已变化），"
+                                      "旧断点已作废并重新传输: %s" % _sanitize_log_text(name))
+                            log("[WARN] " + _msg_u)
+                            walk_warnings.append(_msg_u)
+                        _resume_remote_stamp(sftp, _part_u, size, _mtime_u)
                     _sftp_put_atomic(sftp, local, remote, progress=bytes_uploaded,
                                      resume=bool(args.resume))
+                    if args.resume:
+                        _resume_cleanup_remote(sftp, remote + ".part")
                 entry["transferred"] = True
                 files_transferred = 1
                 bytes_transferred = size
@@ -549,6 +572,19 @@ def cmd_download(args):
                 parent = os.path.dirname(local)
                 if parent:
                     os.makedirs(parent, exist_ok=True)
+                # 续传点必须属于当前这个远端文件（源变了就作废旧断点）。
+                # 不做这一步的后果（实测）：远端文件被替换后 --resume 会把旧文件的
+                # 分片当"已完成"跳过，拼出大小正确、md5 错误、却报 ok:true 的混合文件。
+                if args.resume:
+                    _part_r = local + ".part"
+                    if os.path.exists(_part_r) and not _resume_local_valid(
+                            _part_r, size, rstat.st_mtime):
+                        _resume_discard_local(_part_r)
+                        _msg_r = ("续传点与当前远端文件不符（远端文件已变化），"
+                                  "旧断点已作废并重新传输: %s" % _sanitize_log_text(name))
+                        log("[WARN] " + _msg_r)
+                        dl_warnings.append(_msg_r)
+                    _resume_local_stamp(_part_r, size, rstat.st_mtime)
                 k = args.parallel
                 if k is None:
                     k = 4 if size >= PARALLEL_MIN_SIZE else 1
@@ -618,6 +654,10 @@ def cmd_download(args):
                             lambda part: sftp.get(remote, part, callback=_make_sftp_touch(sftp)),
                             local)
                 try:
+                    if args.resume:
+                        # 成功路径清理续传附属文件（.part 已被原子改名，只剩标记/指纹）。
+                        # 失败路径不进这里：断点连同指纹一起保留，下次才能判断能否续。
+                        _resume_cleanup_local(local + ".part")
                     os.chmod(local, stat.S_IMODE(rstat.st_mode) & 0o777)  # 掩掉 setuid 等特殊位
                 except OSError:
                     # 文件已就位，chmod 失败降级为 warning（同目录路径的处理）

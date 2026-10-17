@@ -1760,12 +1760,20 @@ def suite_live_transfer(s):
     s.check("upload --parallel 4", ok_up)
     # T5 download --resume 断点续传往返：伪造 local.part(前 40%) → 应从断点续传完成
     #    （resume 模式续传点固定名 local+".part"，见 _sftp_get_resume 语义）
+    # v2.5.5：续传点必须带源身份指纹 <part>.src（"大小:修改时间"），否则会被判为
+    # "不属于当前源"而整份作废——本用例要测的是**真续传**，指纹必须写对。
     src_bytes = open(local, "rb").read()
+    _rc, _js, _ = _live_run(["exec", tgt, "--cmd", "stat -c '%s %Y' /tmp/_t_xfer.bin"])
+    _sp = (_js.get("stdout", "").split() if _js else [])
+    _stamp = "%s:%s" % (_sp[0], _sp[1]) if len(_sp) >= 2 else ""
     head = src_bytes[:len(src_bytes) * 2 // 5]
     if os.path.exists(part):
         os.remove(part)
     with open(part, "wb") as f:
         f.write(head)
+    if _stamp:
+        with open(part + ".src", "w", encoding="utf-8", newline="\n") as f:
+            f.write(_stamp + "\n")
     if os.path.exists(dl):
         os.remove(dl)
     rc, j, pstderr = _live_run(["download", tgt, "--remote", "/tmp/_t_xfer.bin",
@@ -1775,10 +1783,33 @@ def suite_live_transfer(s):
     s.check("download --resume 往返字节一致", ok_res)
     if ok_res:
         # 续传证据：stderr 出现 [RESUME] 续传日志（JSON bytes_transferred = 文件全量
-        # 非增量，语义见 cmd_download；续传事实以日志佐证）
-        s.check("download --resume 续传日志", "RESUME" in pstderr
-                or "从断点继续" in pstderr or "续传" in pstderr,
+        # 非增量，语义见 cmd_download；续传事实以日志佐证）。
+        # 别用"续传"二字当判据——v2.5.5 的作废告警里也含"续传"，那样会在"根本没续、
+        # 直接重传"时假装通过（本用例真踩过这个假阳性）。
+        s.check("download --resume 续传日志", "RESUME" in pstderr or "从断点继续" in pstderr,
                 "stderr 无续传标记: %r" % pstderr[:160])
+    # T5b 续传点与源不符 → 必须作废旧断点重传
+    #     背景（v2.5.5 修的真缺陷）：分片标记 .done.<i> 只按序号记，不含源身份。
+    #     远端文件被替换后再 --resume，旧段被当"已完成"跳过、新段拼上去，产出
+    #     **大小相同、md5 不同、却报 ok:true** 的混合文件（实测 2MB 复现）。这层
+    #     断言锁住"源变了就作废"，防止那条静默损坏路径回来。
+    if os.path.exists(dl):
+        os.remove(dl)
+    with open(part, "wb") as f:
+        f.write(b"\x00" * len(src_bytes))
+    with open(part + ".src", "w", encoding="utf-8", newline="\n") as f:
+        f.write("999999:1\n")  # 明显不属于当前源的指纹
+    rc, j, pstderr = _live_run(["download", tgt, "--remote", "/tmp/_t_xfer.bin",
+                                "--local", dl, "--resume"], timeout=300)
+    ok_mis = (j and j.get("ok") is True and os.path.exists(dl)
+              and open(dl, "rb").read() == src_bytes)
+    s.check("续传点与源不符时作废旧断点（不拼出大小相同、内容错误的混合文件）", ok_mis,
+            "ok=%r 大小=%r" % (j and j.get("ok"),
+                               os.path.getsize(dl) if os.path.exists(dl) else None))
+    if ok_mis:
+        s.check("作废续传点告警走双通道（stderr + 结果 warnings）",
+                any("不符" in str(w) for w in (j.get("warnings") or [])) and "不符" in pstderr,
+                "warnings=%r" % (j.get("warnings"),))
     # T6 upload --exclude 目录排除（v2.1）：本地树含 node_modules/.git → 不上传
     deploy_dir = os.path.join(_REPO, "tests", "_tmp_deploy")
     os.makedirs(os.path.join(deploy_dir, "node_modules", "esbuild"), exist_ok=True)
