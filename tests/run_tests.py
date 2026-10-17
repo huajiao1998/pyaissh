@@ -763,8 +763,12 @@ def suite_unit_artifacts(s):
         else:
             _df = _git_run("diff", "--name-only", "%s..HEAD" % _rec_sha)
             _paths = [p.strip() for p in _df.stdout.splitlines() if p.strip()]
+            # 豁免：文档与"过程规矩"文件不改变产品状态，改它们不该逼着更新交接棒。
+            # AGENTS.md 是给人/给 AI 的规矩，不是产品行为（2026-10-17 加：原本只豁免
+            # docs/ 与 MEMORY.md，结果改一条教训就得两连提交，摩擦一大就会有人想关闸）。
+            _EXEMPT = ("MEMORY.md", "AGENTS.md")
             _bad = [p for p in _paths
-                    if not (p.replace("\\", "/").startswith("docs/") or p == "MEMORY.md")]
+                    if not (p.replace("\\", "/").startswith("docs/") or p in _EXEMPT)]
             _head_ok = not _bad
             _head_why = ("其后仅 %d 个文档改动（%s…）" % (len(_paths), _rec_sha)
                          if _head_ok else "其后有非文档改动，请更新 NOW.md 的 HEAD: %s" % _bad[:5])
