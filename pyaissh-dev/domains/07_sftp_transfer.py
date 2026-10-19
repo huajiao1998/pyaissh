@@ -188,12 +188,27 @@ def _parallel_fetch(conn, args_, remote, local, size, k, resume=False):
                     off += len(data)
                     workers[i][4] = off - start
                     _sftp_touch_activity(sftp)
-                # 分片完整写完：写 done 标记（--resume 重跑时跳过已完成分片）
+                # 分片完整写完：**先 flush + fsync 再落 done 标记**。
+                # 为什么顺序重要（外部对端 2026-10-18 指出，属实）：标记原来写在
+                # 句柄 close 之前，而 lf 是带缓冲的——进程在"标记已写、缓冲还没落盘"
+                # 之间死掉（崩溃/掉电），重跑时会按标记跳过这个分片，拼出"标记说完成、
+                # 数据少一截"的文件；而完整性校验用的是内存计数（workers[i][4]），
+                # 看不出磁盘上少了。**标记是意图，落盘才是事实**。
+                # 代价：每分片一次 fsync（最多 8 次），相对传输耗时是零头。
                 if resume:
+                    _synced = True
                     try:
-                        open(done_path, "wb").close()
-                    except Exception:
-                        pass
+                        lf.flush()
+                        os.fsync(lf.fileno())
+                    except Exception as se:
+                        # 落盘失败（磁盘满等）不能写标记：写了就等于宣称"这段可信"。
+                        errors.append((i, se))
+                        _synced = False
+                    if _synced:
+                        try:
+                            open(done_path, "wb").close()
+                        except Exception:
+                            pass
             except KeyboardInterrupt:
                 # 信号中断归位：不记入 errors（否则主线程会把信号误报成
                 # download_failed），由主线程检查 _SIGTERM_RECEIVED 走 130 路径
