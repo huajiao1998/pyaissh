@@ -1732,7 +1732,7 @@ def suite_live_exec_field(s):
 
     # v2.2.2 kill 整组：--kill 必须连子进程一起杀（否则 job.sh/sleep 被 reparent 成孤儿）
     rc, jg, _ = _live_run(["exec", tgt, "--detach", "--cmd",
-                           "sleep 300 # pyaissh_orphan_probe"], timeout=90)
+                           "sleep 303 # pyaissh_orphan_probe（303 专用于本用例）"], timeout=90)
     gjob = (jg or {}).get("job_id")
     if gjob:
         rc, gk, _ = _live_run(["log", tgt, "--job-id", gjob, "--kill", "--wait-rc", "30"],
@@ -1753,7 +1753,7 @@ def suite_live_exec_field(s):
                 and "退出码不可知" in ((gd or {}).get("hint") or ""),
                 "rc=%s %r" % (rc, repr(gd)[:200]))
         p = _live_sub(["exec", tgt, "--cmd",
-                       "pgrep -af '[s]leep 300' >/dev/null && echo ORPHAN_ALIVE "
+                       "pgrep -af '[s]leep 303' >/dev/null && echo ORPHAN_ALIVE "
                        "|| echo NO_ORPHAN", "--field", "stdout"], timeout=60)
         s.check("--kill 杀掉整组：无孤儿进程", "NO_ORPHAN" in (p.stdout or ""),
                 repr(p.stdout)[:120])
