@@ -703,15 +703,26 @@ def _resume_cleanup_remote(sftp, part):
 
 
 
-def _atomic_local_write(write_fn, local, resume=False):
+def _atomic_local_write(write_fn, local, resume=False, expect_size=None):
     """本地原子落盘：write_fn(part) 写 .part，成功后 os.replace。
     失败/中断默认删除 .part——绝不留下"看似完整实则损坏"的半截文件
     （空洞文件会被 --skip-existing 按大小误判为已传完）。
     resume=True（--resume 续传模式）：.part 用固定名 <目标>.part（跨进程
-    可续传），失败/中断【保留】它供下次 --resume 续传（log TIP 提示）。"""
+    可续传），失败/中断【保留】它供下次 --resume 续传（log TIP 提示）。
+    expect_size：给了就在**替换上位之前**核对 .part 的实际磁盘大小——串行下载
+    走 sftp.get，它不校验字节数，服务器少给一段我们会把短文件当成品（2026-10-23
+    顺着外部反馈复查发现的真缺口；并行与续传路径本来就有这道校验）。"""
     part = local + ".part" if resume else _part_path(local)
     try:
         write_fn(part)
+        if expect_size is not None:
+            try:
+                _got = os.path.getsize(part)
+            except OSError:
+                _got = None
+            if _got is not None and _got != expect_size:
+                raise SshError("下载不完整：落到磁盘 %d != 远端 %d 字节"
+                               % (_got, expect_size), "download_failed")
         os.replace(part, local)
     except BaseException:
         if not resume:
@@ -851,6 +862,18 @@ def _sftp_put_atomic(sftp, local, remote, progress=None, resume=False):
             log("[FILE] 续传完成 %s (%s)" % (remote, format_size(local_size)))
         else:
             sftp.put(local, part, callback=_cb)
+            # 串行路径也必须"核大小再改名"：并行路径、续传路径都有这道，唯独这里
+            # 漏了——服务器静默少写、磁盘配额截断时 paramiko 的 put 不报错，我们会
+            # 把短文件改名上位并报成功（2026-10-23 顺着外部反馈复查发现的真缺口）。
+            try:
+                _rsize = sftp.stat(part).st_size
+            except (socket.timeout, TimeoutError):
+                raise
+            except Exception:
+                _rsize = None
+            if _rsize is not None and _rsize != os.path.getsize(local):
+                raise SshError("上传不完整：远端 %d != 本地 %d 字节"
+                               % (_rsize, os.path.getsize(local)), "upload_failed")
         _sftp_atomic_rename(sftp, part, remote)
     except BaseException as e:
         if getattr(e, "keep_part", False):

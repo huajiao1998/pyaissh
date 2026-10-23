@@ -527,7 +527,7 @@ def cmd_download(args):
                         os.makedirs(parent, exist_ok=True)
                     _atomic_local_write(
                         lambda part, _r=full: sftp.get(_r, part, callback=_make_sftp_touch(sftp)),
-                        local_file)
+                        local_file, expect_size=size)
                     # 保留远程权限位但掩掉 setuid/setgid/sticky（0o4000/0o2000/0o1000）：
                     # 远端文件属性不受本方控制，root 下载 4755 文件会在本地造出
                     # setuid-root 二进制，属本地提权落点
@@ -650,11 +650,11 @@ def cmd_download(args):
                         # 处理"不存在全量/已有续传/大小异常覆盖"三种情形）
                         _atomic_local_write(
                             lambda part: _sftp_get_resume(sftp, remote, part, size),
-                            local, resume=True)
+                            local, resume=True, expect_size=size)
                     else:
                         _atomic_local_write(
                             lambda part: sftp.get(remote, part, callback=_make_sftp_touch(sftp)),
-                            local)
+                            local, expect_size=size)
                 try:
                     if args.resume:
                         # 成功路径清理续传附属文件（.part 已被原子改名，只剩标记/指纹）。
