@@ -1007,6 +1007,63 @@ def suite_unit_artifacts(s):
             _shape_bad.append((_argv, _jj.get("warnings")))
     s.check("warnings 在全路径恒存在且为 list（成功 / 子命令错 / 参数错）",
             not _shape_bad, "缺或非 list: %s" % (_shape_bad,))
+    # ---- 落地大小核对（v2.5.5，2026-10-23）----
+    # 起因：串行上传/下载（默认路径）原来不核对实际字节数——paramiko 的 put/get
+    # 在服务器静默少写、配额截断时不报错，我们就把短文件改名上位并报成功。并行
+    # 与续传路径本来都有这道校验，唯独默认的串行路径漏了。
+    # 这里用假 SFTP 把"少写"这件事造出来，锁住"必须报错且不得改名/产出最终名"。
+    import tempfile as _tf2
+
+    class _FakeSftp(object):
+        def __init__(self, reported):
+            self.reported = reported
+            self.renamed = False
+            self.removed = []
+            self._pyaissh_last_activity = 0.0
+
+        def put(self, local, remote, callback=None):
+            if callback:
+                callback(self.reported, self.reported)
+
+        def stat(self, path):
+            return type("A", (), {"st_size": self.reported})()
+
+        def posix_rename(self, a, b):
+            self.renamed = True
+
+        def rename(self, a, b):
+            self.renamed = True
+
+        def remove(self, path):
+            self.removed.append(path)
+
+    _sz_dir = _tf2.mkdtemp(prefix="pyaissh-sizecheck-")
+    _sz_up = os.path.join(_sz_dir, "up.bin")
+    with open(_sz_up, "wb") as _f:
+        _f.write(b"x" * 1000)
+    _fake_s = _FakeSftp(400)          # 远端只"落"了 400 字节
+    _up_err = ""
+    try:
+        _m._sftp_put_atomic(_fake_s, _sz_up, "/tmp/_pyaissh_sizecheck.bin", progress=[0])
+    except _m.SshError as _e:
+        _up_err = _e.error_type
+    s.check("串行上传：远端少写时 upload_failed 且不改名（不把短文件上位）",
+            _up_err == "upload_failed" and not _fake_s.renamed,
+            "error_type=%r renamed=%r" % (_up_err, _fake_s.renamed))
+    _sz_dl = os.path.join(_sz_dir, "dl.bin")
+
+    def _short_write(part):
+        with open(part, "wb") as _f:
+            _f.write(b"y" * 300)
+
+    _dl_err = ""
+    try:
+        _m._atomic_local_write(_short_write, _sz_dl, expect_size=1000)
+    except _m.SshError as _e:
+        _dl_err = _e.error_type
+    s.check("串行下载：落盘少字节时 download_failed 且不产最终名",
+            _dl_err == "download_failed" and not os.path.exists(_sz_dl),
+            "error_type=%r exists=%r" % (_dl_err, os.path.exists(_sz_dl)))
     _m._CONN_WARNINGS.append("probe-warning")
     _buf2 = _io.StringIO()
     with _ctx.redirect_stdout(_buf2):
